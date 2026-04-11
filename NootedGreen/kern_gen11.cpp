@@ -255,6 +255,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			{"__ZN16AppleIntelScaler19updateRegisterCacheEv",AppleIntelScalerupdateRegisterCache, this->oAppleIntelScalerupdateRegisterCache},
 			{"__ZN19AppleIntelPowerWell20disableDisplayEngineEv",disableDisplayEngine, this->odisableDisplayEngine},
 			{"__ZN19AppleIntelPowerWell19enableDisplayEngineEv",enableDisplayEngine, this->oenableDisplayEngine},
+			{"__ZN17AppleIntelPortHAL14enableComboPhyEv",enableComboPhyEv, this->oenableComboPhyEv},
 			{"__ZN19AppleIntelPowerWell21hwSetPowerWellStatePGEbj", releaseDoorbell},
 			{"__ZN19AppleIntelPowerWell22hwSetPowerWellStateAuxEbj",hwSetPowerWellStateAux, this->ohwSetPowerWellStateAux},
 			{"__ZN19AppleIntelPowerWell22hwSetPowerWellStateDDIEbj",hwSetPowerWellStateDDI, this->ohwSetPowerWellStateDDI},
@@ -1310,13 +1311,11 @@ bool Gen11::start(void *that,void  *param_1)
 		}
 	}
 
-	// ── V28: Apply critical GT workarounds BEFORE original start() ──
-	// Acquire Render ForceWake via raw register writes (FB MMIO is already mapped).
+	// ── V29: Apply GT workarounds + GGTT PTE diagnostics ──
 	SYSLOG("ngreen", "Pre-start: acquiring ForceWake for GT workarounds");
 	NGreen::callback->writeReg32(FORCEWAKE_RENDER_GEN9, (1 << 16) | 1);
 	IODelay(1000);
 	
-	// Poll ACK up to 50ms
 	uint32_t fwAck = 0;
 	uint64_t fwNow = 0, fwDeadline = 0;
 	clock_interval_to_deadline(50, kMillisecondScale, &fwDeadline);
@@ -1326,56 +1325,76 @@ bool Gen11::start(void *that,void  *param_1)
 	}
 	SYSLOG("ngreen", "Pre-start ForceWake ACK: 0x%x %s", fwAck, (fwAck & 1) ? "OK" : "TIMEOUT");
 	
-	// ── V28: Clear ERROR_GEN6 before start to isolate errors ──
+	// Register defines
 	#define ERROR_GEN6         0x40A0
 	#define GEN12_RING_FAULT_REG 0xCEC4
 	#define GEN8_FAULT_TLB_DATA0 0x4B10
 	#define GEN8_FAULT_TLB_DATA1 0x4B14
-	#define GEN12_GAM_DONE     0x4E40
-	// Per-engine error/interrupt registers
 	#define RING_EIR(base)     ((base) + 0xB0)
 	#define RING_EMR(base)     ((base) + 0xB4)
 	#define RING_ESR(base)     ((base) + 0xB8)
-	// GT interrupt registers
+	#define RING_FAULT_REG(base) ((base) + 0x150)
 	#define GEN11_GT_INTR_DW0  0x190018
 	#define GEN11_GT_INTR_DW1  0x19001C
-	// GEN12 per-engine fault (at engine MMIO base)
-	#define RING_FAULT_REG(base) ((base) + 0x150)
+	#define RING_ACTHD(base)   ((base) + 0x74)
+	#define RING_ACTHD_UDW(base) ((base) + 0x5C)
+	#define RING_IPEHR(base)   ((base) + 0x68)
+	#define RING_IPEIR(base)   ((base) + 0x64)
+	#define RING_INSTDONE(base) ((base) + 0x6C)
+	#define RING_DMA_FADD(base) ((base) + 0x78)
+	#define RING_DMA_FADD_UDW(base) ((base) + 0x60)
+	#define RING_INSTPM(base)  ((base) + 0xC0)
+	#define RING_EXECLIST_STATUS(base) ((base) + 0x234)
+	#define RING_CONTEXT_STATUS_PTR(base) ((base) + 0x3A0)
+	#define RING_CONTEXT_STATUS_BUF(base, idx)    ((base) + 0x370 + (idx) * 8)
+	#define RING_CONTEXT_STATUS_BUF_HI(base, idx) ((base) + 0x374 + (idx) * 8)
+	// GGTT PTE base within BAR0 (Gen8+: 8MB into MMIO BAR, each PTE is 8 bytes)
+	#define GEN8_GGTT_PTE_BASE 0x800000
+	#define GGTT_PTE_LO(page)  (GEN8_GGTT_PTE_BASE + (page) * 8)
+	#define GGTT_PTE_HI(page)  (GEN8_GGTT_PTE_BASE + (page) * 8 + 4)
+	// Context size register
+	#define RING_CTX_SIZE(base) ((base) + 0x1A0)
+	// Current context ID
+	#define RING_CCID(base)    ((base) + 0x180)
+	// Context control
+	#define RING_CTX_CTRL(base) ((base) + 0x244)
+	// GFX mode (ring mode register)
+	#define RING_MI_MODE(base) ((base) + 0x9C)
+	#define RING_MODE(base)    ((base) + 0x29C)
 	
-	uint32_t errBefore = NGreen::callback->readReg32(ERROR_GEN6);
-	SYSLOG("ngreen", "Pre-start ERROR_GEN6=0x%x (clearing W1C)", errBefore);
-	NGreen::callback->writeReg32(ERROR_GEN6, errBefore);  // W1C: write 1s to clear
-	IODelay(10);
-	uint32_t errCleared = NGreen::callback->readReg32(ERROR_GEN6);
-	SYSLOG("ngreen", "Pre-start ERROR_GEN6 after clear=0x%x", errCleared);
-	
-	// Also clear per-engine error registers
-	uint32_t rcsEirBefore = NGreen::callback->readReg32(RING_EIR(RENDER_RING_BASE));
-	SYSLOG("ngreen", "Pre-start RCS EIR=0x%x ESR=0x%x EMR=0x%x", rcsEirBefore,
-		NGreen::callback->readReg32(RING_ESR(RENDER_RING_BASE)),
-		NGreen::callback->readReg32(RING_EMR(RENDER_RING_BASE)));
-	if (rcsEirBefore) {
-		NGreen::callback->writeReg32(RING_EIR(RENDER_RING_BASE), rcsEirBefore);
+	// ── V29 NEW: Pre-start GGTT PTE dump ──
+	// Dump first few GGTT PTEs to verify format
+	SYSLOG("ngreen", "GGTT PTE format check (first 4 pages):");
+	for (int i = 0; i < 4; i++) {
+		SYSLOG("ngreen", "  GGTT[%d]=0x%08x:%08x", i,
+			NGreen::callback->readReg32(GGTT_PTE_HI(i)),
+			NGreen::callback->readReg32(GGTT_PTE_LO(i)));
+	}
+	// Dump PTEs around the HWS page area (GGTT offset 0x40004000 → page 0x40004)
+	// But that PTE would be at 0x800000 + 0x40004*8 = 0xA00020 — check if within BAR
+	// Instead, dump some PTEs in the driver's active range
+	SYSLOG("ngreen", "GGTT PTE near page 0x100:");
+	for (int i = 0x100; i < 0x104; i++) {
+		SYSLOG("ngreen", "  GGTT[0x%x]=0x%08x:%08x", i,
+			NGreen::callback->readReg32(GGTT_PTE_HI(i)),
+			NGreen::callback->readReg32(GGTT_PTE_LO(i)));
 	}
 	
-	// Clear ring fault register
-	uint32_t ringFaultBefore = NGreen::callback->readReg32(GEN12_RING_FAULT_REG);
-	SYSLOG("ngreen", "Pre-start RING_FAULT=0x%x", ringFaultBefore);
-	if (ringFaultBefore) {
-		NGreen::callback->writeReg32(GEN12_RING_FAULT_REG, ringFaultBefore);
-	}
+	// ── V29 NEW: Context and engine config ──
+	SYSLOG("ngreen", "RCS CTX_SIZE=0x%x CCID=0x%x CTX_CTRL=0x%x",
+		NGreen::callback->readReg32(RING_CTX_SIZE(RENDER_RING_BASE)),
+		NGreen::callback->readReg32(RING_CCID(RENDER_RING_BASE)),
+		NGreen::callback->readReg32(RING_CTX_CTRL(RENDER_RING_BASE)));
+	SYSLOG("ngreen", "RCS MI_MODE=0x%x RING_MODE=0x%x",
+		NGreen::callback->readReg32(RING_MI_MODE(RENDER_RING_BASE)),
+		NGreen::callback->readReg32(RING_MODE(RENDER_RING_BASE)));
 	
-	// Read GT interrupt state
-	SYSLOG("ngreen", "Pre-start GT_INTR_DW0=0x%x DW1=0x%x",
-		NGreen::callback->readReg32(GEN11_GT_INTR_DW0),
-		NGreen::callback->readReg32(GEN11_GT_INTR_DW1));
+	SYSLOG("ngreen", "Pre-start ERROR_GEN6=0x%x", NGreen::callback->readReg32(ERROR_GEN6));
 	
 	// GT workarounds
 	uint32_t misccpctl = NGreen::callback->readReg32(GEN7_MISCCPCTL);
-	SYSLOG("ngreen", "Pre-start GEN7_MISCCPCTL before: 0x%x", misccpctl);
 	misccpctl &= ~GEN12_DOP_CLOCK_GATE_RENDER_ENABLE;
 	NGreen::callback->writeReg32(GEN7_MISCCPCTL, misccpctl);
-	
 	NGreen::callback->wa_write_or(VDBOX_CGCTL3F10(RENDER_RING_BASE), IECPUNIT_CLKGATE_DIS);
 	NGreen::callback->wa_write_or(VDBOX_CGCTL3F10(BLT_RING_BASE), IECPUNIT_CLKGATE_DIS);
 	NGreen::callback->wa_write_or(VDBOX_CGCTL3F10(GEN11_VEBOX_RING_BASE), IECPUNIT_CLKGATE_DIS);
@@ -1398,37 +1417,22 @@ bool Gen11::start(void *that,void  *param_1)
 	
 	auto ret= FunctionCast(start, callback->ostart)(that,param_1);
 	
-	// ── V28: Post-start diagnostics ──
-	// Acquire ForceWake to read GT registers reliably
+	// ── V29: Post-start diagnostics ──
 	NGreen::callback->writeReg32(FORCEWAKE_RENDER_GEN9, (1 << 16) | 1);
 	IODelay(1000);
 	
 	SYSLOG("ngreen", "start() returned %d", ret);
 	
 	// Ring buffer state
+	uint32_t rcsHead = NGreen::callback->readReg32(RING_HEAD(RENDER_RING_BASE));
+	uint32_t rcsTail = NGreen::callback->readReg32(RING_TAIL(RENDER_RING_BASE));
+	uint32_t rcsCtl  = NGreen::callback->readReg32(RING_CTL(RENDER_RING_BASE));
+	uint32_t rcsStart = NGreen::callback->readReg32(RING_START(RENDER_RING_BASE));
+	uint32_t rcsHws  = NGreen::callback->readReg32(RING_HWS_PGA(RENDER_RING_BASE));
 	SYSLOG("ngreen", "RCS0 HEAD=0x%x TAIL=0x%x CTL=0x%x START=0x%x",
-		NGreen::callback->readReg32(RING_HEAD(RENDER_RING_BASE)),
-		NGreen::callback->readReg32(RING_TAIL(RENDER_RING_BASE)),
-		NGreen::callback->readReg32(RING_CTL(RENDER_RING_BASE)),
-		NGreen::callback->readReg32(RING_START(RENDER_RING_BASE)));
+		rcsHead, rcsTail, rcsCtl, rcsStart);
 	SYSLOG("ngreen", "RCS0 HWS_PGA=0x%x HWSTAM=0x%x",
-		NGreen::callback->readReg32(RING_HWS_PGA(RENDER_RING_BASE)),
-		NGreen::callback->readReg32(RING_HWSTAM(RENDER_RING_BASE)));
-	
-	// GPU error/fault diagnostics
-	#define RING_ACTHD(base)   ((base) + 0x74)
-	#define RING_ACTHD_UDW(base) ((base) + 0x5C)
-	#define RING_IPEHR(base)   ((base) + 0x68)
-	#define RING_IPEIR(base)   ((base) + 0x64)
-	#define RING_INSTDONE(base) ((base) + 0x6C)
-	#define RING_DMA_FADD(base) ((base) + 0x78)
-	#define RING_DMA_FADD_UDW(base) ((base) + 0x60)
-	#define RING_INSTPM(base)  ((base) + 0xC0)
-	#define RING_EXECLIST_STATUS(base) ((base) + 0x234)
-	#define RING_CONTEXT_STATUS_PTR(base)   ((base) + 0x3A0)
-	// Context status buffer entries (CSB)
-	#define RING_CONTEXT_STATUS_BUF(base, idx)  ((base) + 0x370 + (idx) * 8)
-	#define RING_CONTEXT_STATUS_BUF_HI(base, idx) ((base) + 0x374 + (idx) * 8)
+		rcsHws, NGreen::callback->readReg32(RING_HWSTAM(RENDER_RING_BASE)));
 	
 	SYSLOG("ngreen", "RCS0 ACTHD=0x%x:%08x IPEHR=0x%x IPEIR=0x%x",
 		NGreen::callback->readReg32(RING_ACTHD_UDW(RENDER_RING_BASE)),
@@ -1444,53 +1448,71 @@ bool Gen11::start(void *that,void  *param_1)
 		NGreen::callback->readReg32(RING_EXECLIST_STATUS(RENDER_RING_BASE)),
 		NGreen::callback->readReg32(RING_CONTEXT_STATUS_PTR(RENDER_RING_BASE)));
 	
-	// ── V28 NEW: Per-engine error registers ──
+	// Per-engine error
 	SYSLOG("ngreen", "RCS0 EIR=0x%x ESR=0x%x EMR=0x%x",
 		NGreen::callback->readReg32(RING_EIR(RENDER_RING_BASE)),
 		NGreen::callback->readReg32(RING_ESR(RENDER_RING_BASE)),
 		NGreen::callback->readReg32(RING_EMR(RENDER_RING_BASE)));
-	// Per-engine fault register
 	SYSLOG("ngreen", "RCS0 RING_FAULT=0x%x",
 		NGreen::callback->readReg32(RING_FAULT_REG(RENDER_RING_BASE)));
 	
-	// ── V28 NEW: ERROR_GEN6 after clear ──
-	SYSLOG("ngreen", "ERROR_GEN6=0x%x (was cleared pre-start)", 
-		NGreen::callback->readReg32(ERROR_GEN6));
-	SYSLOG("ngreen", "RING_FAULT(global)=0x%x", 
+	// Global errors
+	SYSLOG("ngreen", "ERROR_GEN6=0x%x RING_FAULT(global)=0x%x",
+		NGreen::callback->readReg32(ERROR_GEN6),
 		NGreen::callback->readReg32(GEN12_RING_FAULT_REG));
 	SYSLOG("ngreen", "FAULT_TLB_DATA0=0x%x FAULT_TLB_DATA1=0x%x",
 		NGreen::callback->readReg32(GEN8_FAULT_TLB_DATA0),
 		NGreen::callback->readReg32(GEN8_FAULT_TLB_DATA1));
-	
-	// ── V28 NEW: GT interrupt state ──
 	SYSLOG("ngreen", "GT_INTR_DW0=0x%x DW1=0x%x",
 		NGreen::callback->readReg32(GEN11_GT_INTR_DW0),
 		NGreen::callback->readReg32(GEN11_GT_INTR_DW1));
 	
-	// ── V28 NEW: Context status buffer entries (last few CSB events) ──
+	// ── V29 NEW: Context and engine config after start ──
+	SYSLOG("ngreen", "RCS CTX_SIZE=0x%x CCID=0x%x CTX_CTRL=0x%x",
+		NGreen::callback->readReg32(RING_CTX_SIZE(RENDER_RING_BASE)),
+		NGreen::callback->readReg32(RING_CCID(RENDER_RING_BASE)),
+		NGreen::callback->readReg32(RING_CTX_CTRL(RENDER_RING_BASE)));
+	SYSLOG("ngreen", "RCS MI_MODE=0x%x RING_MODE=0x%x",
+		NGreen::callback->readReg32(RING_MI_MODE(RENDER_RING_BASE)),
+		NGreen::callback->readReg32(RING_MODE(RENDER_RING_BASE)));
+	
+	// ── V29 NEW: GGTT PTEs for HWS page and ring buffer ──
+	// HWS_PGA is a GGTT address; read its PTE to check format
+	if (rcsHws) {
+		uint32_t hwsPage = rcsHws >> 12;
+		SYSLOG("ngreen", "GGTT PTE for HWS (page 0x%x)=0x%08x:%08x", hwsPage,
+			NGreen::callback->readReg32(GGTT_PTE_HI(hwsPage)),
+			NGreen::callback->readReg32(GGTT_PTE_LO(hwsPage)));
+		// Also check adjacent pages
+		SYSLOG("ngreen", "GGTT PTE for HWS+1 (page 0x%x)=0x%08x:%08x", hwsPage+1,
+			NGreen::callback->readReg32(GGTT_PTE_HI(hwsPage+1)),
+			NGreen::callback->readReg32(GGTT_PTE_LO(hwsPage+1)));
+	}
+	if (rcsStart) {
+		uint32_t ringPage = rcsStart >> 12;
+		SYSLOG("ngreen", "GGTT PTE for RING (page 0x%x)=0x%08x:%08x", ringPage,
+			NGreen::callback->readReg32(GGTT_PTE_HI(ringPage)),
+			NGreen::callback->readReg32(GGTT_PTE_LO(ringPage)));
+	}
+	
+	// CSB entries
 	uint32_t csp = NGreen::callback->readReg32(RING_CONTEXT_STATUS_PTR(RENDER_RING_BASE));
-	uint32_t csb_wr = (csp >> 8) & 0x7;
-	SYSLOG("ngreen", "CSB wr_ptr=%d rd_ptr=%d", csb_wr, csp & 0x7);
+	SYSLOG("ngreen", "CSB wr_ptr=%d rd_ptr=%d", (csp >> 8) & 0x7, csp & 0x7);
 	for (int i = 0; i < 6; i++) {
 		SYSLOG("ngreen", "CSB[%d]=0x%x:%08x", i,
 			NGreen::callback->readReg32(RING_CONTEXT_STATUS_BUF_HI(RENDER_RING_BASE, i)),
 			NGreen::callback->readReg32(RING_CONTEXT_STATUS_BUF(RENDER_RING_BASE, i)));
 	}
 	
-	SYSLOG("ngreen", "GEN7_MISCCPCTL=0x%x GT_THREAD_STATUS=0x%x",
-		NGreen::callback->readReg32(GEN7_MISCCPCTL),
-		NGreen::callback->readReg32(0x13805C));
 	SYSLOG("ngreen", "ForceWake ACK: Render=0x%x Blitter=0x%x",
 		NGreen::callback->readReg32(FORCEWAKE_ACK_RENDER_GEN9),
 		NGreen::callback->readReg32(FORCEWAKE_ACK_BLITTER_GEN9));
 	
-	// Also check BCS (Blitter) ring
-	SYSLOG("ngreen", "BCS HEAD=0x%x TAIL=0x%x CTL=0x%x ACTHD=0x%x IPEHR=0x%x",
+	// BCS quick check
+	SYSLOG("ngreen", "BCS HEAD=0x%x TAIL=0x%x CTL=0x%x",
 		NGreen::callback->readReg32(RING_HEAD(BLT_RING_BASE)),
 		NGreen::callback->readReg32(RING_TAIL(BLT_RING_BASE)),
-		NGreen::callback->readReg32(RING_CTL(BLT_RING_BASE)),
-		NGreen::callback->readReg32(RING_ACTHD(BLT_RING_BASE)),
-		NGreen::callback->readReg32(RING_IPEHR(BLT_RING_BASE)));
+		NGreen::callback->readReg32(RING_CTL(BLT_RING_BASE)));
 	
 	// Release ForceWake
 	NGreen::callback->writeReg32(FORCEWAKE_RENDER_GEN9, (1 << 16) | 0);
@@ -1938,30 +1960,33 @@ void  Gen11::prepareToEnterWake(void *that)
 
 void Gen11::enableComboPhyEv(void *that)
 {
-	// The TGL fProcMonRefValues table has 3 rows (vccIO=0..2) x 2 cols (process=0..1).
-	// ADL-P/RPL-P silicon returns vccIO=3 and process=2 which are OOB → kernel panic.
-	// Clamp both to the highest valid index before calling the original function,
-	// then restore the register so firmware sees the real values afterward.
-	uint32_t reg_off = getMember<uint32_t>(that, 0x5b8);
-	uint32_t reg_val = NGreen::callback->readReg32(reg_off);
-	uint32_t vccIO   = (reg_val >> 24) & 0x3u;   // bits [25:24]
-	uint32_t process = (reg_val >> 26) & 0x7u;   // bits [28:26]
-	SYSLOG("ngreen", "enableComboPhyEv: that=%p reg_off=0x%x reg_val=0x%x vccIO=%u process=%u", that, reg_off, reg_val, vccIO, process);
+	// TGL PORT_COMP_DW3 = combo_phy_base + 0x100 + 3*4
+	// PHY A base 0x162000, PHY B base 0x06C000
+	// Fields: PROCESS_INFO [27:26] (valid 0-1), VOLTAGE_INFO/vccIO [25:24] (valid 0-2)
+	// RPL-P silicon returns OOB values → TGL driver panics at AppleIntelPortHAL.cpp:2405.
+	// PORT_COMP_DW3 is read-only (silicon fuses) — writes have no effect.
+	// If values are OOB, skip the original entirely: firmware has already calibrated
+	// the combo PHY correctly for RPL-P. Calling original with OOB values → cold.1 panic
+	// or undefined behavior if cold.1 is routed to a no-op (cold functions don't return).
+	static const uint32_t dw3Regs[] = { 0x16210Cu, 0x06C10Cu };
+	bool oob = false;
 
-	bool needs_patch = (vccIO == 3) || (process >= 2);
-	if (needs_patch) {
-		uint32_t clamped = reg_val;
-		if (vccIO == 3)
-			clamped = (clamped & ~(0x3u << 24)) | (0x2u << 24);  // clamp to 2
-		if (process >= 2)
-			clamped = (clamped & ~(0x7u << 26)) | (0x1u << 26);  // clamp to 1
-		NGreen::callback->writeReg32(reg_off, clamped);
+	for (int i = 0; i < 2; i++) {
+		uint32_t val = NGreen::callback->readReg32(dw3Regs[i]);
+		uint32_t vccIO   = (val >> 24) & 0x3u;
+		uint32_t process = (val >> 26) & 0x3u;
+		SYSLOG("ngreen", "enableComboPhyEv: PHY%c DW3=0x%x vccIO=%u process=%u",
+		       'A' + i, val, vccIO, process);
+		if (vccIO > 2 || process > 1)
+			oob = true;
+	}
+
+	if (oob) {
+		SYSLOG("ngreen", "enableComboPhyEv: RPL-P OOB values — skipping original (firmware calibrated)");
+		return;
 	}
 
 	FunctionCast(enableComboPhyEv, callback->oenableComboPhyEv)(that);
-
-	if (needs_patch)
-		NGreen::callback->writeReg32(reg_off, reg_val);  // restore original
 };
 
 void Gen11::setPanelPowerState(void *that,bool param_1)
@@ -2314,7 +2339,7 @@ void Gen11::hwSetPowerWellStateAux(void *that,bool param_1,uint param_2)
 
 void Gen11::hwInitializeCState(void *that)
 {
-	SYSLOG("ngreen", "NB-BUILD-V28-ERROR-ISOLATE");
+	SYSLOG("ngreen", "NB-BUILD-V32-COMBOPHY-SKIP-OOB");
 	int origB48 = getMember<int>(that, 0xB48);
 	int origCE4 = getMember<int>(that, 0xCE4);
 	SYSLOG("ngreen", "hwInitCState B48=%d CE4=%d", origB48, origCE4);

@@ -8,7 +8,7 @@ Patches Apple's Tiger Lake (Gen12) graphics drivers to work with Raptor Lake-P (
 
 ## Status
 
-**Work in progress.** Display output works. GPU acceleration (stamp 3) is under active debugging.
+**Work in progress.** Framebuffer controller starts, combo PHY calibration patched, accelerator ring initialises. Display pipeline under active development.
 
 ## Requirements
 
@@ -30,6 +30,7 @@ Patches Apple's Tiger Lake (Gen12) graphics drivers to work with Raptor Lake-P (
 | `-nbdyldoff` | Disable DYLD patches |
 | `ngreen-dmc=skip` | Skip DMC firmware |
 | `-allow3d` | Force 3D acceleration |
+| `-nbwegcoex` | Enable WEG coexistence mode (run alongside WhateverGreen, skips overlapping routes) |
 
 ## Compatibility
 
@@ -46,6 +47,12 @@ NootedGreen adds:
 ## Building
 
 Open `NootedGreen.xcodeproj` and select the **NootedGreen** scheme to build the RPL-P plugin, or one of the original NootedBlue schemes for legacy hardware. Build with Xcode.
+
+## Authors
+
+- **Stefano Giammorino** ([@sgiammori](https://github.com/sgiammori)) — reverse engineering, driver development, hardware testing
+- **Claude Sonnet** (Anthropic) — AI pair-programming, code generation, debug analysis
+- **Claude Opus 4.6** via GitHub Copilot — AI pair-programming, code generation, debug analysis
 
 ## License
 
