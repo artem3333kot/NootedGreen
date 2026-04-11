@@ -17,7 +17,7 @@
                BlueprintIdentifier = "1C748C261C21952C0024EED2"
                BuildableName = "NootedGreen.kext"
                BlueprintName = "NootedGreen"
-               ReferencedContainer = "container:NootedBlue.xcodeproj">
+               ReferencedContainer = "container:NootedGreen.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
       </BuildActionEntries>
@@ -52,7 +52,7 @@
             BlueprintIdentifier = "1C748C261C21952C0024EED2"
             BuildableName = "NootedGreen.kext"
             BlueprintName = "NootedGreen"
-            ReferencedContainer = "container:NootedBlue.xcodeproj">
+            ReferencedContainer = "container:NootedGreen.xcodeproj">
          </BuildableReference>
       </MacroExpansion>
    </ProfileAction>
