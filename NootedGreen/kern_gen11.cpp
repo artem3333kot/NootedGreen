@@ -267,9 +267,9 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			{"__ZN19AppleIntelPowerWell22hwSetPowerWellStateDDIEbj",hwSetPowerWellStateDDI, this->ohwSetPowerWellStateDDI},
 			//{"__ZN31AppleIntelRegisterAccessManager19FastWriteRegister32Emj",FastWriteRegister32, this->oFastWriteRegister32},
 			/*{"__ZN31AppleIntelRegisterAccessManager14ReadRegister32Em",raReadRegister32, this->oraReadRegister32},
-			{"__ZN31AppleIntelRegisterAccessManager14ReadRegister32EPVvm",raReadRegister32b},
+			{"__ZN31AppleIntelRegisterAccessManager14ReadRegister32EPVvm",raReadRegister32b},*/
 			{"__ZN31AppleIntelRegisterAccessManager15WriteRegister32Emj",raWriteRegister32, this->oraWriteRegister32},
-			{"__ZN31AppleIntelRegisterAccessManager15WriteRegister32EPVvmj",raWriteRegister32b},*/
+			{"__ZN31AppleIntelRegisterAccessManager15WriteRegister32EPVvmj",raWriteRegister32b},
 			{"__ZN21AppleIntelFramebuffer17prepareToExitWakeEv",releaseDoorbell},
 			{"__ZN21AppleIntelFramebuffer18prepareToEnterWakeEv",releaseDoorbell},
 			{"__ZN21AppleIntelFramebuffer18prepareToExitSleepEv",releaseDoorbell},
@@ -1892,13 +1892,23 @@ void Gen11::radWriteRegister32f(void *that,unsigned long param_1, UInt32 param_2
 
 void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 {
+	// Force linear tiling for display plane registers.
+	// Without GPU acceleration, surfaces are linear but the driver computes
+	// Tile4 stride (÷512). Convert back to linear stride (÷64) = multiply by 8.
+	// PLANE_CTL bits[14:12] = tiling mode: force 000 (linear).
+	if (param_1 == 0x70188) { // PLANE_STRIDE Pipe A Plane 1
+		UInt32 linear = param_2 * 8;
+		DBGLOG("ngreen", "PLANE_STRIDE fixup: 0x%x -> 0x%x (linear)", param_2, linear);
+		param_2 = linear;
+	}
+	if (param_1 == 0x70180) { // PLANE_CTL Pipe A Plane 1
+		param_2 &= ~(0x7u << 12); // clear tiling bits → linear
+		DBGLOG("ngreen", "PLANE_CTL fixup: forced linear tiling");
+	}
+
 	if (reinterpret_cast<volatile uint64_t*>(that)==nullptr) return NGreen::callback->writeReg32(param_1,param_2);
-	//PANIC_COND(reinterpret_cast<volatile uint64_t*>(that)==nullptr, "ngreen", "raWriteRegister32 Failed 0x%lx",param_1);
-	if (reinterpret_cast<volatile uint64_t*>(that)==nullptr) return;
-	// oraWriteRegister32 is null when the WriteRegister32Emj route is not installed.
 	if (!callback->oraWriteRegister32) return NGreen::callback->writeReg32(param_1,param_2);
 	FunctionCast(raWriteRegister32, callback->oraWriteRegister32)( that,param_1,param_2);
-	
 };
 
 void Gen11::raWriteRegister32f(void *that,unsigned long param_1, UInt32 param_2)
