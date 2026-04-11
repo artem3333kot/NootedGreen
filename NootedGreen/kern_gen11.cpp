@@ -1429,6 +1429,7 @@ bool Gen11::start(void *that,void  *param_1)
 	
 	// ── V29: Post-start diagnostics ──
 	NGreen::callback->writeReg32(FORCEWAKE_RENDER_GEN9, (1 << 16) | 1);
+	NGreen::callback->writeReg32(FORCEWAKE_BLITTER_GEN9, (1 << 16) | 1);
 	IODelay(1000);
 	
 	SYSLOG("ngreen", "start() returned %d", ret);
@@ -1518,14 +1519,33 @@ bool Gen11::start(void *that,void  *param_1)
 		NGreen::callback->readReg32(FORCEWAKE_ACK_RENDER_GEN9),
 		NGreen::callback->readReg32(FORCEWAKE_ACK_BLITTER_GEN9));
 	
-	// BCS quick check
-	SYSLOG("ngreen", "BCS HEAD=0x%x TAIL=0x%x CTL=0x%x",
-		NGreen::callback->readReg32(RING_HEAD(BLT_RING_BASE)),
-		NGreen::callback->readReg32(RING_TAIL(BLT_RING_BASE)),
-		NGreen::callback->readReg32(RING_CTL(BLT_RING_BASE)));
+	// BCS full state (now with Blitter ForceWake held!)
+	uint32_t bcsHead = NGreen::callback->readReg32(RING_HEAD(BLT_RING_BASE));
+	uint32_t bcsTail = NGreen::callback->readReg32(RING_TAIL(BLT_RING_BASE));
+	uint32_t bcsCtl  = NGreen::callback->readReg32(RING_CTL(BLT_RING_BASE));
+	uint32_t bcsStart = NGreen::callback->readReg32(RING_START(BLT_RING_BASE));
+	SYSLOG("ngreen", "BCS HEAD=0x%x TAIL=0x%x CTL=0x%x START=0x%x",
+		bcsHead, bcsTail, bcsCtl, bcsStart);
+	SYSLOG("ngreen", "BCS HWS_PGA=0x%x MI_MODE=0x%x",
+		NGreen::callback->readReg32(RING_HWS_PGA(BLT_RING_BASE)),
+		NGreen::callback->readReg32(RING_MI_MODE(BLT_RING_BASE)));
+	SYSLOG("ngreen", "BCS ACTHD=0x%x:%08x IPEHR=0x%x IPEIR=0x%x",
+		NGreen::callback->readReg32(RING_ACTHD_UDW(BLT_RING_BASE)),
+		NGreen::callback->readReg32(RING_ACTHD(BLT_RING_BASE)),
+		NGreen::callback->readReg32(RING_IPEHR(BLT_RING_BASE)),
+		NGreen::callback->readReg32(RING_IPEIR(BLT_RING_BASE)));
+	SYSLOG("ngreen", "BCS INSTDONE=0x%x EIR=0x%x ESR=0x%x EMR=0x%x",
+		NGreen::callback->readReg32(RING_INSTDONE(BLT_RING_BASE)),
+		NGreen::callback->readReg32(RING_EIR(BLT_RING_BASE)),
+		NGreen::callback->readReg32(RING_ESR(BLT_RING_BASE)),
+		NGreen::callback->readReg32(RING_EMR(BLT_RING_BASE)));
+	SYSLOG("ngreen", "BCS EXECLIST_STATUS=0x%x CTX_STATUS_PTR=0x%x",
+		NGreen::callback->readReg32(RING_EXECLIST_STATUS(BLT_RING_BASE)),
+		NGreen::callback->readReg32(RING_CONTEXT_STATUS_PTR(BLT_RING_BASE)));
 	
-	// Release ForceWake
+	// Release both ForceWake domains
 	NGreen::callback->writeReg32(FORCEWAKE_RENDER_GEN9, (1 << 16) | 0);
+	NGreen::callback->writeReg32(FORCEWAKE_BLITTER_GEN9, (1 << 16) | 0);
 	
 	return ret;
 }
@@ -1645,6 +1665,86 @@ void Gen11::wrapSafeForceWake(void *that, bool set, uint32_t dom) {
 
 void Gen11::forceWake(void *that, bool set, uint32_t dom, uint8_t ctx) {
 	SYSLOG("ngreen", "forceWake called: set=%d dom=0x%x ctx=%d", set, dom, ctx);
+	
+	// ── Hangcheck: dump GPU state once after stamp-timeout restart ──
+	// During init, ~14 forceWake calls happen. After IOAcceleratorFamily2 submits
+	// work and the stamp times out (~5s later), a burst of restart-related calls
+	// occurs. Dump full RCS/BCS state once on the 30th call to capture post-hang state.
+	static int fwCallCount = 0;
+	static bool hangcheckDumped = false;
+	fwCallCount++;
+	
+	if (!hangcheckDumped && fwCallCount == 30) {
+		hangcheckDumped = true;
+		SYSLOG("ngreen", "=== HANGCHECK: GPU state dump (fwCall=%d) ===", fwCallCount);
+		
+		// Acquire both Render + Blitter ForceWake for reliable reads
+		NGreen::callback->writeReg32(FORCEWAKE_RENDER_GEN9, (1 << 16) | 1);
+		NGreen::callback->writeReg32(FORCEWAKE_BLITTER_GEN9, (1 << 16) | 1);
+		IODelay(1000);
+		
+		SYSLOG("ngreen", "HANGCHECK ForceWake ACK: Render=0x%x Blitter=0x%x",
+			NGreen::callback->readReg32(FORCEWAKE_ACK_RENDER_GEN9),
+			NGreen::callback->readReg32(FORCEWAKE_ACK_BLITTER_GEN9));
+		
+		// RCS ring state
+		SYSLOG("ngreen", "HANGCHECK RCS HEAD=0x%x TAIL=0x%x CTL=0x%x START=0x%x",
+			NGreen::callback->readReg32(RING_HEAD(RENDER_RING_BASE)),
+			NGreen::callback->readReg32(RING_TAIL(RENDER_RING_BASE)),
+			NGreen::callback->readReg32(RING_CTL(RENDER_RING_BASE)),
+			NGreen::callback->readReg32(RING_START(RENDER_RING_BASE)));
+		SYSLOG("ngreen", "HANGCHECK RCS ACTHD=0x%x:%08x IPEHR=0x%x",
+			NGreen::callback->readReg32(RING_ACTHD_UDW(RENDER_RING_BASE)),
+			NGreen::callback->readReg32(RING_ACTHD(RENDER_RING_BASE)),
+			NGreen::callback->readReg32(RING_IPEHR(RENDER_RING_BASE)));
+		SYSLOG("ngreen", "HANGCHECK RCS INSTDONE=0x%x DMA_FADD=0x%x:%08x",
+			NGreen::callback->readReg32(RING_INSTDONE(RENDER_RING_BASE)),
+			NGreen::callback->readReg32(RING_DMA_FADD_UDW(RENDER_RING_BASE)),
+			NGreen::callback->readReg32(RING_DMA_FADD(RENDER_RING_BASE)));
+		SYSLOG("ngreen", "HANGCHECK RCS EIR=0x%x ESR=0x%x EMR=0x%x",
+			NGreen::callback->readReg32(RING_EIR(RENDER_RING_BASE)),
+			NGreen::callback->readReg32(RING_ESR(RENDER_RING_BASE)),
+			NGreen::callback->readReg32(RING_EMR(RENDER_RING_BASE)));
+		SYSLOG("ngreen", "HANGCHECK RCS EXECLIST_STATUS=0x%x CTX_STATUS_PTR=0x%x",
+			NGreen::callback->readReg32(RING_EXECLIST_STATUS(RENDER_RING_BASE)),
+			NGreen::callback->readReg32(RING_CONTEXT_STATUS_PTR(RENDER_RING_BASE)));
+		
+		// BCS ring state (with proper Blitter ForceWake held!)
+		SYSLOG("ngreen", "HANGCHECK BCS HEAD=0x%x TAIL=0x%x CTL=0x%x START=0x%x",
+			NGreen::callback->readReg32(RING_HEAD(BLT_RING_BASE)),
+			NGreen::callback->readReg32(RING_TAIL(BLT_RING_BASE)),
+			NGreen::callback->readReg32(RING_CTL(BLT_RING_BASE)),
+			NGreen::callback->readReg32(RING_START(BLT_RING_BASE)));
+		SYSLOG("ngreen", "HANGCHECK BCS HWS_PGA=0x%x ACTHD=0x%x:%08x",
+			NGreen::callback->readReg32(RING_HWS_PGA(BLT_RING_BASE)),
+			NGreen::callback->readReg32(RING_ACTHD_UDW(BLT_RING_BASE)),
+			NGreen::callback->readReg32(RING_ACTHD(BLT_RING_BASE)));
+		SYSLOG("ngreen", "HANGCHECK BCS IPEHR=0x%x INSTDONE=0x%x",
+			NGreen::callback->readReg32(RING_IPEHR(BLT_RING_BASE)),
+			NGreen::callback->readReg32(RING_INSTDONE(BLT_RING_BASE)));
+		SYSLOG("ngreen", "HANGCHECK BCS EIR=0x%x ESR=0x%x EMR=0x%x",
+			NGreen::callback->readReg32(RING_EIR(BLT_RING_BASE)),
+			NGreen::callback->readReg32(RING_ESR(BLT_RING_BASE)),
+			NGreen::callback->readReg32(RING_EMR(BLT_RING_BASE)));
+		
+		// Global error state
+		SYSLOG("ngreen", "HANGCHECK ERROR_GEN6=0x%x RING_FAULT=0x%x",
+			NGreen::callback->readReg32(0x40A0),
+			NGreen::callback->readReg32(0xCEC4));
+		SYSLOG("ngreen", "HANGCHECK FAULT_TLB0=0x%x TLB1=0x%x",
+			NGreen::callback->readReg32(0x4B10),
+			NGreen::callback->readReg32(0x4B14));
+		SYSLOG("ngreen", "HANGCHECK GT_INTR_DW0=0x%x DW1=0x%x",
+			NGreen::callback->readReg32(0x190018),
+			NGreen::callback->readReg32(0x19001C));
+		
+		// Release ForceWake
+		NGreen::callback->writeReg32(FORCEWAKE_RENDER_GEN9, (1 << 16) | 0);
+		NGreen::callback->writeReg32(FORCEWAKE_BLITTER_GEN9, (1 << 16) | 0);
+		
+		SYSLOG("ngreen", "=== HANGCHECK: dump complete ===");
+	}
+	
 	// ctx 2: IRQ, ctx 1: normal
 	uint32_t ack_exp = set << ctx;
 	uint32_t mask = 1 << ctx;

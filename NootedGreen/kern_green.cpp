@@ -43,8 +43,8 @@ void NGreen::init() {
 	lilu.onKextLoadForce(&kextAGDP);
 	/*lilu.onKextLoadForce(&kextBacklight);
 	lilu.onKextLoadForce(&kextMCCSControl);
-	lilu.onKextLoadForce(&kextIOGraphics);
-	lilu.onKextLoadForce(&kextIOAcceleratorFamily2);*/
+	lilu.onKextLoadForce(&kextIOGraphics);*/
+	lilu.onKextLoadForce(&kextIOAcceleratorFamily2);
 	
 	genx.init();
 	gen11.init();
@@ -196,12 +196,12 @@ bool NGreen::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 		static const uint8_t f1[]= {0x74, 0x57, 0x45, 0x8b, 0x8f, 0x84, 0x02, 0x00, 0x00, 0x48, 0x8d, 0x3d, 0x4a, 0x47, 0xfb, 0xff};
 		static const uint8_t r1[]= {0xeb, 0x57, 0x45, 0x8b, 0x8f, 0x84, 0x02, 0x00, 0x00, 0x48, 0x8d, 0x3d, 0x4a, 0x47, 0xfb, 0xff};
 		const LookupPatchPlus patch {&kextIOAcceleratorFamily2, f1, r1, 1};
-		//SYSLOG_COND(!patch.apply(patcher, address, size), "NGreen", "Failed to apply kextIOAcceleratorFamily2 patch");
+		SYSLOG_COND(!patch.apply(patcher, address, size), "NGreen", "Failed to apply kextIOAcceleratorFamily2 patch f1");
 
 		static const uint8_t f2[]= {0x48, 0x83, 0xec, 0x18, 0xf7, 0xc2, 0xc0, 0x73, 0x80, 0xff, 0x74, 0x33};
 		static const uint8_t r2[]= {0x48, 0x83, 0xec, 0x18, 0xf7, 0xc2, 0xc0, 0x73, 0x80, 0xff, 0xeb, 0x33};
 		const LookupPatchPlus patch2 {&kextIOAcceleratorFamily2, f2, r2, 1};
-		//SYSLOG_COND(!patch2.apply(patcher, address, size), "NGreen", "Failed to apply kextIOAcceleratorFamily2 patch");
+		SYSLOG_COND(!patch2.apply(patcher, address, size), "NGreen", "Failed to apply kextIOAcceleratorFamily2 patch f2");
 		
 	}  else if (kextIOGraphics.loadIndex == index) {
 		/*
