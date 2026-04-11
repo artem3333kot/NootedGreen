@@ -15,12 +15,14 @@ Patches Apple's Tiger Lake (Gen12) graphics drivers to work with Raptor Lake-P (
 - [Lilu](https://github.com/acidanthera/Lilu) 1.7.2+
 - macOS Sonoma 14.x
 - Intel Raptor Lake-P iGPU (device ID `0x9A49`)
-- AAPL,ig-platform-id: `0300C89B`
+- SMBIOS: `MacBookPro16,2`
+- Cpuid1Data spoof to Ice Lake (`0x000706E5`)
+- No iGPU DeviceProperties needed — NootedGreen auto-injects `AAPL,ig-platform-id`
 
 ## Boot args
 
 ```
--v keepsyms=1 debug=0x100 -liludbg -NGreenDebug -disablegfxfirmware -nbdyldoff ngreen-dmc=skip -allow3d
+-v keepsyms=1 debug=0x100 IGLogLevel=8 -wegdbg -NGreenDebug -liludbg liludump=60 -nbdyldoff ngreen-dmc=skip -allow3d -disablegfxfirmware
 ```
 
 | Arg | Purpose |
@@ -31,6 +33,10 @@ Patches Apple's Tiger Lake (Gen12) graphics drivers to work with Raptor Lake-P (
 | `ngreen-dmc=skip` | Skip DMC firmware |
 | `-allow3d` | Force 3D acceleration |
 | `-nbwegcoex` | Enable WEG coexistence mode (run alongside WhateverGreen, skips overlapping routes) |
+| `IGLogLevel=8` | Maximum Intel GPU driver logging |
+| `-wegdbg` | Enable WhateverGreen debug logging |
+| `-liludbg` | Enable Lilu debug logging |
+| `liludump=60` | Dump Lilu logs after 60 seconds |
 
 ## Compatibility
 
