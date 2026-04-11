@@ -486,7 +486,9 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				//{activeKext, f13pb, r13pb, arrsize(f13pb),	1},
 				//{activeKext, f16p, r16p, arrsize(f16p),	1},
 				{activeKext, f19, r19, arrsize(f19),	1},
-				{activeKext, f20p, r20p, arrsize(f20p),	1},
+				// Disabled: NOP-ing this call may prevent "Disabling black black" from firing
+				// in setDisplayMode — the return value likely controls the black screen flag.
+				//{activeKext, f20p, r20p, arrsize(f20p),	1},
 				{activeKext, f21p, r21p, arrsize(f21p),	1},
 				
 			};
