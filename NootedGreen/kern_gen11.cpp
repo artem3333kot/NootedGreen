@@ -265,7 +265,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			{"__ZN19AppleIntelPowerWell21hwSetPowerWellStatePGEbj", releaseDoorbell},
 			{"__ZN19AppleIntelPowerWell22hwSetPowerWellStateAuxEbj",hwSetPowerWellStateAux, this->ohwSetPowerWellStateAux},
 			{"__ZN19AppleIntelPowerWell22hwSetPowerWellStateDDIEbj",hwSetPowerWellStateDDI, this->ohwSetPowerWellStateDDI},
-			//{"__ZN31AppleIntelRegisterAccessManager19FastWriteRegister32Emj",FastWriteRegister32, this->oFastWriteRegister32},
+			{"__ZN31AppleIntelRegisterAccessManager19FastWriteRegister32Emj",FastWriteRegister32, this->oFastWriteRegister32},
 			/*{"__ZN31AppleIntelRegisterAccessManager14ReadRegister32Em",raReadRegister32, this->oraReadRegister32},
 			{"__ZN31AppleIntelRegisterAccessManager14ReadRegister32EPVvm",raReadRegister32b},*/
 			{"__ZN31AppleIntelRegisterAccessManager15WriteRegister32Emj",raWriteRegister32, this->oraWriteRegister32},
@@ -2569,6 +2569,15 @@ void Gen11::hwConfigureCustomAUX(void *that,bool param_1)
 
 void Gen11::FastWriteRegister32(void *that,unsigned long param_1,uint32_t param_2)
 {
+	if (param_1 == 0x70188) { // PLANE_STRIDE Pipe A Plane 1
+		UInt32 linear = param_2 * 8;
+		DBGLOG("ngreen", "FastWrite PLANE_STRIDE fixup: 0x%x -> 0x%x (linear)", param_2, linear);
+		param_2 = linear;
+	}
+	if (param_1 == 0x70180) { // PLANE_CTL Pipe A Plane 1
+		param_2 &= ~(0x7u << 12); // clear tiling bits → linear
+		DBGLOG("ngreen", "FastWrite PLANE_CTL fixup: forced linear tiling");
+	}
 	return FunctionCast(FastWriteRegister32, callback->oFastWriteRegister32)(that,param_1,param_2 );
 }
 
