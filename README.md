@@ -31,6 +31,18 @@ Patches Apple's Tiger Lake (Gen12) graphics drivers to work with Raptor Lake-P (
 | `ngreen-dmc=skip` | Skip DMC firmware |
 | `-allow3d` | Force 3D acceleration |
 
+## Compatibility
+
+The original NootedBlue support is fully preserved:
+
+- **Haswell** (10.12+)
+- **Broadwell** (10.14+)
+- **Braswell** (10.14+)
+
+NootedGreen adds:
+
+- **Raptor Lake-P** (macOS Sonoma 14.x) — work in progress
+
 ## Building
 
 Open `NootedBlue.xcodeproj`, select the **NootedGreen** scheme, and build with Xcode.
