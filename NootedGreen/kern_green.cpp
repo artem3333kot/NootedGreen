@@ -194,146 +194,62 @@ bool NGreen::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 	if (kextIOAcceleratorFamily2.loadIndex == index) {
 		SYSLOG("NGreen", "IOAccelF2: TEXT 0x%llx size 0x%lx", address, size);
 		
-		// V35: Use masked patterns for version-independent matching.
-		// The original f1/f2 had hard-coded RIP-relative offsets and test immediates
-		// that change between macOS builds.  Masked find/replace wildcards those bytes.
-		
-		// ── f1: je → jmp before mov r9d,[r15+OFFSET]; REX-prefixed instr ──
-		// Original (pre-Sonoma): je +0x57; mov r9d,[r15+0x284]; lea rdi,[rip+...]
-		// Anchor: 45 8b 8f = mov r9d,[r15+disp32]  (REX.RB, MOV, ModRM)
-		// Only byte changed: je (0x74) → jmp (0xEB)
-		static const uint8_t f1_f[]  = {0x74, 0x00, 0x45, 0x8b, 0x8f, 0x00, 0x00, 0x00, 0x00, 0x48};
-		static const uint8_t f1_m[]  = {0xFF, 0x00, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF};
-		static const uint8_t f1_r[]  = {0xEB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-		static const uint8_t f1_rm[] = {0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-		const LookupPatchPlus p1 {&kextIOAcceleratorFamily2, f1_f, f1_m, f1_r, f1_rm, 1};
-		bool f1ok = p1.apply(patcher, address, size);
-		patcher.clearError();
-		SYSLOG("NGreen", "IOAccelF2 f1 (masked): %s", f1ok ? "OK" : "FAILED");
-		
-		// ── f2: je → jmp after sub rsp,imm8; test edx,imm32 ──
-		// Original: sub rsp,0x18; test edx,0xFF8073C0; je +0x33
-		// Anchor: 48 83 ec = sub rsp,imm8  followed by  f7 c2 = test edx,imm32
-		// Only byte changed: je (0x74) → jmp (0xEB)
-		static const uint8_t f2_f[]  = {0x48, 0x83, 0xec, 0x00, 0xf7, 0xc2, 0x00, 0x00, 0x00, 0x00, 0x74, 0x00};
-		static const uint8_t f2_m[]  = {0xFF, 0xFF, 0xFF, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00};
+		// ── V40: f2 FIXED based on V39 diagnostics ──
+		// V39 revealed: Sonoma uses push r12; push rbx; push rax (41 54 53 50)
+		// as function prologue instead of sub rsp,imm8 (48 83 ec).
+		// Two matching test edx,imm32; je found at +0x38b0 and +0x102e6.
+		// Patching both (count=2) to bypass capability checks.
+		static const uint8_t f2_f[]  = {0x41, 0x54, 0x53, 0x50, 0xf7, 0xc2, 0x00, 0x00, 0x00, 0x00, 0x74, 0x00};
+		static const uint8_t f2_m[]  = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00};
 		static const uint8_t f2_r[]  = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xEB, 0x00};
 		static const uint8_t f2_rm[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00};
-		const LookupPatchPlus p2 {&kextIOAcceleratorFamily2, f2_f, f2_m, f2_r, f2_rm, 1};
+		const LookupPatchPlus p2 {&kextIOAcceleratorFamily2, f2_f, f2_m, f2_r, f2_rm, 2};
 		bool f2ok = p2.apply(patcher, address, size);
 		patcher.clearError();
-		SYSLOG("NGreen", "IOAccelF2 f2 (masked): %s", f2ok ? "OK" : "FAILED");
+		SYSLOG("NGreen", "IOAccelF2 f2 (fixed): %s", f2ok ? "OK" : "FAILED");
 		
-		// ── V38: Debug why patches fail — find best partial match ──
+		// ── V40: f1 diagnostic — dump 48 bytes around each 45 8b 8f anchor ──
+		// V39 showed the je is NOT at position -2 from the anchor.
+		// Need to find where the actual conditional jump is.
 		{
 			const uint8_t *bin = reinterpret_cast<const uint8_t *>(address);
-			
-			// For f1: find the offset with the most masked-byte matches
-			if (!f1ok) {
-				size_t bestOff = 0; int bestScore = 0;
-				for (size_t i = 0; i + sizeof(f1_f) <= size; i++) {
-					int score = 0;
-					for (size_t j = 0; j < sizeof(f1_f); j++) {
-						if ((bin[i+j] & f1_m[j]) == (f1_f[j] & f1_m[j])) score++;
+			int n = 0;
+			for (size_t i = 48; i + 16 < size && n < 3; i++) {
+				if (bin[i] == 0x45 && bin[i+1] == 0x8b && bin[i+2] == 0x8f) {
+					uint32_t off = (uint32_t)bin[i+3] | ((uint32_t)bin[i+4]<<8) |
+					               ((uint32_t)bin[i+5]<<16) | ((uint32_t)bin[i+6]<<24);
+					SYSLOG("NGreen", "f1 anchor#%d at +0x%lx: mov r9d,[r15+0x%x]", n, i, off);
+					SYSLOG("NGreen", "f1 hex[-48..-33]: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
+						bin[i-48],bin[i-47],bin[i-46],bin[i-45], bin[i-44],bin[i-43],bin[i-42],bin[i-41],
+						bin[i-40],bin[i-39],bin[i-38],bin[i-37], bin[i-36],bin[i-35],bin[i-34],bin[i-33]);
+					SYSLOG("NGreen", "f1 hex[-32..-17]: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
+						bin[i-32],bin[i-31],bin[i-30],bin[i-29], bin[i-28],bin[i-27],bin[i-26],bin[i-25],
+						bin[i-24],bin[i-23],bin[i-22],bin[i-21], bin[i-20],bin[i-19],bin[i-18],bin[i-17]);
+					SYSLOG("NGreen", "f1 hex[-16..-1]:  %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
+						bin[i-16],bin[i-15],bin[i-14],bin[i-13], bin[i-12],bin[i-11],bin[i-10],bin[i-9],
+						bin[i-8],bin[i-7],bin[i-6],bin[i-5], bin[i-4],bin[i-3],bin[i-2],bin[i-1]);
+					SYSLOG("NGreen", "f1 hex[0..+15]:   [458b8f]%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x%02x%02x%02x",
+						bin[i+3],bin[i+4],bin[i+5],bin[i+6],
+						bin[i+7],bin[i+8],bin[i+9],bin[i+10],bin[i+11],bin[i+12],bin[i+13],bin[i+14],bin[i+15]);
+					
+					// Scan backward for je (74), jne (75), near je (0F 84), near jne (0F 85)
+					for (int back = 2; back <= 48; back++) {
+						uint8_t b = bin[i - back];
+						if (b == 0x74 || b == 0x75) {
+							SYSLOG("NGreen", "f1 anchor#%d: SHORT %s at -%d (0x%02x %02x)",
+								n, b == 0x74 ? "je" : "jne", back, b, bin[i - back + 1]);
+						}
+						if (back >= 2 && bin[i - back] == 0x0f &&
+						    (bin[i - back + 1] == 0x84 || bin[i - back + 1] == 0x85)) {
+							SYSLOG("NGreen", "f1 anchor#%d: NEAR %s at -%d (0f %02x %02x%02x%02x%02x)",
+								n, bin[i-back+1] == 0x84 ? "je" : "jne", back,
+								bin[i-back+1], bin[i-back+2], bin[i-back+3], bin[i-back+4], bin[i-back+5]);
+						}
 					}
-					if (score > bestScore) { bestScore = score; bestOff = i; }
+					n++;
 				}
-				SYSLOG("NGreen", "f1 BEST partial match: %d/%lu bytes at +0x%lx",
-					bestScore, sizeof(f1_f), bestOff);
-				// Dump the actual bytes vs expected at the best match
-				if (bestScore > 0 && bestOff + sizeof(f1_f) <= size) {
-					SYSLOG("NGreen", "f1 BEST actual: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
-						bin[bestOff+0], bin[bestOff+1], bin[bestOff+2], bin[bestOff+3], bin[bestOff+4],
-						bin[bestOff+5], bin[bestOff+6], bin[bestOff+7], bin[bestOff+8], bin[bestOff+9]);
-					SYSLOG("NGreen", "f1 BEST expect: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
-						f1_f[0], f1_f[1], f1_f[2], f1_f[3], f1_f[4],
-						f1_f[5], f1_f[6], f1_f[7], f1_f[8], f1_f[9]);
-					SYSLOG("NGreen", "f1 BEST mask:   %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
-						f1_m[0], f1_m[1], f1_m[2], f1_m[3], f1_m[4],
-						f1_m[5], f1_m[6], f1_m[7], f1_m[8], f1_m[9]);
-					// Show each byte match/fail
-					for (size_t j = 0; j < sizeof(f1_f); j++) {
-						bool match = (bin[bestOff+j] & f1_m[j]) == (f1_f[j] & f1_m[j]);
-						if (!match && f1_m[j])
-							SYSLOG("NGreen", "f1 MISMATCH byte %lu: actual=0x%02x expected=0x%02x mask=0x%02x",
-								j, bin[bestOff+j], f1_f[j], f1_m[j]);
-					}
-				}
-				
-				// Also: find all instances of the core anchor 45 8b 8f (mov r9d,[r15+disp32])
-				int n = 0;
-				for (size_t i = 0; i + 7 < size && n < 5; i++) {
-					if (bin[i] == 0x45 && bin[i+1] == 0x8b && bin[i+2] == 0x8f) {
-						SYSLOG("NGreen", "f1 anchor 45_8b_8f at +0x%lx: ctx= %02x%02x [458b8f] %02x%02x%02x%02x %02x%02x",
-							i, (i >= 2 ? bin[i-2] : 0), (i >= 1 ? bin[i-1] : 0),
-							bin[i+3], bin[i+4], bin[i+5], bin[i+6], bin[i+7],
-							(i+8 < size ? bin[i+8] : 0));
-						n++;
-					}
-				}
-				if (!n) SYSLOG("NGreen", "f1: no 45_8b_8f in entire binary — anchor assumption wrong");
 			}
-			
-			// For f2: find the offset with the most masked-byte matches
-			if (!f2ok) {
-				size_t bestOff = 0; int bestScore = 0;
-				for (size_t i = 0; i + sizeof(f2_f) <= size; i++) {
-					int score = 0;
-					for (size_t j = 0; j < sizeof(f2_f); j++) {
-						if ((bin[i+j] & f2_m[j]) == (f2_f[j] & f2_m[j])) score++;
-					}
-					if (score > bestScore) { bestScore = score; bestOff = i; }
-				}
-				SYSLOG("NGreen", "f2 BEST partial match: %d/%lu bytes at +0x%lx",
-					bestScore, sizeof(f2_f), bestOff);
-				if (bestScore > 0 && bestOff + sizeof(f2_f) <= size) {
-					SYSLOG("NGreen", "f2 BEST actual: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
-						bin[bestOff+0], bin[bestOff+1], bin[bestOff+2], bin[bestOff+3],
-						bin[bestOff+4], bin[bestOff+5], bin[bestOff+6], bin[bestOff+7],
-						bin[bestOff+8], bin[bestOff+9], bin[bestOff+10], bin[bestOff+11]);
-					SYSLOG("NGreen", "f2 BEST expect: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
-						f2_f[0], f2_f[1], f2_f[2], f2_f[3], f2_f[4], f2_f[5],
-						f2_f[6], f2_f[7], f2_f[8], f2_f[9], f2_f[10], f2_f[11]);
-					SYSLOG("NGreen", "f2 BEST mask:   %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
-						f2_m[0], f2_m[1], f2_m[2], f2_m[3], f2_m[4], f2_m[5],
-						f2_m[6], f2_m[7], f2_m[8], f2_m[9], f2_m[10], f2_m[11]);
-					for (size_t j = 0; j < sizeof(f2_f); j++) {
-						bool match = (bin[bestOff+j] & f2_m[j]) == (f2_f[j] & f2_m[j]);
-						if (!match && f2_m[j])
-							SYSLOG("NGreen", "f2 MISMATCH byte %lu: actual=0x%02x expected=0x%02x mask=0x%02x",
-								j, bin[bestOff+j], f2_f[j], f2_m[j]);
-					}
-				}
-				
-				// Find ALL test edx,imm32 (f7 c2) and test esi,imm32 (f7 c6) 
-				int n = 0;
-				for (size_t i = 0; i + 10 < size && n < 8; i++) {
-					if (bin[i] == 0xf7 && (bin[i+1] == 0xc2 || bin[i+1] == 0xc6 || 
-					    bin[i+1] == 0xc1 || bin[i+1] == 0xc7 || bin[i+1] == 0xc0)) {
-						SYSLOG("NGreen", "f2 test_r32 at +0x%lx: %02x%02x%02x%02x [f7 %02x] %02x%02x%02x%02x %02x%02x",
-							i, (i >= 4 ? bin[i-4] : 0), (i >= 3 ? bin[i-3] : 0),
-							(i >= 2 ? bin[i-2] : 0), (i >= 1 ? bin[i-1] : 0),
-							bin[i+1],
-							bin[i+2], bin[i+3], bin[i+4], bin[i+5],
-							bin[i+6], bin[i+7]);
-						n++;
-					}
-				}
-				if (!n) SYSLOG("NGreen", "f2: no test r32,imm32 (f7 cX) in entire binary");
-				
-				// Also search for sub rsp (48 83 ec) to verify f2 prefix exists
-				n = 0;
-				for (size_t i = 0; i + 16 < size && n < 5; i++) {
-					if (bin[i] == 0x48 && bin[i+1] == 0x83 && bin[i+2] == 0xec) {
-						SYSLOG("NGreen", "f2 sub_rsp at +0x%lx: [4883ec]%02x %02x%02x%02x%02x%02x%02x %02x%02x%02x",
-							i, bin[i+3],
-							bin[i+4], bin[i+5], bin[i+6], bin[i+7], bin[i+8], bin[i+9],
-							bin[i+10], bin[i+11], bin[i+12]);
-						n++;
-					}
-				}
-				if (!n) SYSLOG("NGreen", "f2: no sub rsp,imm8 (48 83 ec) found");
-			}
+			if (!n) SYSLOG("NGreen", "f1: no 45_8b_8f anchors found in binary");
 		}
 		
 	}  else if (kextIOGraphics.loadIndex == index) {
