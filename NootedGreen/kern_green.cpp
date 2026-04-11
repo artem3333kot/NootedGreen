@@ -162,7 +162,11 @@ void NGreen::processPatcher(KernelPatcher &patcher) {
 	PANIC_COND(!patcher.routeMultipleLong(KernelPatcher::KernelID, &request, 1), "ngreen",
 		"Failed to route kernel symbols");*/
 	
-	dyldpatches.processPatcher(patcher);
+	if (!checkKernelArgument("-nbdyldoff")) {
+		dyldpatches.processPatcher(patcher);
+	} else {
+		DBGLOG("ngreen", "DYLD patches disabled by boot argument -nbdyldoff");
+	}
 }
 
 OSMetaClassBase *NGreen::wrapSafeMetaCast(const OSMetaClassBase *anObject, const OSMetaClass *toMeta) {
