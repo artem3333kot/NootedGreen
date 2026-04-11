@@ -1,27 +1,40 @@
 # NootedGreen
-A [Lilu](https://github.com/acidanthera/Lilu) plugin that provides support for unsupported Intel iGPUs
 
-The Source Code of this Original Work is licensed under the `Thou Shalt Not Profit License version 1.0`. See [`LICENSE`](https://github.com/NootInc/NootedRed/blob/master/LICENSE)
+Lilu plugin for Intel Raptor Lake-P (RPL-P) iGPU acceleration on macOS Sonoma via TGL driver spoofing.
 
-## Current Progress:
-- Haswell: Work is under way on adding Mojave patches from HSWGT1Fixup
-- Gen 8: N/A
-- Gen 9: N/A
-- Gen 9.5: N/A
-- Gen 11: N/A
+## What it does
 
-Note: you still have to set `AAPL,ig-platform-id` and you also have to add `-disablegfxfirmware` if you are on Skylake+
-Refer to [WhateverGreen's Framebuffer list](https://github.com/acidanthera/WhateverGreen/blob/master/Manual/FAQ.IntelHD.en.md) on what framebuffer to set for your system.
+Patches Apple's Tiger Lake (Gen12) graphics drivers to work with Raptor Lake-P (Gen12.5) silicon. Handles MMIO addressing, ForceWake, GPU topology, display controller init, and GT workarounds.
 
-## Compatibility:
-- Haswell (10.12+)
-- Broadwell (10.14+, work in progress)
-- Braswell (10.14+, work in progress)
-### These Generations may be worked on in the future:
-- Skylake
-- Apollo Lake
-- Kaby Lake
-- Coffee Lake
-- Gemini Lake
-- Ice Lake
-- Jasper/Elkhart Lake
+## Status
+
+**Work in progress.** Display output works. GPU acceleration (stamp 3) is under active debugging.
+
+## Requirements
+
+- [Lilu](https://github.com/acidanthera/Lilu) 1.7.2+
+- macOS Sonoma 14.x
+- Intel Raptor Lake-P iGPU (device ID `0x9A49`)
+- AAPL,ig-platform-id: `0300C89B`
+
+## Boot args
+
+```
+-v keepsyms=1 debug=0x100 -liludbg -NGreenDebug -disablegfxfirmware -nbdyldoff ngreen-dmc=skip -allow3d
+```
+
+| Arg | Purpose |
+|---|---|
+| `-NGreenDebug` | Enable NootedGreen debug logging |
+| `-disablegfxfirmware` | Disable GuC/HuC firmware loading |
+| `-nbdyldoff` | Disable DYLD patches |
+| `ngreen-dmc=skip` | Skip DMC firmware |
+| `-allow3d` | Force 3D acceleration |
+
+## Building
+
+Open `NootedBlue.xcodeproj`, select the **NootedGreen** scheme, and build with Xcode.
+
+## License
+
+[Thou Shalt Not Profit License 1.0](LICENSE)
