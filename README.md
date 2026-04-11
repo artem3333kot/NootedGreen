@@ -13,11 +13,9 @@ Patches Apple's Tiger Lake (Gen12) graphics drivers to work with Raptor Lake-P (
 ## Requirements
 
 - [Lilu](https://github.com/acidanthera/Lilu) 1.7.2+
-- macOS Sonoma 14.x
-- Intel Raptor Lake-P iGPU
-- SMBIOS: `MacBookPro16,2`
-- No iGPU DeviceProperties needed — NootedGreen auto-injects `AAPL,ig-platform-id`
-- Discrete GPU disabled via `disable-gpu` on its PCI path
+- macOS Sonoma 14.x (RPL-P) or macOS 10.12–14.x (legacy NootedBlue targets)
+- Supported Intel iGPU (see **Compatibility** below)
+- Discrete GPU disabled via `disable-gpu` on its PCI path (if present)
 
 ## Boot args
 
