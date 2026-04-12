@@ -1888,6 +1888,11 @@ bool Gen11::start(void *that,void  *param_1)
 		NGreen::callback->readReg32(RENDER_RING_BASE + 0x358),
 		NGreen::callback->readReg32(BLT_RING_BASE + 0x358));
 	
+	// ── V49: Log Metal-readiness summary ──
+	SYSLOG("ngreen", "V49: start() ret=%d — DYLD path redirect /System/Library/Extensions/ → /Library/Extensions/", ret);
+	SYSLOG("ngreen", "V49: Metal ON. ICL f2 mask-based. Use -ngreenNoMetal for display-only.");
+	SYSLOG("ngreen", "V49: TGL Metal driver must exist at /Library/Extensions/AppleIntelTGLGraphicsMTLDriver.bundle/");
+	
 	// Release both ForceWake domains
 	NGreen::callback->writeReg32(FORCEWAKE_RENDER_GEN9, (1 << 16) | 0);
 	NGreen::callback->writeReg32(FORCEWAKE_BLITTER_GEN9, (1 << 16) | 0);

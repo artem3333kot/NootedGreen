@@ -8,7 +8,7 @@ Patches Apple's Tiger Lake (Gen12) graphics drivers to work with newer Intel iGP
 
 ## Status
 
-**Work in progress.** Framebuffer controller starts, combo PHY calibration patched, accelerator ring initialises, host-based scheduler (type 5) active with RCS ring running. Display pipeline working (eDP trained, cursor visible). WindowServer connects successfully — 12 user clients created (2x IGAccel2DContext, 2x IOAccelDisplayPipeUserClient2, 8x IGAccelSurface). Metal rendering path conditionally enabled via boot-arg. DYLD patches hook `_cs_validate_page` early (before DeviceInfo) to ensure CoreDisplay is patched before WindowServer starts. GPU command submission under active development.
+**Work in progress.** Framebuffer controller starts, combo PHY calibration patched, accelerator ring initialises, host-based scheduler (type 5) active with RCS ring running. Display pipeline working (eDP trained, cursor visible). WindowServer connects successfully — 12 user clients created (2x IGAccel2DContext, 2x IOAccelDisplayPipeUserClient2, 8x IGAccelSurface). DYLD patches hook `_cs_validate_page` early (before DeviceInfo) to ensure CoreDisplay is patched before WindowServer starts. Metal rendering enabled by default; DYLD path redirect (`-ngreenLibExt`) lets Metal.framework find TGL driver bundles at `/Library/Extensions/` since Apple never shipped a TGL Mac and the drivers aren't in `/System/Library/Extensions/`. ICL Metal driver device-ID bypass uses mask-based matching for build portability. GPU command submission under active development.
 
 ## Requirements
 
@@ -20,7 +20,7 @@ Patches Apple's Tiger Lake (Gen12) graphics drivers to work with newer Intel iGP
 ## Boot args
 
 ```
--v keepsyms=1 debug=0x100 -liludbg liludump=60 -NGreenDebug -disablegfxfirmware -ngreenAllowMetal
+-v keepsyms=1 debug=0x100 -liludbg liludump=60 -NGreenDebug -disablegfxfirmware -ngreenLibExt
 ```
 
 | Arg | Purpose |
@@ -30,7 +30,9 @@ Patches Apple's Tiger Lake (Gen12) graphics drivers to work with newer Intel iGP
 | `ngreenSched=N` | Select GPU scheduler type: `3` = GuC firmware, `4` = IGScheduler4, `5` = host preemptive (default: `5`) |
 | `ngreen-dmc=skip` | Skip DMC firmware |
 | `-allow3d` | Force 3D acceleration |
-| `-ngreenAllowMetal` | Allow Metal rendering — only apply assertion bypass, keep display pipeline intact |
+| `-ngreenLibExt` | **Redirect Metal plugin path** from `/System/Library/Extensions/` to `/Library/Extensions/` — required for TGL since Apple never shipped TGL drivers in the system volume. Without this, manually copy TGL bundles to `/System/Library/Extensions/` (SIP off). |
+| `-ngreenNoMetal` | Disable Metal rendering — stub out CoreDisplay Metal paths to prevent NULL MTLDevice crashes (display-only debug mode) |
+| `-ngreenAllowMetal` | Legacy flag (backward compat) — forces Metal ON, equivalent to not setting `-ngreenNoMetal` |
 | `-nbdyldoff` | **Disable ALL DYLD patches** (CoreDisplay, OpenGL, Metal, SkyLight) — debug only |
 | `IGLogLevel=8` | Maximum Intel GPU driver logging |
 | `-liludbg` | Enable Lilu debug logging |
