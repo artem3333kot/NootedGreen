@@ -196,8 +196,9 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 	
 	
     if (getKernelVersion() >= KernelVersion::Ventura) {
-        // V48: Metal is ON by default now that device-ID patches (f1/f2) are wired up.
-        // Use -ngreenNoMetal boot-arg to disable Metal and apply CoreDisplay stubs
+        // V49: Metal is ON by default. The path redirect (-ngreenLibExt) and
+        // mask-based ICL f2 bypass handle driver loading and device-ID checks.
+        // Use -ngreenNoMetal to disable Metal and apply CoreDisplay stubs
         // (for debugging display-only mode without GPU acceleration).
         static bool noMetalChecked = false;
         static bool noMetal = false;
