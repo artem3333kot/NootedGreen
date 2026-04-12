@@ -1893,6 +1893,91 @@ bool Gen11::start(void *that,void  *param_1)
 	SYSLOG("ngreen", "V50: Metal ON. ICL f2 mask-based (fallback). Use -ngreenNoMetal for display-only.");
 	SYSLOG("ngreen", "V50: TGL Metal driver must exist at /Library/Extensions/AppleIntelTGLGraphicsMTLDriver.bundle/");
 	
+	// ── V51: Clear GPU errors — give Metal a clean slate ──
+	// ERROR_GEN6 is W1C (write-1-to-clear). Stale errors from init may cause
+	// the Metal plugin to reject the device during MTLDevice creation.
+	// Per-engine EIR/ESR registers are also W1C.
+	{
+		// 1. Clear global error register
+		uint32_t errPre = NGreen::callback->readReg32(ERROR_GEN6);
+		if (errPre) {
+			NGreen::callback->writeReg32(ERROR_GEN6, errPre);
+			IODelay(100);
+			uint32_t errPost = NGreen::callback->readReg32(ERROR_GEN6);
+			SYSLOG("ngreen", "V51: cleared ERROR_GEN6: 0x%x -> 0x%x", errPre, errPost);
+		} else {
+			SYSLOG("ngreen", "V51: ERROR_GEN6 already clean");
+		}
+		
+		// 2. Clear per-engine error interrupt registers
+		uint32_t rcsEir = NGreen::callback->readReg32(RING_EIR(RENDER_RING_BASE));
+		uint32_t bcsEir = NGreen::callback->readReg32(RING_EIR(BLT_RING_BASE));
+		uint32_t rcsEsr = NGreen::callback->readReg32(RING_ESR(RENDER_RING_BASE));
+		uint32_t bcsEsr = NGreen::callback->readReg32(RING_ESR(BLT_RING_BASE));
+		if (rcsEir) NGreen::callback->writeReg32(RING_EIR(RENDER_RING_BASE), rcsEir);
+		if (bcsEir) NGreen::callback->writeReg32(RING_EIR(BLT_RING_BASE), bcsEir);
+		if (rcsEsr) NGreen::callback->writeReg32(RING_ESR(RENDER_RING_BASE), rcsEsr);
+		if (bcsEsr) NGreen::callback->writeReg32(RING_ESR(BLT_RING_BASE), bcsEsr);
+		SYSLOG("ngreen", "V51: cleared RCS EIR=0x%x ESR=0x%x, BCS EIR=0x%x ESR=0x%x",
+			   rcsEir, rcsEsr, bcsEir, bcsEsr);
+		
+		// 3. Clear ring fault register
+		uint32_t ringFault = NGreen::callback->readReg32(GEN12_RING_FAULT_REG);
+		if (ringFault) {
+			NGreen::callback->writeReg32(GEN12_RING_FAULT_REG, 0);
+			SYSLOG("ngreen", "V51: cleared RING_FAULT=0x%x", ringFault);
+		}
+		
+		// 4. Clear TLB fault data
+		uint32_t tlb0 = NGreen::callback->readReg32(GEN8_FAULT_TLB_DATA0);
+		uint32_t tlb1 = NGreen::callback->readReg32(GEN8_FAULT_TLB_DATA1);
+		if (tlb0 || tlb1) {
+			NGreen::callback->writeReg32(GEN8_FAULT_TLB_DATA0, 0);
+			NGreen::callback->writeReg32(GEN8_FAULT_TLB_DATA1, 0);
+			SYSLOG("ngreen", "V51: cleared TLB_FAULT data0=0x%x data1=0x%x", tlb0, tlb1);
+		}
+		
+		// 5. Clear GT interrupt identity (W1C) so stale interrupts don't confuse scheduler
+		uint32_t gtIntr0 = NGreen::callback->readReg32(GEN11_GT_INTR_DW0);
+		uint32_t gtIntr1 = NGreen::callback->readReg32(GEN11_GT_INTR_DW1);
+		if (gtIntr0) NGreen::callback->writeReg32(GEN11_GT_INTR_DW0, gtIntr0);
+		if (gtIntr1) NGreen::callback->writeReg32(GEN11_GT_INTR_DW1, gtIntr1);
+		SYSLOG("ngreen", "V51: cleared GT_INTR DW0=0x%x DW1=0x%x", gtIntr0, gtIntr1);
+	}
+	
+	// ── V51: BCS engine stop+clear ──
+	// BCS ring is dead (CTL=0x0, EXECLIST_STATUS=0x1). The Host scheduler
+	// attempted context submission but the engine never started. Clear the
+	// engine state so it can be retried by the scheduler on first Metal blit.
+	{
+		uint32_t bcsCtlNow = NGreen::callback->readReg32(RING_CTL(BLT_RING_BASE));
+		if (bcsCtlNow == 0) {
+			SYSLOG("ngreen", "V51: BCS ring dead (CTL=0x0) — clearing engine state");
+			
+			// Request engine stop via masked write (set STOP_RING with mask bit)
+			NGreen::callback->writeReg32(RING_MI_MODE(BLT_RING_BASE), 
+				(uint32_t)STOP_RING | ((uint32_t)STOP_RING << 16));
+			IODelay(500);
+			
+			// Clear STOP request
+			NGreen::callback->writeReg32(RING_MI_MODE(BLT_RING_BASE),
+				(uint32_t)STOP_RING << 16);
+			IODelay(100);
+			
+			// Reset HEAD and TAIL
+			NGreen::callback->writeReg32(RING_HEAD(BLT_RING_BASE), 0);
+			NGreen::callback->writeReg32(RING_TAIL(BLT_RING_BASE), 0);
+			
+			uint32_t bcsCtlAfter = NGreen::callback->readReg32(RING_CTL(BLT_RING_BASE));
+			uint32_t bcsExec = NGreen::callback->readReg32(RING_EXECLIST_STATUS(BLT_RING_BASE));
+			SYSLOG("ngreen", "V51: BCS after clear: CTL=0x%x EXECLIST=0x%x", bcsCtlAfter, bcsExec);
+		} else {
+			SYSLOG("ngreen", "V51: BCS ring active (CTL=0x%x) — no reset needed", bcsCtlNow);
+		}
+	}
+	
+	SYSLOG("ngreen", "V51: GPU error clearing complete — Metal should see a clean GPU");
+	
 	// Release both ForceWake domains
 	NGreen::callback->writeReg32(FORCEWAKE_RENDER_GEN9, (1 << 16) | 0);
 	NGreen::callback->writeReg32(FORCEWAKE_BLITTER_GEN9, (1 << 16) | 0);
