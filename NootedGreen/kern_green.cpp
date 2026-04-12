@@ -64,6 +64,16 @@ void NGreen::init() {
 
 
 void NGreen::processPatcher(KernelPatcher &patcher) {
+	// Hook _cs_validate_page FIRST — before DeviceInfo which blocks
+	// for >60s polling PEGP (NVIDIA dGPU) disable via processSwitchOff.
+	// Without this, WindowServer starts before the hook is established
+	// and CoreDisplay loads unpatched from the shared cache.
+	if (!checkKernelArgument("-nbdyldoff")) {
+		dyldpatches.processPatcher(patcher);
+	} else {
+		DBGLOG("ngreen", "DYLD patches disabled by boot argument -nbdyldoff");
+	}
+	
     auto *devInfo = DeviceInfo::create();
     if (devInfo) {
         devInfo->processSwitchOff();
@@ -161,12 +171,6 @@ void NGreen::processPatcher(KernelPatcher &patcher) {
 		this->orgSafeMetaCast};
 	PANIC_COND(!patcher.routeMultipleLong(KernelPatcher::KernelID, &request, 1), "ngreen",
 		"Failed to route kernel symbols");*/
-	
-	if (!checkKernelArgument("-nbdyldoff")) {
-		dyldpatches.processPatcher(patcher);
-	} else {
-		DBGLOG("ngreen", "DYLD patches disabled by boot argument -nbdyldoff");
-	}
 }
 
 OSMetaClassBase *NGreen::wrapSafeMetaCast(const OSMetaClassBase *anObject, const OSMetaClass *toMeta) {

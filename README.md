@@ -8,19 +8,19 @@ Patches Apple's Tiger Lake (Gen12) graphics drivers to work with newer Intel iGP
 
 ## Status
 
-**Work in progress.** Framebuffer controller starts, combo PHY calibration patched, accelerator ring initialises, host-based scheduler (type 5) active with RCS ring running. Display pipeline working (eDP trained, cursor visible). WindowServer connects successfully — 12 user clients created (2x IGAccel2DContext, 2x IOAccelDisplayPipeUserClient2, 8x IGAccelSurface). Metal rendering path conditionally enabled via boot-arg. GPU command submission under active development.
+**Work in progress.** Framebuffer controller starts, combo PHY calibration patched, accelerator ring initialises, host-based scheduler (type 5) active with RCS ring running. Display pipeline working (eDP trained, cursor visible). WindowServer connects successfully — 12 user clients created (2x IGAccel2DContext, 2x IOAccelDisplayPipeUserClient2, 8x IGAccelSurface). Metal rendering path conditionally enabled via boot-arg. DYLD patches hook `_cs_validate_page` early (before DeviceInfo) to ensure CoreDisplay is patched before WindowServer starts. GPU command submission under active development.
 
 ## Requirements
 
 - [Lilu](https://github.com/acidanthera/Lilu) 1.7.2+
 - macOS Sonoma 14.x (Gen11/Gen12 targets) or macOS 10.12–14.x (legacy NootedBlue targets)
 - Supported Intel iGPU (see **Compatibility** below)
-- Discrete GPU disabled via `disable-gpu` on its PCI path (if present)
+- Discrete GPU disabled via SSDT (recommended) or `disable-gpu` DeviceProperty on its PCI path
 
 ## Boot args
 
 ```
--v keepsyms=1 debug=0x100 IGLogLevel=8 -wegdbg -NGreenDebug -liludbg liludump=60 -nbdyldoff ngreen-dmc=skip -allow3d -disablegfxfirmware -ngreenAllowMetal
+-v keepsyms=1 debug=0x100 -liludbg liludump=60 -NGreenDebug -ngreenAllowMetal
 ```
 
 | Arg | Purpose |
@@ -28,13 +28,11 @@ Patches Apple's Tiger Lake (Gen12) graphics drivers to work with newer Intel iGP
 | `-NGreenDebug` | Enable NootedGreen debug logging |
 | `-disablegfxfirmware` | Disable GuC/HuC firmware loading (legacy, prefer `ngreenSched`) |
 | `ngreenSched=N` | Select GPU scheduler type: `3` = GuC firmware, `4` = IGScheduler4, `5` = host preemptive (default: `5`) |
-| `-nbdyldoff` | Disable DYLD patches |
 | `ngreen-dmc=skip` | Skip DMC firmware |
 | `-allow3d` | Force 3D acceleration |
-| `-ngreenAllowMetal` | Allow Metal rendering — skip CoreDisplay patches that block Metal GPU commands (V47+) |
-| `-nbwegcoex` | Enable WEG coexistence mode (run alongside WhateverGreen, skips overlapping routes) |
+| `-ngreenAllowMetal` | Allow Metal rendering — only apply assertion bypass, keep display pipeline intact |
+| `-nbdyldoff` | **Disable ALL DYLD patches** (CoreDisplay, OpenGL, Metal, SkyLight) — debug only |
 | `IGLogLevel=8` | Maximum Intel GPU driver logging |
-| `-wegdbg` | Enable WhateverGreen debug logging |
 | `-liludbg` | Enable Lilu debug logging |
 | `liludump=60` | Dump Lilu logs after 60 seconds |
 
