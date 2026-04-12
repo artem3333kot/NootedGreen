@@ -252,6 +252,35 @@ struct PACKED intel_dmc_header_v3 {
 #define RING_HWSTAM(base)			((base) + 0x98)
 #define RING_MI_MODE(base)			((base) + 0x9c)
 #define RING_MODE_GEN7(base)		((base) + 0x29c)
+#define RING_ACTHD(base)			((base) + 0x74)
+#define RING_ACTHD_UDW(base)		((base) + 0x5c)
+#define RING_IPEHR(base)			((base) + 0x68)
+#define RING_IPEIR(base)			((base) + 0x64)
+#define RING_INSTDONE(base)			((base) + 0x6c)
+#define RING_ESR(base)				((base) + 0xb8)
+#define RING_CTX_SIZE(base)			((base) + 0x1a0) /* context size */
+#define RING_CCID(base)				((base) + 0x180) /* context control ID */
+#define RING_CTX_CTRL(base)			((base) + 0x244) /* context control */
+#define RING_EXECLIST_STATUS(base)	((base) + 0x234)
+#define RING_CONTEXT_STATUS_PTR(base) ((base) + 0x3a0)
+#define RING_MODE(base)				((base) + 0x29c)
+#define RING_FAULT_REG(base)		((base) + 0x150)
+#define RING_DMA_FADD(base)			((base) + 0x78)
+#define RING_DMA_FADD_UDW(base)		((base) + 0x60)
+#define RING_INSTPM(base)			((base) + 0xC0)
+#define RING_CONTEXT_STATUS_BUF(base, idx)    ((base) + 0x370 + (idx) * 8)
+#define RING_CONTEXT_STATUS_BUF_HI(base, idx) ((base) + 0x374 + (idx) * 8)
+
+// Global error/fault registers
+#define ERROR_GEN6				0x40A0
+#define GEN12_RING_FAULT_REG	0xCEC4
+#define GEN8_FAULT_TLB_DATA0	0x4B10
+#define GEN8_FAULT_TLB_DATA1	0x4B14
+
+// GGTT PTE base within BAR0 (Gen8+: 8MB into MMIO BAR, each PTE is 8 bytes)
+#define GEN8_GGTT_PTE_BASE		0x800000
+#define GGTT_PTE_LO(page)		(GEN8_GGTT_PTE_BASE + (page) * 8)
+#define GGTT_PTE_HI(page)		(GEN8_GGTT_PTE_BASE + (page) * 8 + 4)
 #define   GEN11_GFX_DISABLE_LEGACY_MODE		(1 << 3)
 #define   STOP_RING				REG_BIT(8)
 // Engine ring base addresses (RCS=render, BCS=blitter, VCS/BSD=video, VECS=video enhance)
@@ -1246,6 +1275,7 @@ private:
 	
 	// ── Accelerator start & forcewake ──
 	static bool start(void *that,void  *param_1);   // IntelAccelerator::start wrapper
+	static void v53TimerCallback(thread_call_param_t, thread_call_param_t);  // V53: timer diagnostic
 	mach_vm_address_t ostart {};
 	
 	static bool patchRCSCheck(mach_vm_address_t& start);  // bypass RCS engine check

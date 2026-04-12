@@ -1403,6 +1403,98 @@ static void v45ScheduleDelayedCheck(void *accelInstance, unsigned delayMs) {
 	}
 }
 
+// V53: Static timer callback to dump GPU state if start() hangs
+void Gen11::v53TimerCallback(thread_call_param_t, thread_call_param_t) {
+	static bool v53TimerFired = false;
+	if (v53TimerFired) return;
+	v53TimerFired = true;
+	
+	SYSLOG("ngreen", "=== V53 TIMER: start() still blocked after 8s ===");
+	
+	// Acquire ForceWake for reliable register reads
+	NGreen::callback->writeReg32(FORCEWAKE_RENDER_GEN9, (1 << 16) | 1);
+	NGreen::callback->writeReg32(FORCEWAKE_BLITTER_GEN9, (1 << 16) | 1);
+	IODelay(1000);
+	
+	SYSLOG("ngreen", "V53T ForceWake ACK: Render=0x%x Blitter=0x%x",
+		NGreen::callback->readReg32(FORCEWAKE_ACK_RENDER_GEN9),
+		NGreen::callback->readReg32(FORCEWAKE_ACK_BLITTER_GEN9));
+	
+	// RCS state
+	SYSLOG("ngreen", "V53T RCS HEAD=0x%x TAIL=0x%x CTL=0x%x START=0x%x",
+		NGreen::callback->readReg32(RING_HEAD(RENDER_RING_BASE)),
+		NGreen::callback->readReg32(RING_TAIL(RENDER_RING_BASE)),
+		NGreen::callback->readReg32(RING_CTL(RENDER_RING_BASE)),
+		NGreen::callback->readReg32(RING_START(RENDER_RING_BASE)));
+	SYSLOG("ngreen", "V53T RCS ACTHD=0x%x:%08x IPEHR=0x%x IPEIR=0x%x",
+		NGreen::callback->readReg32(RING_ACTHD_UDW(RENDER_RING_BASE)),
+		NGreen::callback->readReg32(RING_ACTHD(RENDER_RING_BASE)),
+		NGreen::callback->readReg32(RING_IPEHR(RENDER_RING_BASE)),
+		NGreen::callback->readReg32(RING_IPEIR(RENDER_RING_BASE)));
+	SYSLOG("ngreen", "V53T RCS MI_MODE=0x%x RING_MODE=0x%x INSTDONE=0x%x",
+		NGreen::callback->readReg32(RING_MI_MODE(RENDER_RING_BASE)),
+		NGreen::callback->readReg32(RING_MODE(RENDER_RING_BASE)),
+		NGreen::callback->readReg32(RING_INSTDONE(RENDER_RING_BASE)));
+	SYSLOG("ngreen", "V53T RCS EXECLIST_STATUS=0x%x CTX_STATUS_PTR=0x%x",
+		NGreen::callback->readReg32(RING_EXECLIST_STATUS(RENDER_RING_BASE)),
+		NGreen::callback->readReg32(RING_CONTEXT_STATUS_PTR(RENDER_RING_BASE)));
+	SYSLOG("ngreen", "V53T RCS EIR=0x%x ESR=0x%x EMR=0x%x",
+		NGreen::callback->readReg32(RING_EIR(RENDER_RING_BASE)),
+		NGreen::callback->readReg32(RING_ESR(RENDER_RING_BASE)),
+		NGreen::callback->readReg32(RING_EMR(RENDER_RING_BASE)));
+	SYSLOG("ngreen", "V53T RCS CTX_SIZE=0x%x CCID=0x%x CTX_CTRL=0x%x",
+		NGreen::callback->readReg32(RING_CTX_SIZE(RENDER_RING_BASE)),
+		NGreen::callback->readReg32(RING_CCID(RENDER_RING_BASE)),
+		NGreen::callback->readReg32(RING_CTX_CTRL(RENDER_RING_BASE)));
+	SYSLOG("ngreen", "V53T RCS TIMESTAMP=0x%x HWS_PGA=0x%x",
+		NGreen::callback->readReg32(RENDER_RING_BASE + 0x358),
+		NGreen::callback->readReg32(RING_HWS_PGA(RENDER_RING_BASE)));
+	
+	// BCS state
+	SYSLOG("ngreen", "V53T BCS HEAD=0x%x TAIL=0x%x CTL=0x%x START=0x%x",
+		NGreen::callback->readReg32(RING_HEAD(BLT_RING_BASE)),
+		NGreen::callback->readReg32(RING_TAIL(BLT_RING_BASE)),
+		NGreen::callback->readReg32(RING_CTL(BLT_RING_BASE)),
+		NGreen::callback->readReg32(RING_START(BLT_RING_BASE)));
+	SYSLOG("ngreen", "V53T BCS EXECLIST_STATUS=0x%x EIR=0x%x ESR=0x%x",
+		NGreen::callback->readReg32(RING_EXECLIST_STATUS(BLT_RING_BASE)),
+		NGreen::callback->readReg32(RING_EIR(BLT_RING_BASE)),
+		NGreen::callback->readReg32(RING_ESR(BLT_RING_BASE)));
+	
+	// VCS (Video Command Streamer — may exist on RPL)
+	SYSLOG("ngreen", "V53T VCS0 HEAD=0x%x TAIL=0x%x CTL=0x%x",
+		NGreen::callback->readReg32(RING_HEAD(GEN11_BSD_RING_BASE)),
+		NGreen::callback->readReg32(RING_TAIL(GEN11_BSD_RING_BASE)),
+		NGreen::callback->readReg32(RING_CTL(GEN11_BSD_RING_BASE)));
+	SYSLOG("ngreen", "V53T VECS0 HEAD=0x%x TAIL=0x%x CTL=0x%x",
+		NGreen::callback->readReg32(RING_HEAD(GEN11_VEBOX_RING_BASE)),
+		NGreen::callback->readReg32(RING_TAIL(GEN11_VEBOX_RING_BASE)),
+		NGreen::callback->readReg32(RING_CTL(GEN11_VEBOX_RING_BASE)));
+	
+	// Global errors
+	SYSLOG("ngreen", "V53T ERROR_GEN6=0x%x RING_FAULT=0x%x",
+		NGreen::callback->readReg32(ERROR_GEN6),
+		NGreen::callback->readReg32(GEN12_RING_FAULT_REG));
+	SYSLOG("ngreen", "V53T FAULT_TLB0=0x%x TLB1=0x%x",
+		NGreen::callback->readReg32(GEN8_FAULT_TLB_DATA0),
+		NGreen::callback->readReg32(GEN8_FAULT_TLB_DATA1));
+	SYSLOG("ngreen", "V53T GT_INTR_DW0=0x%x DW1=0x%x GFX_MSTR_IRQ=0x%x",
+		NGreen::callback->readReg32(GEN11_GT_INTR_DW0),
+		NGreen::callback->readReg32(GEN11_GT_INTR_DW1),
+		NGreen::callback->readReg32(GEN11_GFX_MSTR_IRQ));
+	
+	// Interrupt enable state
+	SYSLOG("ngreen", "V53T RENDER_COPY_INTR_EN=0x%x VCS_VECS_INTR_EN=0x%x",
+		NGreen::callback->readReg32(GEN11_RENDER_COPY_INTR_ENABLE),
+		NGreen::callback->readReg32(GEN11_VCS_VECS_INTR_ENABLE));
+	
+	// Release ForceWake
+	NGreen::callback->writeReg32(FORCEWAKE_RENDER_GEN9, (1 << 16) | 0);
+	NGreen::callback->writeReg32(FORCEWAKE_BLITTER_GEN9, (1 << 16) | 0);
+	
+	SYSLOG("ngreen", "=== V53 TIMER: dump complete ===");
+}
+
 bool Gen11::start(void *that,void  *param_1)
 {
 	// V44: Configurable scheduler type.
@@ -1494,43 +1586,6 @@ bool Gen11::start(void *that,void  *param_1)
 	}
 	SYSLOG("ngreen", "Pre-start ForceWake ACK: 0x%x %s", fwAck, (fwAck & 1) ? "OK" : "TIMEOUT");
 	
-	// Register defines
-	#define ERROR_GEN6         0x40A0
-	#define GEN12_RING_FAULT_REG 0xCEC4
-	#define GEN8_FAULT_TLB_DATA0 0x4B10
-	#define GEN8_FAULT_TLB_DATA1 0x4B14
-	#define RING_EIR(base)     ((base) + 0xB0)
-	#define RING_EMR(base)     ((base) + 0xB4)
-	#define RING_ESR(base)     ((base) + 0xB8)
-	#define RING_FAULT_REG(base) ((base) + 0x150)
-	#define GEN11_GT_INTR_DW0  0x190018
-	#define GEN11_GT_INTR_DW1  0x19001C
-	#define RING_ACTHD(base)   ((base) + 0x74)
-	#define RING_ACTHD_UDW(base) ((base) + 0x5C)
-	#define RING_IPEHR(base)   ((base) + 0x68)
-	#define RING_IPEIR(base)   ((base) + 0x64)
-	#define RING_INSTDONE(base) ((base) + 0x6C)
-	#define RING_DMA_FADD(base) ((base) + 0x78)
-	#define RING_DMA_FADD_UDW(base) ((base) + 0x60)
-	#define RING_INSTPM(base)  ((base) + 0xC0)
-	#define RING_EXECLIST_STATUS(base) ((base) + 0x234)
-	#define RING_CONTEXT_STATUS_PTR(base) ((base) + 0x3A0)
-	#define RING_CONTEXT_STATUS_BUF(base, idx)    ((base) + 0x370 + (idx) * 8)
-	#define RING_CONTEXT_STATUS_BUF_HI(base, idx) ((base) + 0x374 + (idx) * 8)
-	// GGTT PTE base within BAR0 (Gen8+: 8MB into MMIO BAR, each PTE is 8 bytes)
-	#define GEN8_GGTT_PTE_BASE 0x800000
-	#define GGTT_PTE_LO(page)  (GEN8_GGTT_PTE_BASE + (page) * 8)
-	#define GGTT_PTE_HI(page)  (GEN8_GGTT_PTE_BASE + (page) * 8 + 4)
-	// Context size register
-	#define RING_CTX_SIZE(base) ((base) + 0x1A0)
-	// Current context ID
-	#define RING_CCID(base)    ((base) + 0x180)
-	// Context control
-	#define RING_CTX_CTRL(base) ((base) + 0x244)
-	// GFX mode (ring mode register)
-	#define RING_MI_MODE(base) ((base) + 0x9C)
-	#define RING_MODE(base)    ((base) + 0x29C)
-	
 	// ── V29 NEW: Pre-start GGTT PTE dump ──
 	// Dump first few GGTT PTEs to verify format
 	SYSLOG("ngreen", "GGTT PTE format check (first 4 pages):");
@@ -1586,6 +1641,19 @@ bool Gen11::start(void *that,void  *param_1)
 	
 	// V42: Save accelerator instance for child enumeration in hangcheck
 	callback->accelInstance = that;
+	
+	// V53: Schedule a timer callback to dump GPU state 8 seconds after start() begins.
+	// If start() hangs, this fires while it's blocked and captures the stall point.
+	{
+		auto timerCall = thread_call_allocate(v53TimerCallback, nullptr);
+		
+		if (timerCall) {
+			uint64_t deadline;
+			clock_interval_to_deadline(8, kSecondScale, &deadline);
+			thread_call_enter_delayed(timerCall, deadline);
+			SYSLOG("ngreen", "V53: Timer armed — will dump GPU state in 8s if start() blocks");
+		}
+	}
 	
 	auto ret= FunctionCast(start, callback->ostart)(that,param_1);
 	
@@ -2131,7 +2199,7 @@ void Gen11::forceWake(void *that, bool set, uint32_t dom, uint8_t ctx) {
 	static bool hangcheckDumped = false;
 	fwCallCount++;
 	
-	if (!hangcheckDumped && fwCallCount == 30) {
+	if (!hangcheckDumped && fwCallCount == 15) {
 		hangcheckDumped = true;
 		SYSLOG("ngreen", "=== HANGCHECK: GPU state dump (fwCall=%d) ===", fwCallCount);
 		
@@ -3852,7 +3920,32 @@ unsigned long Gen11::resetGraphicsEngine(void *that,void *param_1)
 	
 	SYSLOG("ngreen", "resetGraphicsEngine: GT workarounds applied (with ForceWake)");
 	
+	// V53: Snapshot engine state BEFORE original resetGraphicsEngine
+	SYSLOG("ngreen", "V53 resetGfxEng PRE: RCS CTL=0x%x HEAD=0x%x TAIL=0x%x",
+		NGreen::callback->readReg32(RING_CTL(RENDER_RING_BASE)),
+		NGreen::callback->readReg32(RING_HEAD(RENDER_RING_BASE)),
+		NGreen::callback->readReg32(RING_TAIL(RENDER_RING_BASE)));
+	SYSLOG("ngreen", "V53 resetGfxEng PRE: BCS CTL=0x%x HEAD=0x%x TAIL=0x%x",
+		NGreen::callback->readReg32(RING_CTL(BLT_RING_BASE)),
+		NGreen::callback->readReg32(RING_HEAD(BLT_RING_BASE)),
+		NGreen::callback->readReg32(RING_TAIL(BLT_RING_BASE)));
+	SYSLOG("ngreen", "V53 resetGfxEng PRE: ERROR_GEN6=0x%x MI_MODE_RCS=0x%x MI_MODE_BCS=0x%x",
+		NGreen::callback->readReg32(ERROR_GEN6),
+		NGreen::callback->readReg32(RING_MI_MODE(RENDER_RING_BASE)),
+		NGreen::callback->readReg32(RING_MI_MODE(BLT_RING_BASE)));
+	
 	auto ret=FunctionCast(resetGraphicsEngine, callback->oresetGraphicsEngine)(that,param_1);
+	
+	// V53: Snapshot AFTER — did original reset change anything?
+	SYSLOG("ngreen", "V53 resetGfxEng POST: ret=%lu RCS CTL=0x%x HEAD=0x%x TAIL=0x%x",
+		ret,
+		NGreen::callback->readReg32(RING_CTL(RENDER_RING_BASE)),
+		NGreen::callback->readReg32(RING_HEAD(RENDER_RING_BASE)),
+		NGreen::callback->readReg32(RING_TAIL(RENDER_RING_BASE)));
+	SYSLOG("ngreen", "V53 resetGfxEng POST: BCS CTL=0x%x ERROR_GEN6=0x%x",
+		NGreen::callback->readReg32(RING_CTL(BLT_RING_BASE)),
+		NGreen::callback->readReg32(ERROR_GEN6));
+	
 	return ret;
 }
 
