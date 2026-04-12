@@ -1289,7 +1289,7 @@ private:
 	// ── Accelerator start & forcewake ──
 	static bool start(void *that,void  *param_1);   // IntelAccelerator::start wrapper
 	static void v54IrqWatchdog(thread_call_param_t, thread_call_param_t);  // V54: IRQ watchdog
-	static void v57GpuHealthMonitor(thread_call_param_t, thread_call_param_t);  // V57: periodic GPU health monitor
+	static void v58GpuHealthMonitor(thread_call_param_t, thread_call_param_t);  // V58: aggressive 100ms ERROR_GEN6 suppression
 	mach_vm_address_t ostart {};
 	
 	static bool patchRCSCheck(mach_vm_address_t& start);  // bypass RCS engine check
