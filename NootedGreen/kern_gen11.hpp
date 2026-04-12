@@ -1275,7 +1275,7 @@ private:
 	
 	// ── Accelerator start & forcewake ──
 	static bool start(void *that,void  *param_1);   // IntelAccelerator::start wrapper
-	static void v53TimerCallback(thread_call_param_t, thread_call_param_t);  // V53: timer diagnostic
+	static void v54IrqWatchdog(thread_call_param_t, thread_call_param_t);  // V54: IRQ watchdog
 	mach_vm_address_t ostart {};
 	
 	static bool patchRCSCheck(mach_vm_address_t& start);  // bypass RCS engine check

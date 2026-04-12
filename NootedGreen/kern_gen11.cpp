@@ -1350,10 +1350,26 @@ static void v45DelayedChildCheck(thread_call_param_t p0, thread_call_param_t p1)
 		while ((obj = iter->getNextObject())) {
 			auto *child = OSDynamicCast(IOService, obj);
 			if (child) {
+				uint64_t childState = child->getState();
 				SYSLOG("ngreen", "V45: T+%ums child[%d]: %s class=%s state=0x%llx",
 					   delayMs, count, child->getName(),
 					   child->getMetaClass()->getClassName(),
-					   (unsigned long long)child->getState());
+					   (unsigned long long)childState);
+				
+				// V54: If IGAccelDevice exists but is not registered (state=0x0),
+				// force registerService() on it. Without this, Metal/GL can't open the device.
+				if (childState == 0 && delayMs >= 3000) {
+					const char *childName = child->getName();
+					if (childName && (strcmp(childName, "IGAccelDevice") == 0 ||
+									  strcmp(childName, "IGAccelSharedUserClient") == 0)) {
+						SYSLOG("ngreen", "V54: %s at state=0x0 — calling registerService()", childName);
+						child->registerService(kIOServiceAsynchronous);
+						IODelay(100);
+						uint64_t newState = child->getState();
+						SYSLOG("ngreen", "V54: %s after registerService → state=0x%llx",
+							   childName, (unsigned long long)newState);
+					}
+				}
 				count++;
 			}
 		}
@@ -1403,96 +1419,46 @@ static void v45ScheduleDelayedCheck(void *accelInstance, unsigned delayMs) {
 	}
 }
 
-// V53: Static timer callback to dump GPU state if start() hangs
-void Gen11::v53TimerCallback(thread_call_param_t, thread_call_param_t) {
-	static bool v53TimerFired = false;
-	if (v53TimerFired) return;
-	v53TimerFired = true;
+// V54: IRQ watchdog — re-enables Master IRQ if the driver disables it during init.
+// Fires every 2s, up to 5 times (10s total), then stops.
+void Gen11::v54IrqWatchdog(thread_call_param_t param0, thread_call_param_t) {
+	static int v54WatchdogCount = 0;
+	v54WatchdogCount++;
 	
-	SYSLOG("ngreen", "=== V53 TIMER: start() still blocked after 8s ===");
+	uint32_t mstrIrq = NGreen::callback->readReg32(GEN11_GFX_MSTR_IRQ);
+	bool enabled = !!(mstrIrq & GEN11_MASTER_IRQ);
 	
-	// Acquire ForceWake for reliable register reads
-	NGreen::callback->writeReg32(FORCEWAKE_RENDER_GEN9, (1 << 16) | 1);
-	NGreen::callback->writeReg32(FORCEWAKE_BLITTER_GEN9, (1 << 16) | 1);
-	IODelay(1000);
+	if (!enabled) {
+		// Re-enable Master IRQ
+		NGreen::callback->writeReg32(GEN11_GFX_MSTR_IRQ, GEN11_MASTER_IRQ);
+		IODelay(100);
+		uint32_t after = NGreen::callback->readReg32(GEN11_GFX_MSTR_IRQ);
+		SYSLOG("ngreen", "V54W[%d]: Master IRQ was DISABLED (0x%x) — re-enabled → 0x%x",
+			v54WatchdogCount, mstrIrq, after);
+	} else {
+		SYSLOG("ngreen", "V54W[%d]: Master IRQ OK (0x%x)", v54WatchdogCount, mstrIrq);
+	}
 	
-	SYSLOG("ngreen", "V53T ForceWake ACK: Render=0x%x Blitter=0x%x",
-		NGreen::callback->readReg32(FORCEWAKE_ACK_RENDER_GEN9),
-		NGreen::callback->readReg32(FORCEWAKE_ACK_BLITTER_GEN9));
-	
-	// RCS state
-	SYSLOG("ngreen", "V53T RCS HEAD=0x%x TAIL=0x%x CTL=0x%x START=0x%x",
+	// Also dump quick GPU state for diagnostics
+	SYSLOG("ngreen", "V54W[%d]: RCS CTL=0x%x HEAD=0x%x TAIL=0x%x ERROR_GEN6=0x%x",
+		v54WatchdogCount,
+		NGreen::callback->readReg32(RING_CTL(RENDER_RING_BASE)),
 		NGreen::callback->readReg32(RING_HEAD(RENDER_RING_BASE)),
 		NGreen::callback->readReg32(RING_TAIL(RENDER_RING_BASE)),
-		NGreen::callback->readReg32(RING_CTL(RENDER_RING_BASE)),
-		NGreen::callback->readReg32(RING_START(RENDER_RING_BASE)));
-	SYSLOG("ngreen", "V53T RCS ACTHD=0x%x:%08x IPEHR=0x%x IPEIR=0x%x",
-		NGreen::callback->readReg32(RING_ACTHD_UDW(RENDER_RING_BASE)),
-		NGreen::callback->readReg32(RING_ACTHD(RENDER_RING_BASE)),
-		NGreen::callback->readReg32(RING_IPEHR(RENDER_RING_BASE)),
-		NGreen::callback->readReg32(RING_IPEIR(RENDER_RING_BASE)));
-	SYSLOG("ngreen", "V53T RCS MI_MODE=0x%x RING_MODE=0x%x INSTDONE=0x%x",
-		NGreen::callback->readReg32(RING_MI_MODE(RENDER_RING_BASE)),
-		NGreen::callback->readReg32(RING_MODE(RENDER_RING_BASE)),
-		NGreen::callback->readReg32(RING_INSTDONE(RENDER_RING_BASE)));
-	SYSLOG("ngreen", "V53T RCS EXECLIST_STATUS=0x%x CTX_STATUS_PTR=0x%x",
-		NGreen::callback->readReg32(RING_EXECLIST_STATUS(RENDER_RING_BASE)),
-		NGreen::callback->readReg32(RING_CONTEXT_STATUS_PTR(RENDER_RING_BASE)));
-	SYSLOG("ngreen", "V53T RCS EIR=0x%x ESR=0x%x EMR=0x%x",
-		NGreen::callback->readReg32(RING_EIR(RENDER_RING_BASE)),
-		NGreen::callback->readReg32(RING_ESR(RENDER_RING_BASE)),
-		NGreen::callback->readReg32(RING_EMR(RENDER_RING_BASE)));
-	SYSLOG("ngreen", "V53T RCS CTX_SIZE=0x%x CCID=0x%x CTX_CTRL=0x%x",
-		NGreen::callback->readReg32(RING_CTX_SIZE(RENDER_RING_BASE)),
-		NGreen::callback->readReg32(RING_CCID(RENDER_RING_BASE)),
-		NGreen::callback->readReg32(RING_CTX_CTRL(RENDER_RING_BASE)));
-	SYSLOG("ngreen", "V53T RCS TIMESTAMP=0x%x HWS_PGA=0x%x",
-		NGreen::callback->readReg32(RENDER_RING_BASE + 0x358),
-		NGreen::callback->readReg32(RING_HWS_PGA(RENDER_RING_BASE)));
+		NGreen::callback->readReg32(ERROR_GEN6));
 	
-	// BCS state
-	SYSLOG("ngreen", "V53T BCS HEAD=0x%x TAIL=0x%x CTL=0x%x START=0x%x",
-		NGreen::callback->readReg32(RING_HEAD(BLT_RING_BASE)),
-		NGreen::callback->readReg32(RING_TAIL(BLT_RING_BASE)),
-		NGreen::callback->readReg32(RING_CTL(BLT_RING_BASE)),
-		NGreen::callback->readReg32(RING_START(BLT_RING_BASE)));
-	SYSLOG("ngreen", "V53T BCS EXECLIST_STATUS=0x%x EIR=0x%x ESR=0x%x",
-		NGreen::callback->readReg32(RING_EXECLIST_STATUS(BLT_RING_BASE)),
-		NGreen::callback->readReg32(RING_EIR(BLT_RING_BASE)),
-		NGreen::callback->readReg32(RING_ESR(BLT_RING_BASE)));
-	
-	// VCS (Video Command Streamer — may exist on RPL)
-	SYSLOG("ngreen", "V53T VCS0 HEAD=0x%x TAIL=0x%x CTL=0x%x",
-		NGreen::callback->readReg32(RING_HEAD(GEN11_BSD_RING_BASE)),
-		NGreen::callback->readReg32(RING_TAIL(GEN11_BSD_RING_BASE)),
-		NGreen::callback->readReg32(RING_CTL(GEN11_BSD_RING_BASE)));
-	SYSLOG("ngreen", "V53T VECS0 HEAD=0x%x TAIL=0x%x CTL=0x%x",
-		NGreen::callback->readReg32(RING_HEAD(GEN11_VEBOX_RING_BASE)),
-		NGreen::callback->readReg32(RING_TAIL(GEN11_VEBOX_RING_BASE)),
-		NGreen::callback->readReg32(RING_CTL(GEN11_VEBOX_RING_BASE)));
-	
-	// Global errors
-	SYSLOG("ngreen", "V53T ERROR_GEN6=0x%x RING_FAULT=0x%x",
-		NGreen::callback->readReg32(ERROR_GEN6),
-		NGreen::callback->readReg32(GEN12_RING_FAULT_REG));
-	SYSLOG("ngreen", "V53T FAULT_TLB0=0x%x TLB1=0x%x",
-		NGreen::callback->readReg32(GEN8_FAULT_TLB_DATA0),
-		NGreen::callback->readReg32(GEN8_FAULT_TLB_DATA1));
-	SYSLOG("ngreen", "V53T GT_INTR_DW0=0x%x DW1=0x%x GFX_MSTR_IRQ=0x%x",
-		NGreen::callback->readReg32(GEN11_GT_INTR_DW0),
-		NGreen::callback->readReg32(GEN11_GT_INTR_DW1),
-		NGreen::callback->readReg32(GEN11_GFX_MSTR_IRQ));
-	
-	// Interrupt enable state
-	SYSLOG("ngreen", "V53T RENDER_COPY_INTR_EN=0x%x VCS_VECS_INTR_EN=0x%x",
-		NGreen::callback->readReg32(GEN11_RENDER_COPY_INTR_ENABLE),
-		NGreen::callback->readReg32(GEN11_VCS_VECS_INTR_ENABLE));
-	
-	// Release ForceWake
-	NGreen::callback->writeReg32(FORCEWAKE_RENDER_GEN9, (1 << 16) | 0);
-	NGreen::callback->writeReg32(FORCEWAKE_BLITTER_GEN9, (1 << 16) | 0);
-	
-	SYSLOG("ngreen", "=== V53 TIMER: dump complete ===");
+	// Re-arm for up to 5 iterations
+	if (v54WatchdogCount < 5) {
+		// Allocate a fresh timer call for the next iteration
+		auto nextTimer = thread_call_allocate(v54IrqWatchdog, nullptr);
+		if (nextTimer) {
+			uint64_t deadline;
+			clock_interval_to_deadline(2, kSecondScale, &deadline);
+			thread_call_enter_delayed(nextTimer, deadline);
+		}
+	} else {
+		SYSLOG("ngreen", "V54W: watchdog complete after %d iterations", v54WatchdogCount);
+	}
 }
 
 bool Gen11::start(void *that,void  *param_1)
@@ -1642,16 +1608,27 @@ bool Gen11::start(void *that,void  *param_1)
 	// V42: Save accelerator instance for child enumeration in hangcheck
 	callback->accelInstance = that;
 	
-	// V53: Schedule a timer callback to dump GPU state 8 seconds after start() begins.
-	// If start() hangs, this fires while it's blocked and captures the stall point.
+	// V54: Pre-enable Master IRQ BEFORE calling original start().
+	// V53 proved that the TGL driver never enables GFX_MSTR_IRQ bit 31 on RPL.
+	// Without it, completion interrupts never reach the CPU and start() hangs
+	// for ~15s until our hangcheck accidentally re-enabled it.
+	if (!NGreen::callback->isRealTGL) {
+		// Enable Master IRQ (bit 31)
+		NGreen::callback->writeReg32(GEN11_GFX_MSTR_IRQ, GEN11_MASTER_IRQ);
+		IODelay(100);
+		SYSLOG("ngreen", "V54: Pre-enabled Master IRQ: GFX_MSTR_IRQ=0x%x",
+			NGreen::callback->readReg32(GEN11_GFX_MSTR_IRQ));
+	}
+	
+	// V54: Schedule IRQ watchdog timer — re-enables Master IRQ every 2s during start().
+	// The driver's interrupt setup may disable it during init; we keep re-enabling.
 	{
-		auto timerCall = thread_call_allocate(v53TimerCallback, nullptr);
-		
+		auto timerCall = thread_call_allocate(v54IrqWatchdog, nullptr);
 		if (timerCall) {
 			uint64_t deadline;
-			clock_interval_to_deadline(8, kSecondScale, &deadline);
+			clock_interval_to_deadline(2, kSecondScale, &deadline);
 			thread_call_enter_delayed(timerCall, deadline);
-			SYSLOG("ngreen", "V53: Timer armed — will dump GPU state in 8s if start() blocks");
+			SYSLOG("ngreen", "V54: IRQ watchdog armed — will re-enable Master IRQ every 2s");
 		}
 	}
 	
