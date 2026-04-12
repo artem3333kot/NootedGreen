@@ -8,7 +8,7 @@ Patches Apple's Tiger Lake (Gen12) graphics drivers to work with newer Intel iGP
 
 ## Status
 
-**Work in progress.** Framebuffer controller starts, combo PHY calibration patched, accelerator ring initialises, host-based scheduler (type 5) active with RCS ring running. Display pipeline working (eDP trained, cursor visible). WindowServer connects successfully — 12 user clients created (2x IGAccel2DContext, 2x IOAccelDisplayPipeUserClient2, 8x IGAccelSurface). DYLD patches hook `_cs_validate_page` early (before DeviceInfo) to ensure CoreDisplay is patched before WindowServer starts. Metal rendering enabled by default; V50 patches `gpu_bundle_find_trusted()` in libsystem_sandbox.dylib to redirect GPU bundle search from `/Library/GPUBundles` → `/Library/Extensions/` where the TGL driver actually lives (Apple never shipped a TGL Mac). Alternative: manually `sudo cp -R /Library/Extensions/AppleIntelTGLGraphicsMTLDriver.bundle /Library/GPUBundles/`. ICL Metal driver device-ID bypass uses mask-based matching for build portability. GPU command submission under active development.
+**Work in progress.** Framebuffer controller starts, combo PHY calibration patched, accelerator ring initialises, host-based scheduler (type 5) active with RCS ring running on RPL. Display pipeline working (eDP trained, cursor visible). WindowServer connects successfully — 12 user clients created (2x IGAccel2DContext, 2x IOAccelDisplayPipeUserClient2, 8x IGAccelSurface). DYLD patches hook `_cs_validate_page` early (before DeviceInfo) to ensure CoreDisplay is patched before WindowServer starts. Metal rendering enabled by default; V50 patches `gpu_bundle_find_trusted()` in libsystem_sandbox.dylib to redirect GPU bundle search from `/Library/GPUBundles` → `/Library/Extensions/` where the TGL driver actually lives (Apple never shipped a TGL Mac). Alternative: manually `sudo cp -R /Library/Extensions/AppleIntelTGLGraphicsMTLDriver.bundle /Library/GPUBundles/`. ICL Metal driver device-ID bypass uses mask-based matching for build portability. V52 adds CPUID-based cross-platform detection (`isRealTGL`) — RPL-specific patches (topology overrides, GuC stub, BCS reset, ForceWake override) are automatically skipped on genuine Tiger Lake hardware. GPU command submission under active development.
 
 ## Requirements
 
@@ -26,8 +26,8 @@ Patches Apple's Tiger Lake (Gen12) graphics drivers to work with newer Intel iGP
 | Arg | Purpose |
 |---|---|
 | `-NGreenDebug` | Enable NootedGreen debug logging |
-| `-disablegfxfirmware` | Disable GuC/HuC firmware loading — required because scheduler selection (`ngreenSched`) happens after the HW-branch `processKext`, so the driver attempts firmware init before NootedGreen can override the scheduler type |
-| `ngreenSched=N` | Select GPU scheduler type: `3` = GuC firmware, `4` = IGScheduler4, `5` = host preemptive (default: `5`) |
+| `-disablegfxfirmware` | Disable GuC/HuC firmware loading — required on RPL/ADL because scheduler selection (`ngreenSched`) happens after the HW-branch `processKext`, so the driver attempts firmware init before NootedGreen can override the scheduler type. Not needed on real TGL (GuC loads natively). |
+| `ngreenSched=N` | Select GPU scheduler type: `3` = GuC firmware, `4` = IGScheduler4, `5` = host preemptive (default: `3` on real TGL, `5` on RPL/ADL) |
 | `ngreen-dmc=skip` | Skip DMC firmware |
 | `-allow3d` | Force 3D acceleration |
 | `-ngreenNoMetal` | Disable Metal rendering — stub out CoreDisplay Metal paths to prevent NULL MTLDevice crashes (display-only debug mode) |
@@ -51,7 +51,7 @@ The Intel TGL graphics driver supports three scheduler types, selectable at boot
 
 1. Boot argument `ngreenSched=N` (highest priority)
 2. `SchedulerType` key in Info.plist (NootedGreen personality)
-3. Default: `5` (host preemptive)
+3. Default: `3` (GuC firmware) on real TGL, `5` (host preemptive) on RPL/ADL
 
 Type 5 bypasses `IGScheduler::initFirmware()` entirely, avoiding GuC/HuC binary loading which fails on spoofed devices. The RCS ring is initialized directly by the host driver.
 
@@ -79,8 +79,8 @@ NootedBlue legacy support (fully preserved):
 
 NootedGreen (Gen11/Gen12 — TGL driver spoofing):
 
-- **Tiger Lake** (macOS Sonoma 14.x) — reported working
-- **Raptor Lake-P** (macOS Sonoma 14.x) — work in progress
+- **Tiger Lake** (macOS Sonoma 14.x) — cross-platform safe (V52: RPL-specific patches auto-skipped via CPUID)
+- **Raptor Lake-P** (macOS Sonoma 14.x) — work in progress (primary dev platform: i7-13700H)
 - **Ice Lake** — untested, may work
 - **Rocket Lake** — untested, may work
 - **Alder Lake** — untested, may work

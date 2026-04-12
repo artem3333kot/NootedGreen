@@ -136,6 +136,24 @@ void NGreen::processPatcher(KernelPatcher &patcher) {
 
         this->deviceId = WIOKit::readPCIConfigValue(this->iGPU, WIOKit::kIOPCIConfigDeviceID);
         this->pciRevision = WIOKit::readPCIConfigValue(NGreen::callback->iGPU, WIOKit::kIOPCIConfigRevisionID);
+
+        // V52: Detect real TGL vs spoofed RPL/ADL by CPU model
+        // TGL-U: model 0x8C, TGL-H: model 0x8D
+        // RPL-P: model 0xBA, RPL-S: model 0xBF, RPL-HX: model 0xB7
+        // ADL-P: model 0x9A, ADL-S: model 0x97
+        {
+            uint32_t eax = 0, ebx = 0, ecx = 0, edx = 0;
+            asm volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1));
+            uint32_t family = (eax >> 8) & 0xF;
+            uint32_t model = (eax >> 4) & 0xF;
+            uint32_t extModel = (eax >> 16) & 0xF;
+            uint32_t stepping = eax & 0xF;
+            if (family == 0x6) model |= (extModel << 4);
+            this->cpuModel = model;
+            this->isRealTGL = (model == 0x8C || model == 0x8D);
+            SYSLOG("ngreen", "V52: CPU family=0x%x model=0x%x stepping=%u isRealTGL=%d",
+                   family, model, stepping, this->isRealTGL);
+        }
 		
 		auto gms = WIOKit::readPCIConfigValue(devInfo->videoBuiltin, WIOKit::kIOPCIConfigGraphicsControl, 0, 16) >> 8;
 		

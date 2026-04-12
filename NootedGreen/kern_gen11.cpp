@@ -766,27 +766,35 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		
 
 		{
-			LookupPatchPlus const patches[] = {
-				
-				//{activeKext, f3a, r3a, arrsize(f3a),	1},
-				
+			// V52: Split patches into always-apply and RPL-only groups.
+			// Real TGL reads topology from fuses correctly; RPL must hardcode
+			// because fuse layout differs and BCS ring doesn't start.
+			LookupPatchPlus const patchesAlways[] = {
+				// SKU/device-ID bypass — needed for both (0x9A49 not in whitelist)
 				{activeKext, f3, r3, arrsize(f3),	1},
-				{activeKext, f3b, r3b, arrsize(f3b),	1},
-				
-				{activeKext, f3bb, r3bb, arrsize(f3bb),	1},
-				 {activeKext, f3bbb, r3bbb, arrsize(f3bbb),	1},
-				 
-				 {activeKext, f_devstart, r_devstart, arrsize(f_devstart), 1},
-				 
-				// {activeKext, f4, r4, arrsize(f4),	1},
-				
 			};
+			PANIC_COND(!LookupPatchPlus::applyAll(patcher, patchesAlways, address, size), "ngreen",
+				"kextG11HWT Failed to apply base patches!");
 			
-			
-			PANIC_COND(!LookupPatchPlus::applyAll(patcher, patches , address, size), "ngreen", "kextG11HWT Failed to apply patches!");
+			if (!NGreen::callback->isRealTGL) {
+				// RPL-only: hardcode topology and bypass BCS readiness check
+				LookupPatchPlus const patchesRPL[] = {
+					{activeKext, f3b, r3b, arrsize(f3b),	1},      // L3BankCount=8
+					{activeKext, f3bb, r3bb, arrsize(f3bb),	1},    // MaxEU/SS=8
+					{activeKext, f3bbb, r3bbb, arrsize(f3bbb),	1},// NumSubSlices=12
+					{activeKext, f_devstart, r_devstart, arrsize(f_devstart), 1}, // BCS bypass
+				};
+				PANIC_COND(!LookupPatchPlus::applyAll(patcher, patchesRPL, address, size), "ngreen",
+					"kextG11HWT Failed to apply RPL-specific patches!");
+				SYSLOG("ngreen", "V52: Applied RPL-specific patches (topology hardcode + BCS bypass)");
+			} else {
+				SYSLOG("ngreen", "V52: Real TGL — skipping topology hardcodes and BCS bypass");
+			}
 		}
 
-		SYSLOG("ngreen", "Loaded AppleIntelTGLGraphics! slices=1 subslices=12(6DSS) maxEU/SS=8 totalEU=96 L3=8");
+		SYSLOG("ngreen", "Loaded AppleIntelTGLGraphics! %s",
+			   NGreen::callback->isRealTGL ? "Real TGL — native topology" :
+			   "RPL spoofed — slices=1 subslices=12(6DSS) maxEU/SS=8 totalEU=96 L3=8");
 
 		return true;
 	}
@@ -1071,10 +1079,13 @@ IOReturn Gen11::wrapFBClientDoAttribute(void *fbclient, uint32_t attribute, unsi
 }
 
 unsigned long Gen11::loadGuCBinary(void *that) {
-	// Stub: return 1 (success) without loading firmware.
-	// RPL cannot authenticate TGL GuC firmware. Use -disablegfxfirmware boot arg
-	// to force host-based scheduling, which skips GuC entirely.
-	SYSLOG("ngreen", "loadGuCBinary: stubbed to return 1 (use -disablegfxfirmware)");
+	// V52: Real TGL can authenticate and load GuC firmware natively.
+	// RPL cannot — stub to return 1 and use host scheduling instead.
+	if (NGreen::callback->isRealTGL) {
+		SYSLOG("ngreen", "loadGuCBinary: real TGL — calling original for GuC firmware load");
+		return FunctionCast(loadGuCBinary, callback->oloadGuCBinary)(that);
+	}
+	SYSLOG("ngreen", "loadGuCBinary: RPL — stubbed to return 1 (host scheduling)");
 	return 1;
 }
 
@@ -1397,10 +1408,11 @@ bool Gen11::start(void *that,void  *param_1)
 	// V44: Configurable scheduler type.
 	// populateAccelConfig reads "GraphicsSchedulerSelect" from the IORegistry.
 	// Types: 3=IGGuC (firmware), 4=IGScheduler4, 5=IGScheduler5 (host preemptive).
-	// Priority: boot-arg "ngreenSched=N" > Info.plist "SchedulerType" > default 5.
+	// Priority: boot-arg "ngreenSched=N" > Info.plist "SchedulerType" > default.
+	// V52: Default depends on platform — real TGL uses GuC (3), RPL uses Host (5).
 	auto *service = static_cast<IOService *>(that);
 	{
-		int schedType = 5; // default: host preemptive (no firmware needed)
+		int schedType = NGreen::callback->isRealTGL ? 3 : 5;
 		
 		// 1. Check boot-arg first (highest priority)
 		int bootArgSched = 0;
@@ -1436,6 +1448,8 @@ bool Gen11::start(void *that,void  *param_1)
 	// Inject MultiForceWakeSelect=1 into Development dictionary.
 	// This tells the accelerator to use SafeForceWakeMultithreaded (which we hook)
 	// instead of the framebuffer's SafeForceWake (which fails on RPL-P with ACK=0).
+	// V52: Only needed on RPL — real TGL's native ForceWake works fine.
+	if (!NGreen::callback->isRealTGL) {
 	auto *devDict = OSDynamicCast(OSDictionary, service->getProperty("Development"));
 	if (devDict) {
 		auto *newDevDict = OSDictionary::withDictionary(devDict);
@@ -1461,6 +1475,9 @@ bool Gen11::start(void *that,void  *param_1)
 			service->setProperty("Development", newDevDict);
 			newDevDict->release();
 		}
+	}
+	} else {
+		SYSLOG("ngreen", "V52: Real TGL — skipping MultiForceWakeSelect override");
 	}
 
 	// ── V29: Apply GT workarounds + GGTT PTE diagnostics ──
@@ -1946,6 +1963,8 @@ bool Gen11::start(void *that,void  *param_1)
 	}
 	
 	// ── V51: BCS engine stop+clear ──
+	// V52: Only on RPL — real TGL's BCS works natively.
+	if (!NGreen::callback->isRealTGL) {
 	// BCS ring is dead (CTL=0x0, EXECLIST_STATUS=0x1). The Host scheduler
 	// attempted context submission but the engine never started. Clear the
 	// engine state so it can be retried by the scheduler on first Metal blit.
@@ -1974,6 +1993,9 @@ bool Gen11::start(void *that,void  *param_1)
 		} else {
 			SYSLOG("ngreen", "V51: BCS ring active (CTL=0x%x) — no reset needed", bcsCtlNow);
 		}
+	}
+	} else {
+		SYSLOG("ngreen", "V52: Real TGL — skipping BCS engine reset");
 	}
 	
 	SYSLOG("ngreen", "V51: GPU error clearing complete — Metal should see a clean GPU");

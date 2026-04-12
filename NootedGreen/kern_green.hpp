@@ -215,6 +215,8 @@ class NGreen {
     bool isJslDerivative = false;
     bool isGen9LPDerivative = false;
     bool isGen8LPDerivative = false;
+    bool isRealTGL = false;  // true if CPU is genuine TGL (model 0x8C/0x8D), false if spoofed (RPL/ADL)
+    uint32_t cpuModel {0};  // full display model (family_model)
     uint32_t deviceId {0};
     uint16_t revision {0};
     uint32_t pciRevision {0};
