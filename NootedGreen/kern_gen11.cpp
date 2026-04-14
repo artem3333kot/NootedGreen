@@ -1561,30 +1561,32 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		}
 	}
 	
-	// V64: On iteration 5, unmask RCS context-switch + user interrupts if masked
-	if (v60Count == 5) {
+	// V65: Enforce RCS0 interrupt enable on EVERY iteration (moved from V64 iteration 5).
+	// V64 proved the fix at T+10s was too late — scheduler already gave up.
+	// Now combined with V65 pre-start + V65W watchdog fixes for full coverage.
+	{
 		uint32_t rcIntrEn = NGreen::callback->readReg32(GEN11_RENDER_COPY_INTR_ENABLE);
 		uint32_t rcsMask  = NGreen::callback->readReg32(GEN11_RCS0_RSVD_INTR_MASK);
-		SYSLOG("ngreen", "V64: pre-fix RC_INTR_EN=0x%x RCS_MASK=0x%x", rcIntrEn, rcsMask);
 		
 		// Enable RCS+BCS in tier-1 interrupt enable (bit 0 = RCS0, bit 15 = BCS)
-		if (!(rcIntrEn & (1 << GEN11_RCS0))) {
-			uint32_t newEn = rcIntrEn | (1 << GEN11_RCS0) | (1 << GEN11_BCS);
+		uint32_t wantBits = (1 << GEN11_RCS0) | (1 << GEN11_BCS);
+		if ((rcIntrEn & wantBits) != wantBits) {
+			uint32_t newEn = rcIntrEn | wantBits;
 			NGreen::callback->writeReg32(GEN11_RENDER_COPY_INTR_ENABLE, newEn);
-			SYSLOG("ngreen", "V64: enabled RCS+BCS in RENDER_COPY_INTR_ENABLE: 0x%x->0x%x",
-				   rcIntrEn, newEn);
+			if (v60Count <= 3) {
+				SYSLOG("ngreen", "V65M[%d]: tier-1 fix 0x%x->0x%x", v60Count, rcIntrEn,
+					NGreen::callback->readReg32(GEN11_RENDER_COPY_INTR_ENABLE));
+			}
 		}
 		// Unmask context-switch + user interrupt for RCS (0 = unmasked, 1 = masked)
 		uint32_t wantUnmasked = GT_CONTEXT_SWITCH_INTERRUPT | GT_RENDER_USER_INTERRUPT;
 		if (rcsMask & wantUnmasked) {
 			uint32_t newMask = rcsMask & ~wantUnmasked;
 			NGreen::callback->writeReg32(GEN11_RCS0_RSVD_INTR_MASK, newMask);
-			SYSLOG("ngreen", "V64: unmasked RCS CS+USER interrupts: mask 0x%x->0x%x",
-				   rcsMask, newMask);
+			if (v60Count <= 3) {
+				SYSLOG("ngreen", "V65M[%d]: tier-2 fix mask 0x%x->0x%x", v60Count, rcsMask, newMask);
+			}
 		}
-		uint32_t postEn   = NGreen::callback->readReg32(GEN11_RENDER_COPY_INTR_ENABLE);
-		uint32_t postMask = NGreen::callback->readReg32(GEN11_RCS0_RSVD_INTR_MASK);
-		SYSLOG("ngreen", "V64: post-fix RC_INTR_EN=0x%x RCS_MASK=0x%x", postEn, postMask);
 	}
 	
 	v60LastHead = rcsHead;
@@ -1622,6 +1624,38 @@ void Gen11::v54IrqWatchdog(thread_call_param_t param0, thread_call_param_t) {
 			v54WatchdogCount, mstrIrq, after);
 	} else {
 		SYSLOG("ngreen", "V54W[%d]: Master IRQ OK (0x%x)", v54WatchdogCount, mstrIrq);
+	}
+	
+	// V65: Continuously enforce RCS0 tier-1 interrupt enable during ring init window.
+	// V64 proved Apple's code leaves RCS0 DISABLED in RENDER_COPY_INTR_ENABLE.
+	// The ring activates between V54W[4]-V54W[5] (T+8-10s) — we must have this set BEFORE.
+	{
+		uint32_t rcIntrEn = NGreen::callback->readReg32(GEN11_RENDER_COPY_INTR_ENABLE);
+		uint32_t wantBits = (1 << GEN11_RCS0) | (1 << GEN11_BCS);
+		bool rcsOk = !!(rcIntrEn & (1 << GEN11_RCS0));
+		if (!rcsOk) {
+			uint32_t newEn = rcIntrEn | wantBits;
+			NGreen::callback->writeReg32(GEN11_RENDER_COPY_INTR_ENABLE, newEn);
+			SYSLOG("ngreen", "V65W[%d]: RCS0 tier-1 DISABLED (0x%x) — enabled → 0x%x",
+				v54WatchdogCount, rcIntrEn,
+				NGreen::callback->readReg32(GEN11_RENDER_COPY_INTR_ENABLE));
+		} else {
+			SYSLOG("ngreen", "V65W[%d]: RCS0 tier-1 OK (0x%x)", v54WatchdogCount, rcIntrEn);
+		}
+		// Also enforce tier-2 unmask
+		uint32_t rcsMask = NGreen::callback->readReg32(GEN11_RCS0_RSVD_INTR_MASK);
+		uint32_t wantUnmasked = GT_CONTEXT_SWITCH_INTERRUPT | GT_RENDER_USER_INTERRUPT;
+		if (rcsMask & wantUnmasked) {
+			uint32_t newMask = rcsMask & ~wantUnmasked;
+			NGreen::callback->writeReg32(GEN11_RCS0_RSVD_INTR_MASK, newMask);
+			SYSLOG("ngreen", "V65W[%d]: RCS mask fix 0x%x->0x%x", v54WatchdogCount, rcsMask, newMask);
+		}
+		// V65: Proactively clear ERROR_GEN6 to prevent error handler from killing engine
+		uint32_t errNow = NGreen::callback->readReg32(ERROR_GEN6);
+		if (errNow) {
+			NGreen::callback->writeReg32(ERROR_GEN6, 0x0);
+			SYSLOG("ngreen", "V65W[%d]: cleared ERROR_GEN6=0x%x", v54WatchdogCount, errNow);
+		}
 	}
 	
 	// Also dump quick GPU state for diagnostics
@@ -1820,6 +1854,25 @@ bool Gen11::start(void *that,void  *param_1)
 		IODelay(100);
 		SYSLOG("ngreen", "V54: Pre-enabled Master IRQ: GFX_MSTR_IRQ=0x%x",
 			NGreen::callback->readReg32(GEN11_GFX_MSTR_IRQ));
+		
+		// V65: Pre-enable RCS0+BCS tier-1 interrupt routing BEFORE ring init.
+		// V64 proved GEN11_RENDER_COPY_INTR_ENABLE had RCS0 (bit 0) DISABLED,
+		// causing scheduler to never receive completion interrupts → timeout → dead engine.
+		// Must be set BEFORE ring activates (T+8-10s) to prevent scheduler timeout.
+		uint32_t rcIntrPre = NGreen::callback->readReg32(GEN11_RENDER_COPY_INTR_ENABLE);
+		uint32_t wantBits = (1 << GEN11_RCS0) | (1 << GEN11_BCS);
+		uint32_t newEn = rcIntrPre | wantBits;
+		NGreen::callback->writeReg32(GEN11_RENDER_COPY_INTR_ENABLE, newEn);
+		// Also unmask RCS context-switch + user interrupts at tier-2
+		uint32_t rcsMaskPre = NGreen::callback->readReg32(GEN11_RCS0_RSVD_INTR_MASK);
+		uint32_t wantUnmasked = GT_CONTEXT_SWITCH_INTERRUPT | GT_RENDER_USER_INTERRUPT;
+		NGreen::callback->writeReg32(GEN11_RCS0_RSVD_INTR_MASK, rcsMaskPre & ~wantUnmasked);
+		// Pre-clear any stale ERROR_GEN6 to prevent error handler interference
+		uint32_t errPre = NGreen::callback->readReg32(ERROR_GEN6);
+		if (errPre) NGreen::callback->writeReg32(ERROR_GEN6, 0x0);
+		SYSLOG("ngreen", "V65: Pre-start interrupt fix: RC_INTR_EN 0x%x->0x%x, RCS_MASK 0x%x->0x%x, ERR=0x%x",
+			rcIntrPre, NGreen::callback->readReg32(GEN11_RENDER_COPY_INTR_ENABLE),
+			rcsMaskPre, NGreen::callback->readReg32(GEN11_RCS0_RSVD_INTR_MASK), errPre);
 	}
 	
 	// V54: Schedule IRQ watchdog timer — re-enables Master IRQ every 2s during start().
@@ -1835,6 +1888,28 @@ bool Gen11::start(void *that,void  *param_1)
 	}
 	
 	auto ret= FunctionCast(start, callback->ostart)(that,param_1);
+	
+	// V65: IMMEDIATELY after original start() returns, re-enable RCS0 interrupts.
+	// Apple's init code may have overwritten our pre-start settings.
+	// This is our earliest opportunity after ring activation.
+	if (!NGreen::callback->isRealTGL) {
+		uint32_t rcIntrPost = NGreen::callback->readReg32(GEN11_RENDER_COPY_INTR_ENABLE);
+		uint32_t wantBits = (1 << GEN11_RCS0) | (1 << GEN11_BCS);
+		uint32_t newEn = rcIntrPost | wantBits;
+		NGreen::callback->writeReg32(GEN11_RENDER_COPY_INTR_ENABLE, newEn);
+		// Re-unmask tier-2
+		uint32_t rcsMaskPost = NGreen::callback->readReg32(GEN11_RCS0_RSVD_INTR_MASK);
+		uint32_t wantUnmasked = GT_CONTEXT_SWITCH_INTERRUPT | GT_RENDER_USER_INTERRUPT;
+		NGreen::callback->writeReg32(GEN11_RCS0_RSVD_INTR_MASK, rcsMaskPost & ~wantUnmasked);
+		// Re-enable Master IRQ (may have been toggled during start)
+		NGreen::callback->writeReg32(GEN11_GFX_MSTR_IRQ, GEN11_MASTER_IRQ);
+		// Clear any ERROR_GEN6 that fired during ring init
+		uint32_t errPost = NGreen::callback->readReg32(ERROR_GEN6);
+		if (errPost) NGreen::callback->writeReg32(ERROR_GEN6, 0x0);
+		SYSLOG("ngreen", "V65: Post-start interrupt fix: RC_INTR_EN 0x%x->0x%x, RCS_MASK 0x%x->0x%x, ERR=0x%x",
+			rcIntrPost, NGreen::callback->readReg32(GEN11_RENDER_COPY_INTR_ENABLE),
+			rcsMaskPost, NGreen::callback->readReg32(GEN11_RCS0_RSVD_INTR_MASK), errPost);
+	}
 	
 	// ── V29: Post-start diagnostics ──
 	NGreen::callback->writeReg32(FORCEWAKE_RENDER_GEN9, (1 << 16) | 1);
