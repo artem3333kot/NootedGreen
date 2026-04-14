@@ -1802,6 +1802,48 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		}
 	}
 	
+	// ── V75: Display pipeline register dump — diagnose black screen ──
+	// System stays alive but display is black. Read pipe/plane/transcoder/backlight
+	// registers to understand what state the display hardware is in.
+	if (v60Count == 3 || v60Count == 30) {
+		// Pipe A config
+		uint32_t pipeConf  = NGreen::callback->readReg32(0x70008); // PIPE_CONF_A
+		uint32_t pipeSrc   = NGreen::callback->readReg32(0x6001C); // PIPE_SRCSZ_A
+		// Plane 1 on Pipe A
+		uint32_t planCtl   = NGreen::callback->readReg32(0x70180); // PLANE_CTL
+		uint32_t planStrd  = NGreen::callback->readReg32(0x70188); // PLANE_STRIDE
+		uint32_t planSurf  = NGreen::callback->readReg32(0x7019C); // PLANE_SURF
+		uint32_t planSize  = NGreen::callback->readReg32(0x70190); // PLANE_SIZE
+		uint32_t planPos   = NGreen::callback->readReg32(0x7018C); // PLANE_POS
+		uint32_t planOff   = NGreen::callback->readReg32(0x70194); // PLANE_OFFSET
+		// Transcoder A
+		uint32_t transConf = NGreen::callback->readReg32(0x60008); // TRANS_CONF_A (or PIPE_CONF for ICL+)
+		uint32_t transH    = NGreen::callback->readReg32(0x60000); // HTOTAL_A
+		uint32_t transV    = NGreen::callback->readReg32(0x6000C); // VTOTAL_A
+		// DDI / port
+		uint32_t ddiFuncA  = NGreen::callback->readReg32(0x60400); // DDI_FUNC_CTL_A (trans EDP on TGL)
+		uint32_t ddiFunc1  = NGreen::callback->readReg32(0x60100); // DDI_FUNC_CTL_1 (trans A)
+		// Backlight
+		uint32_t blcPwm    = NGreen::callback->readReg32(0xC8250); // BLC_PWM_CTL2
+		uint32_t blcDuty   = NGreen::callback->readReg32(0xC8254); // BLC_PWM_DATA / duty cycle
+		uint32_t sblcPwm   = NGreen::callback->readReg32(0xC8254); // South BLC_PWM_CTL
+		// Power wells
+		uint32_t pwrWell   = NGreen::callback->readReg32(0x45400); // PWR_WELL_CTL2 (ICL+)
+		uint32_t dcState   = NGreen::callback->readReg32(0x45504); // DC_STATE_EN
+
+		SYSLOG("ngreen", "V75[%d]: PIPE_CONF=0x%x PIPE_SRC=0x%x", v60Count, pipeConf, pipeSrc);
+		SYSLOG("ngreen", "V75[%d]: PLANE_CTL=0x%x STRIDE=0x%x SURF=0x%x SIZE=0x%x POS=0x%x OFF=0x%x",
+			   v60Count, planCtl, planStrd, planSurf, planSize, planPos, planOff);
+		SYSLOG("ngreen", "V75[%d]: TRANS_CONF=0x%x HTOTAL=0x%x VTOTAL=0x%x",
+			   v60Count, transConf, transH, transV);
+		SYSLOG("ngreen", "V75[%d]: DDI_FUNC_EDP=0x%x DDI_FUNC_A=0x%x",
+			   v60Count, ddiFuncA, ddiFunc1);
+		SYSLOG("ngreen", "V75[%d]: BLC_PWM=0x%x BLC_DUTY=0x%x SBLC=0x%x",
+			   v60Count, blcPwm, blcDuty, sblcPwm);
+		SYSLOG("ngreen", "V75[%d]: PWR_WELL=0x%x DC_STATE=0x%x",
+			   v60Count, pwrWell, dcState);
+	}
+
 	// ── V68: Iteration 5 — deep probe e08obj + GGTT PTE check ──
 	// V67 proved: sched error clear sticks, but hardware ERROR_GEN6=0x7b recurs
 	// every ~10s independently. Need to find WHAT generates the error.

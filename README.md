@@ -8,7 +8,17 @@ Patches Apple's Tiger Lake (Gen12) graphics drivers to work with newer Intel iGP
 
 ## Status
 
-**Work in progress.** Framebuffer controller starts, combo PHY calibration patched, accelerator ring initialises, host-based scheduler (type 5) active with RCS ring running on RPL. Display pipeline working (eDP trained, cursor visible). WindowServer connects successfully — 12 user clients created (2x IGAccel2DContext, 2x IOAccelDisplayPipeUserClient2, 8x IGAccelSurface). DYLD patches hook `_cs_validate_page` early (before DeviceInfo) to ensure CoreDisplay is patched before WindowServer starts. Metal rendering enabled by default; V50 patches `gpu_bundle_find_trusted()` in libsystem_sandbox.dylib to redirect GPU bundle search from `/Library/GPUBundles` → `/Library/Extensions/` where the TGL driver actually lives (Apple never shipped a TGL Mac). Alternative: manually `sudo cp -R /Library/Extensions/AppleIntelTGLGraphicsMTLDriver.bundle /Library/GPUBundles/`. ICL Metal driver device-ID bypass uses mask-based matching for build portability. V52 adds CPUID-based cross-platform detection (`isRealTGL`) — RPL-specific patches (topology overrides, GuC stub, BCS reset, ForceWake override) are automatically skipped on genuine Tiger Lake hardware. GPU command submission under active development.
+**Work in progress.** Framebuffer controller starts, combo PHY calibration patched, accelerator ring initialises, host-based scheduler (type 5) active with RCS ring running on RPL. Display pipeline working (eDP trained, cursor visible). WindowServer connects successfully — 12 user clients created (2x IGAccel2DContext, 2x IOAccelDisplayPipeUserClient2, 8x IGAccelSurface). System reaches login screen and stays alive (no kernel panic). DYLD patches hook `_cs_validate_page` early (before DeviceInfo) to ensure CoreDisplay is patched before WindowServer starts. Metal rendering enabled by default; V50 patches `gpu_bundle_find_trusted()` in libsystem_sandbox.dylib to redirect GPU bundle search from `/Library/GPUBundles` → `/Library/Extensions/` where the TGL driver actually lives (Apple never shipped a TGL Mac). Alternative: manually `sudo cp -R /Library/Extensions/AppleIntelTGLGraphicsMTLDriver.bundle /Library/GPUBundles/`. ICL Metal driver device-ID bypass uses mask-based matching for build portability. V52 adds CPUID-based cross-platform detection (`isRealTGL`) — RPL-specific patches (topology overrides, GuC stub, BCS reset, ForceWake override) are automatically skipped on genuine Tiger Lake hardware.
+
+### Recent Progress (V72–V74)
+
+- **V74:** Permanent EMR enforcer — 50ms timer runs indefinitely, keeping ERROR_GEN6 masked. System survives full boot without kernel panic. IGAccelDevice stays alive (dev=0x1e at V60M[60]).
+- **V73:** Fixed double-dereference crash in blit3D initialize hook. Three `IGHardwareBlit3DContext::initialize()` calls now complete successfully.
+- **V72:** EMR write interception on all MMIO write paths (discovered Apple uses direct MMIO, not WriteRegister32 — hooks don't fire, but timer approach works).
+
+### Current Blocker
+
+Display is black after driver takeover. The BIOS framebuffer is lost when the driver reinitializes the display pipeline. GPU acceleration subsystem is alive (EXEC=0x18101, CSB active, blit3D contexts created) but display plane registers need investigation.
 
 ## Requirements
 
@@ -106,7 +116,7 @@ NootedGreen (Gen11/Gen12 — TGL driver spoofing):
 | Platform | Status | Est. | Notes |
 |----------|--------|------|-------|
 | **Tiger Lake** | ~90% | V52 | RPL-specific patches auto-skipped via CPUID. GuC, topology, ForceWake, BCS all use native Apple paths. Remaining risk: SKU bypass hook + DYLD patches still in the path. No real TGL hardware tested yet. |
-| **Raptor Lake-P** | ~40% | V52 | Primary dev platform (i7-13700H). Display pipeline fully working, WindowServer connected, 12 user clients. Metal plugin loads but GPU command submission fails (ERROR_GEN6, dead BCS). |
+| **Raptor Lake-P** | ~55% | V74 | Primary dev platform (i7-13700H). Display pipeline working, WindowServer connected, system stable (no kernel panic). Permanent EMR enforcer keeps phantom GPU errors masked. Blit3D contexts initialize. Black screen after driver takeover — display plane reprogramming needed. |
 | **Alder Lake** | ~35% | — | Same Gen12 arch as RPL, should behave similarly. Untested. |
 | **Rocket Lake** | ~25% | — | Gen12 LP but different display engine. Untested. |
 | **Ice Lake** | ~50% | V52 | Dedicated ICL path exists (ICL FB + ICL HW kextInfos, ICL-specific object offsets in `getGPUInfoICL`, SKU gate×3, platform remap, PAVP hook, DYLD ICL Metal device-ID bypass). Topology hardcoded to ICL GT2 LP (1×8×8=64EU). IRQ init disabled (V37 boot hang). ICL path only activates when TGL kexts are absent. Untested on real ICL hardware. |
