@@ -1992,6 +1992,56 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		}
 	}
 
+	// ── V81: Persistent framebuffer fill — prove display pipeline works ──
+	// V80 boot: all registers correct, gamma valid, GGTT valid, WS alive (cursor visible)
+	// but primary plane shows black. WS composites to an IOAccelSurface that is NOT
+	// PLANE_SURF. Fill PLANE_SURF with a visible color to prove the pipe works,
+	// and read back pixels to detect if WS is writing to this surface.
+	if (v60Count >= 1 && v60Count <= 30) {
+		uint32_t surfAddr = NGreen::callback->readReg32(0x7019C); // PLANE_SURF
+		uint32_t surfPage = surfAddr >> 12;
+		uint32_t pteLo = NGreen::callback->readReg32(GGTT_PTE_LO(surfPage));
+		uint32_t pteHi = NGreen::callback->readReg32(GGTT_PTE_HI(surfPage));
+		uint64_t pte = ((uint64_t)pteHi << 32) | pteLo;
+		uint64_t physAddr = pte & 0x0000FFFFFFFFF000ULL;
+		bool pteValid = (pteLo & 0x1) != 0;
+
+		if (pteValid && physAddr != 0) {
+			// Map 256KB = 25 scanlines of 2560*4=10240 bytes
+			uint32_t mapSize = 256 * 1024;
+			auto *desc = IOMemoryDescriptor::withPhysicalAddress(
+				(IOPhysicalAddress)physAddr, mapSize, kIODirectionInOut);
+			if (desc) {
+				auto *map = desc->createMappingInTask(kernel_task, 0,
+					kIOMapAnywhere | kIOMapInhibitCache, 0, mapSize);
+				if (map) {
+					volatile uint32_t *fb = (volatile uint32_t *)map->getVirtualAddress();
+					uint32_t totalPixels = mapSize / 4; // 65536 pixels
+
+					// Read first 4 pixels to detect if WS writes here
+					if (v60Count <= 5 || v60Count == 10 || v60Count == 20 || v60Count == 30) {
+						SYSLOG("ngreen", "V81[%d]: SURF=0x%x px[0]=0x%x px[1]=0x%x px[2560]=0x%x px[5120]=0x%x",
+							   v60Count, surfAddr, fb[0], fb[1], fb[2560], fb[5120]);
+					}
+
+					// Fill with magenta (0xFFFF00FF) on iterations 2-20
+					// This overwrites whatever WS or the driver put there
+					if (v60Count >= 2 && v60Count <= 20) {
+						for (uint32_t px = 0; px < totalPixels; px++) {
+							fb[px] = 0xFFFF00FF; // XRGB magenta
+						}
+						if (v60Count <= 5) {
+							SYSLOG("ngreen", "V81[%d]: FILLED %d pixels magenta at phys=0x%llx",
+								   v60Count, totalPixels, (unsigned long long)physAddr);
+						}
+					}
+					map->release();
+				}
+				desc->release();
+			}
+		}
+	}
+
 	// ── V68: Iteration 5 — deep probe e08obj + GGTT PTE check ──
 	// V67 proved: sched error clear sticks, but hardware ERROR_GEN6=0x7b recurs
 	// every ~10s independently. Need to find WHAT generates the error.
