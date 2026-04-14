@@ -1512,13 +1512,15 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 	
 	// 6. Log with ring + CSB focus
 	uint32_t postErr = NGreen::callback->readReg32(ERROR_GEN6);
+	uint32_t gtDw0   = NGreen::callback->readReg32(GEN11_GT_INTR_DW0);
+	uint32_t rcIntr  = NGreen::callback->readReg32(GEN11_RENDER_COPY_INTR_ENABLE);
 	SYSLOG("ngreen", "V60M[%d]: ERR=0x%x->0x%x HEAD=0x%x TAIL=0x%x CTL=0x%x EMR=0x%x EXEC=0x%x CSB=0x%x ch=%d dev=0x%llx%s%s",
 		   v60Count, realErr, postErr, rcsHead, rcsTail, rcsCtl, emr,
 		   execStatus, csbPtr, childCount, (unsigned long long)accelDevState,
 		   headChanged ? " HEAD_MOVED!" : "",
 		   tailChanged ? " TAIL_MOVED!" : "");
-	SYSLOG("ngreen", "V63M[%d]: ACTHD=0x%x CCID=0x%x FAULT=0x%x",
-		   v60Count, acthd, ccid, ringFault);
+	SYSLOG("ngreen", "V66M[%d]: ACTHD=0x%x CCID=0x%x FAULT=0x%x GT_DW0=0x%x RC_EN=0x%x",
+		   v60Count, acthd, ccid, ringFault, gtDw0, rcIntr);
 	
 	// ── V64: CSB buffer dump + interrupt mask diagnostics + CSB read pointer advance ──
 	if (v60Count == 1) {
@@ -1539,6 +1541,57 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		uint32_t ident0 = NGreen::callback->readReg32(GEN11_INTR_IDENTITY_REG0);
 		uint32_t ident1 = NGreen::callback->readReg32(GEN11_INTR_IDENTITY_REG1);
 		SYSLOG("ngreen", "V64: INTR_IDENT0=0x%x INTR_IDENT1=0x%x", ident0, ident1);
+		
+		// ── V66: Scheduler object internal state dump ──
+		// The scheduler at accelerator offset 0xe00 controls GPU work submission.
+		// Dump its internal fields to find engine alive/dead state.
+		{
+			uint64_t schedPtr = getMember<uint64_t>(svc, 0xe00);
+			if (schedPtr) {
+				SYSLOG("ngreen", "V66: scheduler ptr=0x%llx", (unsigned long long)schedPtr);
+				// Dump the first 256 bytes of the scheduler object in 8-byte chunks
+				// Looking for engine state, workloop ptr, interrupt event source ptr, etc.
+				auto *schedBase = reinterpret_cast<uint8_t *>(schedPtr);
+				for (int i = 0; i < 32; i++) {
+					uint64_t val = *reinterpret_cast<uint64_t *>(schedBase + i * 8);
+					SYSLOG("ngreen", "V66: sched[0x%03x]=0x%016llx", i * 8, (unsigned long long)val);
+				}
+				// Also dump fields around likely engine state offsets (0x100-0x180)
+				for (int i = 0; i < 16; i++) {
+					uint64_t val = *reinterpret_cast<uint64_t *>(schedBase + 0x100 + i * 8);
+					SYSLOG("ngreen", "V66: sched[0x%03x]=0x%016llx", 0x100 + i * 8, (unsigned long long)val);
+				}
+			} else {
+				SYSLOG("ngreen", "V66: scheduler ptr is NULL!");
+			}
+			
+			// Check the accelerator's workloop for interrupt event sources
+			auto *wl = svc->getWorkLoop();
+			SYSLOG("ngreen", "V66: accelerator workLoop=%s", wl ? "EXISTS" : "NULL");
+			if (wl) {
+				// Try to find if any IOInterruptEventSource is registered
+				// We can check by dumping the accelerator object fields around the
+				// expected interrupt source pointer offset
+				// Also check if the workloop itself has event sources by reading its chain
+				SYSLOG("ngreen", "V66: workLoop class=%s", wl->getMetaClass()->getClassName());
+			}
+			
+			// Dump accelerator object fields around interrupt/workloop storage
+			// Typical IOAccelerator fields: workloop ~0xd0-0xe0, interrupt ES ~0xe8-0xf8
+			for (int i = 0; i < 8; i++) {
+				uint64_t val = getMember<uint64_t>(svc, 0xd00 + i * 8);
+				SYSLOG("ngreen", "V66: accel[0x%03x]=0x%016llx", 0xd00 + i * 8, (unsigned long long)val);
+			}
+			for (int i = 0; i < 8; i++) {
+				uint64_t val = getMember<uint64_t>(svc, 0xe00 + i * 8);
+				SYSLOG("ngreen", "V66: accel[0x%03x]=0x%016llx", 0xe00 + i * 8, (unsigned long long)val);
+			}
+			// Dump fields around encodeFailureStack (0x1c30) and GPU state area
+			for (int i = 0; i < 8; i++) {
+				uint64_t val = getMember<uint64_t>(svc, 0x1c00 + i * 8);
+				SYSLOG("ngreen", "V66: accel[0x%03x]=0x%016llx", 0x1c00 + i * 8, (unsigned long long)val);
+			}
+		}
 	}
 	
 	// V64: On iteration 3, advance CSB read pointer to match write pointer
@@ -1586,6 +1639,37 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 			if (v60Count <= 3) {
 				SYSLOG("ngreen", "V65M[%d]: tier-2 fix mask 0x%x->0x%x", v60Count, rcsMask, newMask);
 			}
+		}
+	}
+	
+	// ── V66: Iteration 5 — re-dump scheduler state after IGAccelDevice should be alive ──
+	// At T+10s, IGAccelDevice reaches state 0x1e and userspace tries to connect.
+	// Compare scheduler state with iteration 1 to detect engine-dead marking.
+	if (v60Count == 5) {
+		uint64_t schedPtr = getMember<uint64_t>(svc, 0xe00);
+		if (schedPtr) {
+			auto *schedBase = reinterpret_cast<uint8_t *>(schedPtr);
+			// Dump key scheduler fields (first 256 bytes + 0x100-0x180 range)
+			for (int i = 0; i < 32; i++) {
+				uint64_t val = *reinterpret_cast<uint64_t *>(schedBase + i * 8);
+				SYSLOG("ngreen", "V66B: sched[0x%03x]=0x%016llx", i * 8, (unsigned long long)val);
+			}
+			for (int i = 0; i < 16; i++) {
+				uint64_t val = *reinterpret_cast<uint64_t *>(schedBase + 0x100 + i * 8);
+				SYSLOG("ngreen", "V66B: sched[0x%03x]=0x%016llx", 0x100 + i * 8, (unsigned long long)val);
+			}
+			// Also probe deeper — 0x200-0x280 (engine context/state area)
+			for (int i = 0; i < 16; i++) {
+				uint64_t val = *reinterpret_cast<uint64_t *>(schedBase + 0x200 + i * 8);
+				SYSLOG("ngreen", "V66B: sched[0x%03x]=0x%016llx", 0x200 + i * 8, (unsigned long long)val);
+			}
+		}
+		// Dump encodeFailureStack — has it grown since start()?
+		uint32_t failCount = getMember<uint32_t>(svc, 0x1c50);
+		SYSLOG("ngreen", "V66B: encodeFailureStack count=%u (was 2 at start)", failCount);
+		for (uint32_t i = 0; i < failCount && i < 8; i++) {
+			uint32_t code = getMember<uint32_t>(svc, 0x1c30 + i * 4);
+			SYSLOG("ngreen", "V66B:   failureStack[%u] = 0x%x", i, code);
 		}
 	}
 	
