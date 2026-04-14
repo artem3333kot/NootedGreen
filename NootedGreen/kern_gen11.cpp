@@ -1542,54 +1542,93 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		uint32_t ident1 = NGreen::callback->readReg32(GEN11_INTR_IDENTITY_REG1);
 		SYSLOG("ngreen", "V64: INTR_IDENT0=0x%x INTR_IDENT1=0x%x", ident0, ident1);
 		
-		// ── V66: Scheduler object internal state dump ──
-		// The scheduler at accelerator offset 0xe00 controls GPU work submission.
-		// Dump its internal fields to find engine alive/dead state.
+		// ── V67: Enhanced scheduler + workloop + event source diagnostics ──
 		{
 			uint64_t schedPtr = getMember<uint64_t>(svc, 0xe00);
 			if (schedPtr) {
-				SYSLOG("ngreen", "V66: scheduler ptr=0x%llx", (unsigned long long)schedPtr);
-				// Dump the first 256 bytes of the scheduler object in 8-byte chunks
-				// Looking for engine state, workloop ptr, interrupt event source ptr, etc.
+				SYSLOG("ngreen", "V67: scheduler ptr=0x%llx", (unsigned long long)schedPtr);
 				auto *schedBase = reinterpret_cast<uint8_t *>(schedPtr);
-				for (int i = 0; i < 32; i++) {
+				// V67: Expanded dump — 0x000-0x400 (128 QWORDs)
+				for (int i = 0; i < 128; i++) {
 					uint64_t val = *reinterpret_cast<uint64_t *>(schedBase + i * 8);
-					SYSLOG("ngreen", "V66: sched[0x%03x]=0x%016llx", i * 8, (unsigned long long)val);
-				}
-				// Also dump fields around likely engine state offsets (0x100-0x180)
-				for (int i = 0; i < 16; i++) {
-					uint64_t val = *reinterpret_cast<uint64_t *>(schedBase + 0x100 + i * 8);
-					SYSLOG("ngreen", "V66: sched[0x%03x]=0x%016llx", 0x100 + i * 8, (unsigned long long)val);
+					if (val != 0) {  // Only log non-zero to reduce noise
+						SYSLOG("ngreen", "V67: sched[0x%03x]=0x%016llx", i * 8, (unsigned long long)val);
+					}
 				}
 			} else {
-				SYSLOG("ngreen", "V66: scheduler ptr is NULL!");
+				SYSLOG("ngreen", "V67: scheduler ptr is NULL!");
 			}
 			
-			// Check the accelerator's workloop for interrupt event sources
+			// V67: Dump object at accel[0xe08] — may be the actual scheduler C++ object
+			uint64_t schedObj = getMember<uint64_t>(svc, 0xe08);
+			if (schedObj) {
+				auto *objBase = reinterpret_cast<uint8_t *>(schedObj);
+				// First 8 bytes should be vtable pointer for a C++ object
+				uint64_t vtable = *reinterpret_cast<uint64_t *>(objBase);
+				SYSLOG("ngreen", "V67: accel[0xe08] obj=0x%llx vtable=0x%llx",
+					(unsigned long long)schedObj, (unsigned long long)vtable);
+				// Dump first 256 bytes, non-zero only
+				for (int i = 0; i < 32; i++) {
+					uint64_t val = *reinterpret_cast<uint64_t *>(objBase + i * 8);
+					if (val != 0) {
+						SYSLOG("ngreen", "V67: e08obj[0x%03x]=0x%016llx", i * 8, (unsigned long long)val);
+					}
+				}
+			}
+			
+			// V67: Dump objects at accel[0xe10..0xe38] — identify by vtable class
+			for (int idx = 0; idx < 6; idx++) {
+				uint64_t objPtr = getMember<uint64_t>(svc, 0xe10 + idx * 8);
+				if (objPtr) {
+					auto *obj = reinterpret_cast<OSObject *>(objPtr);
+					const char *clsName = obj->getMetaClass() ? obj->getMetaClass()->getClassName() : "?";
+					SYSLOG("ngreen", "V67: accel[0x%03x]=0x%llx class=%s",
+						0xe10 + idx * 8, (unsigned long long)objPtr, clsName);
+				}
+			}
+			
+			// V67: Workloop event source chain enumeration
 			auto *wl = svc->getWorkLoop();
-			SYSLOG("ngreen", "V66: accelerator workLoop=%s", wl ? "EXISTS" : "NULL");
+			SYSLOG("ngreen", "V67: workLoop=%s", wl ? "EXISTS" : "NULL");
 			if (wl) {
-				// Try to find if any IOInterruptEventSource is registered
-				// We can check by dumping the accelerator object fields around the
-				// expected interrupt source pointer offset
-				// Also check if the workloop itself has event sources by reading its chain
-				SYSLOG("ngreen", "V66: workLoop class=%s", wl->getMetaClass()->getClassName());
+				SYSLOG("ngreen", "V67: workLoop class=%s ptr=0x%llx",
+					wl->getMetaClass()->getClassName(), (unsigned long long)wl);
+				// Dump workloop object — first 128 bytes to find event source chain
+				auto *wlBase = reinterpret_cast<uint8_t *>(wl);
+				for (int i = 0; i < 16; i++) {
+					uint64_t val = *reinterpret_cast<uint64_t *>(wlBase + i * 8);
+					SYSLOG("ngreen", "V67: wl[0x%02x]=0x%016llx", i * 8, (unsigned long long)val);
+				}
+				
+				// V67: Walk event source chain from workloop dump.
+				// IOWorkLoop layout: [0x00]=vtable [0x08-0x10]=OSObject fields
+				// [0x18]=gateLock [0x20]=eventChain [0x28]=controlG [0x30]=workToDo etc.
+				// Read eventChain pointer (offset ~0x20 or thereabouts in the dump above)
+				// and follow the chain manually.
+				uint64_t eventChain = *reinterpret_cast<uint64_t *>(wlBase + 0x20);
+				SYSLOG("ngreen", "V67: wl eventChain=0x%016llx", (unsigned long long)eventChain);
+				int esIdx = 0;
+				uint64_t esPtr = eventChain;
+				while (esPtr && esIdx < 16) {
+					auto *esObj = reinterpret_cast<OSObject *>(esPtr);
+					const char *esClass = "?";
+					if (esObj->getMetaClass()) {
+						esClass = esObj->getMetaClass()->getClassName();
+					}
+					SYSLOG("ngreen", "V67: eventSource[%d]: class=%s ptr=0x%016llx",
+						esIdx, esClass, (unsigned long long)esPtr);
+					// IOEventSource::eventChainNext is typically at offset 0x10
+					auto *esBase = reinterpret_cast<uint8_t *>(esPtr);
+					esPtr = *reinterpret_cast<uint64_t *>(esBase + 0x10);
+					esIdx++;
+				}
+				SYSLOG("ngreen", "V67: workLoop has %d event sources in chain", esIdx);
 			}
 			
-			// Dump accelerator object fields around interrupt/workloop storage
-			// Typical IOAccelerator fields: workloop ~0xd0-0xe0, interrupt ES ~0xe8-0xf8
-			for (int i = 0; i < 8; i++) {
-				uint64_t val = getMember<uint64_t>(svc, 0xd00 + i * 8);
-				SYSLOG("ngreen", "V66: accel[0x%03x]=0x%016llx", 0xd00 + i * 8, (unsigned long long)val);
-			}
+			// V67: Key accelerator fields
 			for (int i = 0; i < 8; i++) {
 				uint64_t val = getMember<uint64_t>(svc, 0xe00 + i * 8);
-				SYSLOG("ngreen", "V66: accel[0x%03x]=0x%016llx", 0xe00 + i * 8, (unsigned long long)val);
-			}
-			// Dump fields around encodeFailureStack (0x1c30) and GPU state area
-			for (int i = 0; i < 8; i++) {
-				uint64_t val = getMember<uint64_t>(svc, 0x1c00 + i * 8);
-				SYSLOG("ngreen", "V66: accel[0x%03x]=0x%016llx", 0x1c00 + i * 8, (unsigned long long)val);
+				SYSLOG("ngreen", "V67: accel[0x%03x]=0x%016llx", 0xe00 + i * 8, (unsigned long long)val);
 			}
 		}
 	}
@@ -1642,34 +1681,62 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		}
 	}
 	
-	// ── V66: Iteration 5 — re-dump scheduler state after IGAccelDevice should be alive ──
-	// At T+10s, IGAccelDevice reaches state 0x1e and userspace tries to connect.
-	// Compare scheduler state with iteration 1 to detect engine-dead marking.
+	// ── V67: Iteration 5 — clear scheduler error field + monitor effect ──
+	// V66 proved sched[0x008] = 0x0000007b00000060 (upper 32 = ERROR_GEN6 code).
+	// V66 also showed Apple's error handler resets RC_INTR_EN every ~10s in exact
+	// correlation with ERROR_GEN6=0x7b. Try clearing the scheduler's cached error.
 	if (v60Count == 5) {
 		uint64_t schedPtr = getMember<uint64_t>(svc, 0xe00);
 		if (schedPtr) {
 			auto *schedBase = reinterpret_cast<uint8_t *>(schedPtr);
-			// Dump key scheduler fields (first 256 bytes + 0x100-0x180 range)
-			for (int i = 0; i < 32; i++) {
-				uint64_t val = *reinterpret_cast<uint64_t *>(schedBase + i * 8);
-				SYSLOG("ngreen", "V66B: sched[0x%03x]=0x%016llx", i * 8, (unsigned long long)val);
-			}
-			for (int i = 0; i < 16; i++) {
-				uint64_t val = *reinterpret_cast<uint64_t *>(schedBase + 0x100 + i * 8);
-				SYSLOG("ngreen", "V66B: sched[0x%03x]=0x%016llx", 0x100 + i * 8, (unsigned long long)val);
-			}
-			// Also probe deeper — 0x200-0x280 (engine context/state area)
-			for (int i = 0; i < 16; i++) {
-				uint64_t val = *reinterpret_cast<uint64_t *>(schedBase + 0x200 + i * 8);
-				SYSLOG("ngreen", "V66B: sched[0x%03x]=0x%016llx", 0x200 + i * 8, (unsigned long long)val);
-			}
+			// Read current values
+			uint32_t schedErr = *reinterpret_cast<uint32_t *>(schedBase + 0x0C);
+			uint32_t schedCfg = *reinterpret_cast<uint32_t *>(schedBase + 0x08);
+			uint32_t schedFlag = *reinterpret_cast<uint32_t *>(schedBase + 0x00);
+			SYSLOG("ngreen", "V67: pre-clear sched[0x00]=0x%x sched[0x08]=0x%x sched[0x0C]=0x%x",
+				schedFlag, schedCfg, schedErr);
+			
+			// Clear the error field (0x7b → 0x0)
+			*reinterpret_cast<uint32_t *>(schedBase + 0x0C) = 0;
+			// Also try clearing sched[0x00] flag (1→0, might be "error state" flag)
+			*reinterpret_cast<uint32_t *>(schedBase + 0x00) = 0;
+			
+			uint32_t afterErr = *reinterpret_cast<uint32_t *>(schedBase + 0x0C);
+			uint32_t afterFlag = *reinterpret_cast<uint32_t *>(schedBase + 0x00);
+			SYSLOG("ngreen", "V67: post-clear sched[0x00]=0x%x sched[0x0C]=0x%x",
+				afterFlag, afterErr);
+			
+			// Also clear ERROR_GEN6 and fully mask EMR at the same time
+			NGreen::callback->writeReg32(ERROR_GEN6, 0x0);
+			NGreen::callback->writeReg32(RING_EMR(RENDER_RING_BASE), 0xFFFFFFFF);
+			// Re-enable interrupts
+			uint32_t wantBits = (1 << GEN11_RCS0) | (1 << GEN11_BCS);
+			NGreen::callback->writeReg32(GEN11_RENDER_COPY_INTR_ENABLE,
+				NGreen::callback->readReg32(GEN11_RENDER_COPY_INTR_ENABLE) | wantBits);
+			SYSLOG("ngreen", "V67: cleared ERROR_GEN6, masked EMR, re-enabled RCS0 interrupts");
 		}
-		// Dump encodeFailureStack — has it grown since start()?
+		// Check encodeFailureStack
 		uint32_t failCount = getMember<uint32_t>(svc, 0x1c50);
-		SYSLOG("ngreen", "V66B: encodeFailureStack count=%u (was 2 at start)", failCount);
-		for (uint32_t i = 0; i < failCount && i < 8; i++) {
-			uint32_t code = getMember<uint32_t>(svc, 0x1c30 + i * 4);
-			SYSLOG("ngreen", "V66B:   failureStack[%u] = 0x%x", i, code);
+		SYSLOG("ngreen", "V67: encodeFailureStack count=%u", failCount);
+	}
+	
+	// V67: Iteration 10 — check if scheduler error clear had any effect
+	if (v60Count == 10) {
+		uint64_t schedPtr = getMember<uint64_t>(svc, 0xe00);
+		if (schedPtr) {
+			auto *schedBase = reinterpret_cast<uint8_t *>(schedPtr);
+			uint32_t schedFlag = *reinterpret_cast<uint32_t *>(schedBase + 0x00);
+			uint32_t schedCfg = *reinterpret_cast<uint32_t *>(schedBase + 0x08);
+			uint32_t schedErr = *reinterpret_cast<uint32_t *>(schedBase + 0x0C);
+			SYSLOG("ngreen", "V67B: T+20s sched[0x00]=0x%x sched[0x08]=0x%x sched[0x0C]=0x%x",
+				schedFlag, schedCfg, schedErr);
+			// Dump non-zero fields in 0x000-0x400 to see if anything changed
+			for (int i = 0; i < 128; i++) {
+				uint64_t val = *reinterpret_cast<uint64_t *>(schedBase + i * 8);
+				if (val != 0) {
+					SYSLOG("ngreen", "V67B: sched[0x%03x]=0x%016llx", i * 8, (unsigned long long)val);
+				}
+			}
 		}
 	}
 	
