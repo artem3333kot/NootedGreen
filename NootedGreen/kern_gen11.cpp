@@ -1520,6 +1520,73 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 	SYSLOG("ngreen", "V63M[%d]: ACTHD=0x%x CCID=0x%x FAULT=0x%x",
 		   v60Count, acthd, ccid, ringFault);
 	
+	// ── V64: CSB buffer dump + interrupt mask diagnostics + CSB read pointer advance ──
+	if (v60Count == 1) {
+		// Dump all 6 CSB entries (context status buffer) — GPU writes these during context switches
+		for (int i = 0; i < 6; i++) {
+			uint32_t csbHi = NGreen::callback->readReg32(RING_CONTEXT_STATUS_BUF_HI(RENDER_RING_BASE, i));
+			uint32_t csbLo = NGreen::callback->readReg32(RING_CONTEXT_STATUS_BUF(RENDER_RING_BASE, i));
+			SYSLOG("ngreen", "V64: CSB[%d] = 0x%x:0x%x", i, csbHi, csbLo);
+		}
+		// Dump interrupt enable + mask registers for RCS
+		uint32_t rcIntrEn   = NGreen::callback->readReg32(GEN11_RENDER_COPY_INTR_ENABLE);
+		uint32_t rcsIntrMask = NGreen::callback->readReg32(GEN11_RCS0_RSVD_INTR_MASK);
+		uint32_t gtIntrDw0  = NGreen::callback->readReg32(GEN11_GT_INTR_DW0);
+		uint32_t mstrIrq    = NGreen::callback->readReg32(GEN11_GFX_MSTR_IRQ);
+		SYSLOG("ngreen", "V64: RC_INTR_EN=0x%x RCS_INTR_MASK=0x%x GT_DW0=0x%x MSTR=0x%x",
+			   rcIntrEn, rcsIntrMask, gtIntrDw0, mstrIrq);
+		// Dump identity registers
+		uint32_t ident0 = NGreen::callback->readReg32(GEN11_INTR_IDENTITY_REG0);
+		uint32_t ident1 = NGreen::callback->readReg32(GEN11_INTR_IDENTITY_REG1);
+		SYSLOG("ngreen", "V64: INTR_IDENT0=0x%x INTR_IDENT1=0x%x", ident0, ident1);
+	}
+	
+	// V64: On iteration 3, advance CSB read pointer to match write pointer
+	// CSB ptr format: bits[10:8]=write ptr (GPU), bits[2:0]=read ptr (software)
+	// If write > read, scheduler is stuck waiting for CSB processing
+	if (v60Count == 3) {
+		uint32_t csbPtrNow = NGreen::callback->readReg32(RING_CONTEXT_STATUS_PTR(RENDER_RING_BASE));
+		uint32_t writeIdx = (csbPtrNow >> 8) & 0x7;
+		uint32_t readIdx  = csbPtrNow & 0x7;
+		SYSLOG("ngreen", "V64: CSB ptr=0x%x write=%d read=%d", csbPtrNow, writeIdx, readIdx);
+		if (writeIdx != readIdx) {
+			// Advance read pointer to match write pointer
+			uint32_t newPtr = (csbPtrNow & ~0x7) | (writeIdx & 0x7);
+			NGreen::callback->writeReg32(RING_CONTEXT_STATUS_PTR(RENDER_RING_BASE), newPtr);
+			uint32_t verify = NGreen::callback->readReg32(RING_CONTEXT_STATUS_PTR(RENDER_RING_BASE));
+			SYSLOG("ngreen", "V64: CSB read ptr advanced %d->%d (wrote 0x%x, readback 0x%x)",
+				   readIdx, writeIdx, newPtr, verify);
+		} else {
+			SYSLOG("ngreen", "V64: CSB ptrs already matched (write=read=%d)", writeIdx);
+		}
+	}
+	
+	// V64: On iteration 5, unmask RCS context-switch + user interrupts if masked
+	if (v60Count == 5) {
+		uint32_t rcIntrEn = NGreen::callback->readReg32(GEN11_RENDER_COPY_INTR_ENABLE);
+		uint32_t rcsMask  = NGreen::callback->readReg32(GEN11_RCS0_RSVD_INTR_MASK);
+		SYSLOG("ngreen", "V64: pre-fix RC_INTR_EN=0x%x RCS_MASK=0x%x", rcIntrEn, rcsMask);
+		
+		// Enable RCS+BCS in tier-1 interrupt enable (bit 0 = RCS0, bit 15 = BCS)
+		if (!(rcIntrEn & (1 << GEN11_RCS0))) {
+			uint32_t newEn = rcIntrEn | (1 << GEN11_RCS0) | (1 << GEN11_BCS);
+			NGreen::callback->writeReg32(GEN11_RENDER_COPY_INTR_ENABLE, newEn);
+			SYSLOG("ngreen", "V64: enabled RCS+BCS in RENDER_COPY_INTR_ENABLE: 0x%x->0x%x",
+				   rcIntrEn, newEn);
+		}
+		// Unmask context-switch + user interrupt for RCS (0 = unmasked, 1 = masked)
+		uint32_t wantUnmasked = GT_CONTEXT_SWITCH_INTERRUPT | GT_RENDER_USER_INTERRUPT;
+		if (rcsMask & wantUnmasked) {
+			uint32_t newMask = rcsMask & ~wantUnmasked;
+			NGreen::callback->writeReg32(GEN11_RCS0_RSVD_INTR_MASK, newMask);
+			SYSLOG("ngreen", "V64: unmasked RCS CS+USER interrupts: mask 0x%x->0x%x",
+				   rcsMask, newMask);
+		}
+		uint32_t postEn   = NGreen::callback->readReg32(GEN11_RENDER_COPY_INTR_ENABLE);
+		uint32_t postMask = NGreen::callback->readReg32(GEN11_RCS0_RSVD_INTR_MASK);
+		SYSLOG("ngreen", "V64: post-fix RC_INTR_EN=0x%x RCS_MASK=0x%x", postEn, postMask);
+	}
+	
 	v60LastHead = rcsHead;
 	v60LastTail = rcsTail;
 	
