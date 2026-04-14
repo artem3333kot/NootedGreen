@@ -1992,12 +1992,15 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		}
 	}
 
-	// ── V81: Persistent framebuffer fill — prove display pipeline works ──
-	// V80 boot: all registers correct, gamma valid, GGTT valid, WS alive (cursor visible)
-	// but primary plane shows black. WS composites to an IOAccelSurface that is NOT
-	// PLANE_SURF. Fill PLANE_SURF with a visible color to prove the pipe works,
-	// and read back pixels to detect if WS is writing to this surface.
-	if (v60Count >= 1 && v60Count <= 30) {
+	// ── V82: GGTT PTE cloning — full-screen magenta framebuffer test ──
+	// V81 bug: mapped 256KB contiguously from first PTE physAddr, but GGTT pages
+	// are NOT contiguous after page 3. Only ~12KB (1.2 rows) was valid.
+	// V82 fix: Fill page 0 with magenta, then CLONE its PTE across all 4000
+	// framebuffer pages so the display resolves every page to the same
+	// magenta-filled physical page. Also reduced logging to prevent APFS panic.
+	static IOMemoryMap *v82FbMap = nullptr;
+
+	if (v60Count == 2) {
 		uint32_t surfAddr = NGreen::callback->readReg32(0x7019C); // PLANE_SURF
 		uint32_t surfPage = surfAddr >> 12;
 		uint32_t pteLo = NGreen::callback->readReg32(GGTT_PTE_LO(surfPage));
@@ -2007,39 +2010,47 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		bool pteValid = (pteLo & 0x1) != 0;
 
 		if (pteValid && physAddr != 0) {
-			// Map 256KB = 25 scanlines of 2560*4=10240 bytes
-			uint32_t mapSize = 256 * 1024;
+			// Map page 0 physical address (4KB = 1024 pixels)
 			auto *desc = IOMemoryDescriptor::withPhysicalAddress(
-				(IOPhysicalAddress)physAddr, mapSize, kIODirectionInOut);
+				(IOPhysicalAddress)physAddr, 4096, kIODirectionInOut);
 			if (desc) {
-				auto *map = desc->createMappingInTask(kernel_task, 0,
-					kIOMapAnywhere | kIOMapInhibitCache, 0, mapSize);
-				if (map) {
-					volatile uint32_t *fb = (volatile uint32_t *)map->getVirtualAddress();
-					uint32_t totalPixels = mapSize / 4; // 65536 pixels
-
-					// Read first 4 pixels to detect if WS writes here
-					if (v60Count <= 5 || v60Count == 10 || v60Count == 20 || v60Count == 30) {
-						SYSLOG("ngreen", "V81[%d]: SURF=0x%x px[0]=0x%x px[1]=0x%x px[2560]=0x%x px[5120]=0x%x",
-							   v60Count, surfAddr, fb[0], fb[1], fb[2560], fb[5120]);
-					}
-
-					// Fill with magenta (0xFFFF00FF) on iterations 2-20
-					// This overwrites whatever WS or the driver put there
-					if (v60Count >= 2 && v60Count <= 20) {
-						for (uint32_t px = 0; px < totalPixels; px++) {
-							fb[px] = 0xFFFF00FF; // XRGB magenta
-						}
-						if (v60Count <= 5) {
-							SYSLOG("ngreen", "V81[%d]: FILLED %d pixels magenta at phys=0x%llx",
-								   v60Count, totalPixels, (unsigned long long)physAddr);
-						}
-					}
-					map->release();
+				v82FbMap = desc->createMappingInTask(kernel_task, 0,
+					kIOMapAnywhere | kIOMapInhibitCache, 0, 4096);
+				if (v82FbMap) {
+					volatile uint32_t *fb = (volatile uint32_t *)v82FbMap->getVirtualAddress();
+					SYSLOG("ngreen", "V82[2]: SURF=0x%x phys=0x%llx PRE px[0]=0x%x px[512]=0x%x",
+						   surfAddr, (unsigned long long)physAddr, fb[0], fb[512]);
+					// Fill 1024 pixels with magenta
+					for (int px = 0; px < 1024; px++)
+						fb[px] = 0xFFFF00FF;
 				}
 				desc->release();
 			}
+
+			// Clone PTE to pages 1-3999: entire 2560x1600 framebuffer
+			// Every page resolves to the same magenta physical page
+			for (int p = 1; p <= 3999; p++) {
+				NGreen::callback->writeReg32(GGTT_PTE_LO(surfPage + p), pteLo);
+				NGreen::callback->writeReg32(GGTT_PTE_HI(surfPage + p), pteHi);
+			}
+			// Re-arm PLANE_SURF to force display engine to re-walk GGTT
+			NGreen::callback->writeReg32(0x7019C, surfAddr);
+			SYSLOG("ngreen", "V82[2]: cloned PTE to 3999 pages, SURF re-armed");
 		}
+	}
+
+	if (v60Count >= 3 && v60Count <= 5 && v82FbMap) {
+		volatile uint32_t *fb = (volatile uint32_t *)v82FbMap->getVirtualAddress();
+		SYSLOG("ngreen", "V82[%d]: readback px[0]=0x%x px[512]=0x%x",
+			   v60Count, fb[0], fb[512]);
+		// Re-fill in case WS or driver overwrites
+		for (int px = 0; px < 1024; px++)
+			fb[px] = 0xFFFF00FF;
+	}
+
+	if (v60Count == 30 && v82FbMap) {
+		v82FbMap->release();
+		v82FbMap = nullptr;
 	}
 
 	// ── V68: Iteration 5 — deep probe e08obj + GGTT PTE check ──
@@ -2158,7 +2169,7 @@ void Gen11::v71EmrEnforcer(thread_call_param_t param0, thread_call_param_t param
 		NGreen::callback->writeReg32(ERROR_GEN6, 0x0);
 
 	// 3. Log first 3 + unmask events (rate-limited: first 200 only)
-	if (v71Count <= 3 || (emrRcs != 0xFFFFFFFF && v71Count <= 200)) {
+	if (v71Count <= 3 || (emrRcs != 0xFFFFFFFF && v71Count <= 10)) {
 		SYSLOG("ngreen", "V74E[%d]: EMR_RCS=0x%x EMR_BCS=0x%x ERR=0x%x",
 			   v71Count, emrRcs, emrBcs, err);
 	}
@@ -2191,7 +2202,7 @@ void Gen11::v71EmrEnforcer(thread_call_param_t param0, thread_call_param_t param
 				// Re-arm PLANE_SURF to latch changes
 				uint32_t surf = NGreen::callback->readReg32(0x7019C);
 				NGreen::callback->writeReg32(0x7019C, surf);
-				if (v71Count <= 40) {
+				if (v71Count <= 5) {
 					SYSLOG("ngreen", "V80[%d]: tiling=%d stride=0x%x->0x%x w=%d",
 						   v71Count, tilingBits, planStrd, expectedStride, width);
 				}
