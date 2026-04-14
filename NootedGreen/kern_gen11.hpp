@@ -261,6 +261,7 @@ struct PACKED intel_dmc_header_v3 {
 #define RING_CTX_SIZE(base)			((base) + 0x1a0) /* context size */
 #define RING_CCID(base)				((base) + 0x180) /* context control ID */
 #define RING_CTX_CTRL(base)			((base) + 0x244) /* context control */
+#define RING_ELSP(base)				((base) + 0x230) /* ExecList Submission Port */
 #define RING_EXECLIST_STATUS(base)	((base) + 0x234)
 #define RING_CONTEXT_STATUS_PTR(base) ((base) + 0x3a0)
 #define RING_MODE(base)				((base) + 0x29c)

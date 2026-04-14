@@ -1224,9 +1224,31 @@ uint32_t Gen11::wrapReadRegister32(void *controller, uint32_t address) {
 
 void Gen11::wrapWriteRegister32(void *controller, uint32_t address, uint32_t value) {
 	if (controller == nullptr) {
-		NGreen::callback->writeReg32(address, value);  // readReg32 now takes byte offsets
+		NGreen::callback->writeReg32(address, value);
 		return;
 	}
+
+	// ── V62: Log scheduler submission activity (diagnostic only, no modification) ──
+	if (!NGreen::callback->isRealTGL) {
+		// ELSP — ExecList Submission Port: scheduler writes context descriptors here
+		if (address == RING_ELSP(RENDER_RING_BASE)) {
+			SYSLOG("ngreen", "V62: ELSP WRITE val=0x%x", value);
+		}
+		// RING_TAIL — driver advances tail to tell GPU about new ring commands
+		else if (address == RING_TAIL(RENDER_RING_BASE)) {
+			SYSLOG("ngreen", "V62: RCS RING_TAIL write val=0x%x (HEAD=0x%x)", value,
+				NGreen::callback->readReg32(RING_HEAD(RENDER_RING_BASE)));
+		}
+		// RING_CTL — ring enable/disable
+		else if (address == RING_CTL(RENDER_RING_BASE)) {
+			SYSLOG("ngreen", "V62: RCS RING_CTL write val=0x%x", value);
+		}
+		// RING_START — ring buffer base address
+		else if (address == RING_START(RENDER_RING_BASE)) {
+			SYSLOG("ngreen", "V62: RCS RING_START write val=0x%x", value);
+		}
+	}
+
 	FunctionCast(wrapWriteRegister32, callback->owrapWriteRegister32)(controller,address,value);
 }
 
