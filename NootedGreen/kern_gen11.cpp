@@ -1231,6 +1231,22 @@ void Gen11::wrapWriteRegister32(void *controller, uint32_t address, uint32_t val
 		return;
 	}
 
+	// ── V72: EMR write intercept — force all errors masked ──
+	// RCS EMR = 0x20b4, BCS EMR = 0x220b4
+	// Apple writes 0xfffffffa (unmasks bits 0,2) → triggers phantom ERROR_GEN6=0x7b
+	// Force value to 0xffffffff so no error bits can fire interrupts.
+	if (address == 0x20b4 || address == 0x220b4) {
+		if (value != 0xFFFFFFFF) {
+			static int v72WrapCount = 0;
+			if (v72WrapCount < 20) {
+				v72WrapCount++;
+				SYSLOG("ngreen", "V72W[%d]: EMR write blocked @ 0x%x val=0x%x -> 0xffffffff",
+					   v72WrapCount, address, value);
+			}
+			value = 0xFFFFFFFF;
+		}
+	}
+
 	// ── V63: Broad RCS register write intercept (diagnostic only, no modification) ──
 	// Catches ANY write to RCS control range: ELSP, EXECLIST, CTX_CTRL, CCID, TAIL, etc.
 	// Rate-limited to first 100 writes to avoid flooding Lilu buffer.
@@ -3287,6 +3303,19 @@ void Gen11::radWriteRegister32f(void *that,unsigned long param_1, UInt32 param_2
 
 void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 {
+	// ── V72: EMR write intercept — force all errors masked ──
+	if (param_1 == 0x20b4 || param_1 == 0x220b4) {
+		if (param_2 != 0xFFFFFFFF) {
+			static int v72RaCount = 0;
+			if (v72RaCount < 20) {
+				v72RaCount++;
+				SYSLOG("ngreen", "V72R[%d]: EMR write blocked @ 0x%lx val=0x%x -> 0xffffffff",
+					   v72RaCount, param_1, param_2);
+			}
+			param_2 = 0xFFFFFFFF;
+		}
+	}
+
 	// Force linear tiling for display plane registers.
 	// Without GPU acceleration, surfaces are linear but the driver computes
 	// Tile4 stride (÷512). Convert back to linear stride (÷64) = multiply by 8.
@@ -4018,6 +4047,19 @@ void Gen11::hwConfigureCustomAUX(void *that,bool param_1)
 
 void Gen11::FastWriteRegister32(void *that,unsigned long param_1,uint32_t param_2)
 {
+	// ── V72: EMR write intercept — force all errors masked ──
+	if (param_1 == 0x20b4 || param_1 == 0x220b4) {
+		if (param_2 != 0xFFFFFFFF) {
+			static int v72FastCount = 0;
+			if (v72FastCount < 20) {
+				v72FastCount++;
+				SYSLOG("ngreen", "V72F[%d]: EMR write blocked @ 0x%lx val=0x%x -> 0xffffffff",
+					   v72FastCount, param_1, param_2);
+			}
+			param_2 = 0xFFFFFFFF;
+		}
+	}
+
 	if (param_1 == 0x70188) { // PLANE_STRIDE Pipe A Plane 1
 		UInt32 linear = param_2 * 8;
 		DBGLOG("ngreen", "FastWrite PLANE_STRIDE fixup: 0x%x -> 0x%x (linear)", param_2, linear);
