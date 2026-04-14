@@ -1568,6 +1568,34 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		}
 	}
 	
+	// V77: Fallback — terminate IOAccelDisplayPipeUserClient2 children if they exist.
+	// Primary fix: DisplayPipeSupported=0 in accelerator properties (set in start()).
+	// This fallback catches cases where IOAccelerator2D ignores the property and
+	// creates display pipe user clients anyway.
+	if (v60Count >= 2 && v60Count <= 15) {
+		OSIterator *dpIter = svc->getClientIterator();
+		if (dpIter) {
+			OSObject *dpObj;
+			int dpKilled = 0;
+			while ((dpObj = dpIter->getNextObject())) {
+				auto *dpChild = OSDynamicCast(IOService, dpObj);
+				if (dpChild) {
+					const char *dpCn = dpChild->getMetaClass()->getClassName();
+					if (dpCn && strstr(dpCn, "DisplayPipe")) {
+						SYSLOG("ngreen", "V77: TERMINATING %s (st=0x%llx) to prevent WS GPU compositing crash",
+							   dpCn, (unsigned long long)dpChild->getState());
+						dpChild->terminate(kIOServiceRequired);
+						dpKilled++;
+					}
+				}
+			}
+			dpIter->release();
+			if (dpKilled > 0) {
+				SYSLOG("ngreen", "V77: Killed %d display pipe client(s) at iter %d", dpKilled, v60Count);
+			}
+		}
+	}
+	
 	// 5. V60: ACTIVE error suppression (V57 proven approach)
 	//    Clear ERROR_GEN6 by writing 0x0, re-mask EMR every cycle
 	if (realErr) {
@@ -2632,14 +2660,19 @@ bool Gen11::start(void *that,void  *param_1)
 			accelSvc->setProperty("IOSourceVersion", "0.0.0.0.0");
 			auto *vaRendID = OSNumber::withNumber(static_cast<unsigned long long>(17301568), 32);
 			if (vaRendID) { accelSvc->setProperty("IOVARendererID", vaRendID); vaRendID->release(); }
+			// V77: DisplayPipeSupported=0 — disable GPU display pipe compositing.
+			// WindowServer crash-loops (consecutiveCrashCount=11) in
+			// CoreDisplay::DisplayPipe::RunFullDisplayPipe because GPU can't render
+			// surfaces (RCS ring idle). Force CPU compositing via FB aperture.
 			auto *dpCaps = OSDictionary::withCapacity(2);
 			if (dpCaps) {
-				auto *v1 = OSNumber::withNumber(1ULL, 32);
-				auto *v2 = OSNumber::withNumber(1ULL, 32);
+				auto *v1 = OSNumber::withNumber(0ULL, 32);
+				auto *v2 = OSNumber::withNumber(0ULL, 32);
 				if (v1) { dpCaps->setObject("DisplayPipeSupported", v1); v1->release(); }
 				if (v2) { dpCaps->setObject("TransactionsSupported", v2); v2->release(); }
 				accelSvc->setProperty("IOAccelDisplayPipeCapabilities", dpCaps);
 				dpCaps->release();
+				SYSLOG("ngreen", "V77: DisplayPipeSupported=0 set on accelerator");
 			}
 			auto *cfpi = OSDictionary::withCapacity(1);
 			if (cfpi) {
@@ -3779,11 +3812,12 @@ bool Gen11::AppleIntelBaseControllerstart(void *that,void *param_1)
 					pluginDict->release();
 				}
 				
-				// Display pipe capabilities
+				// V77: Display pipe capabilities — DISABLED to prevent WS GPU compositing crash.
+				// See V77 comment in start() for full explanation.
 				auto *dpCaps = OSDictionary::withCapacity(2);
 				if (dpCaps) {
-					auto *dpSupp = OSNumber::withNumber(static_cast<unsigned long long>(1), 32);
-					auto *trSupp = OSNumber::withNumber(static_cast<unsigned long long>(1), 32);
+					auto *dpSupp = OSNumber::withNumber(static_cast<unsigned long long>(0), 32);
+					auto *trSupp = OSNumber::withNumber(static_cast<unsigned long long>(0), 32);
 					dpCaps->setObject("DisplayPipeSupported", dpSupp);
 					dpCaps->setObject("TransactionsSupported", trSupp);
 					OSSafeReleaseNULL(dpSupp);
