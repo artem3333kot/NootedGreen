@@ -1228,24 +1228,20 @@ void Gen11::wrapWriteRegister32(void *controller, uint32_t address, uint32_t val
 		return;
 	}
 
-	// ── V62: Log scheduler submission activity (diagnostic only, no modification) ──
+	// ── V63: Broad RCS register write intercept (diagnostic only, no modification) ──
+	// Catches ANY write to RCS control range: ELSP, EXECLIST, CTX_CTRL, CCID, TAIL, etc.
+	// Rate-limited to first 100 writes to avoid flooding Lilu buffer.
 	if (!NGreen::callback->isRealTGL) {
-		// ELSP — ExecList Submission Port: scheduler writes context descriptors here
-		if (address == RING_ELSP(RENDER_RING_BASE)) {
-			SYSLOG("ngreen", "V62: ELSP WRITE val=0x%x", value);
-		}
-		// RING_TAIL — driver advances tail to tell GPU about new ring commands
-		else if (address == RING_TAIL(RENDER_RING_BASE)) {
-			SYSLOG("ngreen", "V62: RCS RING_TAIL write val=0x%x (HEAD=0x%x)", value,
-				NGreen::callback->readReg32(RING_HEAD(RENDER_RING_BASE)));
-		}
-		// RING_CTL — ring enable/disable
-		else if (address == RING_CTL(RENDER_RING_BASE)) {
-			SYSLOG("ngreen", "V62: RCS RING_CTL write val=0x%x", value);
-		}
-		// RING_START — ring buffer base address
-		else if (address == RING_START(RENDER_RING_BASE)) {
-			SYSLOG("ngreen", "V62: RCS RING_START write val=0x%x", value);
+		static int v63WriteCount = 0;
+		// RCS engine MMIO range: 0x2000-0x2FFF covers all ring control registers
+		if (address >= 0x2000 && address <= 0x2FFF) {
+			if (v63WriteCount < 100) {
+				v63WriteCount++;
+				SYSLOG("ngreen", "V63W[%d]: RCS reg 0x%x = 0x%x", v63WriteCount, address, value);
+			} else if (v63WriteCount == 100) {
+				v63WriteCount++;
+				SYSLOG("ngreen", "V63W: rate limit reached (100 RCS writes logged)");
+			}
 		}
 	}
 
@@ -1476,6 +1472,11 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 	uint32_t execStatus = NGreen::callback->readReg32(RING_EXECLIST_STATUS(RENDER_RING_BASE));
 	uint32_t csbPtr = NGreen::callback->readReg32(RING_CONTEXT_STATUS_PTR(RENDER_RING_BASE));
 	
+	// V63: Additional scheduler/context diagnostics
+	uint32_t acthd    = NGreen::callback->readReg32(RING_ACTHD(RENDER_RING_BASE));
+	uint32_t ccid     = NGreen::callback->readReg32(RING_CCID(RENDER_RING_BASE));
+	uint32_t ringFault = NGreen::callback->readReg32(GEN12_RING_FAULT_REG);
+	
 	// 3. Track ring HEAD/TAIL movement
 	bool headChanged = (rcsHead != v60LastHead);
 	bool tailChanged = (rcsTail != v60LastTail);
@@ -1516,6 +1517,8 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		   execStatus, csbPtr, childCount, (unsigned long long)accelDevState,
 		   headChanged ? " HEAD_MOVED!" : "",
 		   tailChanged ? " TAIL_MOVED!" : "");
+	SYSLOG("ngreen", "V63M[%d]: ACTHD=0x%x CCID=0x%x FAULT=0x%x",
+		   v60Count, acthd, ccid, ringFault);
 	
 	v60LastHead = rcsHead;
 	v60LastTail = rcsTail;
@@ -4104,6 +4107,9 @@ void Gen11::IGScheduler5resume(void *that) {
 
 unsigned long Gen11::resetGraphicsEngine(void *that,void *param_1)
 {
+	static int v63ResetCount = 0;
+	v63ResetCount++;
+	SYSLOG("ngreen", "V63: resetGraphicsEngine call #%d", v63ResetCount);
 	
 	//GT workarounds: the list of these WAs is applied whenever these registers
 	//*   revert to their default values: on GPU reset, suspend/resume [1]_, etc.
