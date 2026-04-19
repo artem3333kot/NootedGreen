@@ -105,6 +105,24 @@ static bool isV93PlaneGuardEnabled() {
 	return checkKernelArgument("-ngreenv93");
 }
 
+static bool isReferenceF2ProbeEnabled() {
+	int enabled = 0;
+	if (PE_parse_boot_argn("ngreenRefProbeF2", &enabled, sizeof(enabled))) {
+		return enabled != 0;
+	}
+
+	return checkKernelArgument("-ngreenRefProbeF2");
+}
+
+static bool isV88ScanoutFillEnabled() {
+	int enabled = 0;
+	if (PE_parse_boot_argn("ngreenv88", &enabled, sizeof(enabled))) {
+		return enabled != 0;
+	}
+
+	return checkKernelArgument("-ngreenv88");
+}
+
 bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
 	
 	if (kextG11FB.loadIndex == index) {
@@ -305,6 +323,8 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			{"__ZN19AppleIntelPowerWell19enableDisplayEngineEv",enableDisplayEngine, this->oenableDisplayEngine},
 			{"__ZN17AppleIntelPortHAL14enableComboPhyEv",enableComboPhyEv, this->oenableComboPhyEv},
 			{"__ZN14AppleIntelPort16computeLaneCountEPK29IODetailedTimingInformationV2jjPj",computeLaneCount, this->ocomputeLaneCount},
+			// V97: Log AUX transactions to diagnose eDP link training failures on RPL
+			{"__ZN14AppleIntelPort7readAUXEjPvj", Genx::wrapICLReadAUX, Genx::callback->orgICLReadAUX},
 			// V96: Force display online — WEG's getDisplayStatus hook (FOD) fails with
 			// "err 2" on TGL kext because that symbol doesn't exist. TGL uses getOnlineInfo.
 			{"__ZN21AppleIntelFramebuffer13getOnlineInfoEP21AppleIntelDisplayPathPhS2_", getOnlineInfo, this->ogetOnlineInfo},
@@ -547,6 +567,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			PANIC_COND(!LookupPatchPlus::applyAll(patcher, patchesp , address, size), "ngreen", "kextG11FBT Failed to apply production patches!");
 		}
 		else {
+			const bool refProbeF2 = isReferenceF2ProbeEnabled();
 			LookupPatchPlus const patches[] = {// tgl debug kext
 				{activeKext, f1, r1, arrsize(f1),	1},
 				// f2 (osinfo pipe/port/fb counts) disabled: wrong counts can corrupt scanout layout
@@ -583,6 +604,19 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			};
 			
 			PANIC_COND(!LookupPatchPlus::applyAll(patcher, patches , address, size), "ngreen", "kextG11FBT Failed to apply dbg patches!");
+
+			if (refProbeF2 && !NGreen::callback->isRealTGL) {
+				// Reference probe: enable only old f2 topology/osinfo bypass on demand.
+				// Keeps current stability protections while testing whether f2 is the flash trigger.
+				LookupPatchPlus const probeF2Patch[] = {
+					{activeKext, f2, r2, arrsize(f2), 1},
+				};
+				PANIC_COND(!LookupPatchPlus::applyAll(patcher, probeF2Patch, address, size),
+					"ngreen", "kextG11FBT Failed to apply reference f2 probe patch!");
+				SYSLOG("ngreen", "V109: reference probe enabled (f2 osinfo patch active)");
+			} else if (refProbeF2) {
+				SYSLOG("ngreen", "V109: reference f2 probe requested but ignored on real TGL");
+			}
 		}
 		
 		return true;
@@ -1921,9 +1955,34 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		}
 	}
 	
-	// ── V79: Framebuffer status monitor (every cycle) ──
-	// Keep this read-only; no plane mutation here.
-	{
+	// ── V79: Plane monitor / experimental linearization ──
+	// The old copy only reached brief first-light when the experimental path forced
+	// the scanout plane to linear and re-armed PLANE_SURF. Keep the default path
+	// read-only; restore the old behavior only with -ngreenexp.
+	if (isExperimentalMonitorEnabled()) {
+		if (v60Count <= 5 || v60Count == 10 || v60Count == 20 || v60Count == 30) {
+			uint32_t planCtl  = NGreen::callback->readReg32(0x70180); // PLANE_CTL
+			uint32_t planStrd = NGreen::callback->readReg32(0x70188); // PLANE_STRIDE
+			uint32_t tiling = (planCtl >> 10) & 0x7; // bits[12:10]
+			if (tiling != 0) {
+				uint32_t newCtl = planCtl & ~(0x7u << 10); // clear tiling -> linear
+				uint32_t newStrd = planStrd;
+				if (tiling == 1) {
+					newStrd = planStrd * 8;
+				} else if (tiling == 4) {
+					newStrd = planStrd * 16;
+				}
+				NGreen::callback->writeReg32(0x70180, newCtl);
+				NGreen::callback->writeReg32(0x70188, newStrd);
+				uint32_t planSurf = NGreen::callback->readReg32(0x7019C);
+				NGreen::callback->writeReg32(0x7019C, planSurf);
+				SYSLOG("ngreen", "V79[%d]: tiling %d->linear CTL 0x%x->0x%x STRIDE 0x%x->0x%x SURF=0x%x",
+					   v60Count, tiling, planCtl, newCtl, planStrd, newStrd, planSurf);
+			} else {
+				SYSLOG("ngreen", "V79[%d]: already linear CTL=0x%x STRIDE=0x%x", v60Count, planCtl, planStrd);
+			}
+		}
+	} else {
 		uint32_t planCtl  = NGreen::callback->readReg32(0x70180); // PLANE_CTL
 		uint32_t planStrd = NGreen::callback->readReg32(0x70188); // PLANE_STRIDE
 		uint32_t planSurf = NGreen::callback->readReg32(0x7019C); // PLANE_SURF
@@ -1934,9 +1993,6 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		SYSLOG("ngreen", "V79[%d]: PIPE=0x%x CTL=0x%x STRIDE=0x%x SURF=0x%x SIZE=0x%x POS=0x%x tiling=%d",
 			   v60Count, pipeConf, planCtl, planStrd, planSurf, planSize, planPos, tiling);
 	}
-
-	// V79B disabled: one-shot plane kick created transient flash artifacts that
-	// masked real bring-up behavior. Keep V79 read-only logging for diagnosis.
 
 	// ── V75: Display pipeline register dump — diagnose black screen ──
 	// System stays alive but display is black. Read pipe/plane/transcoder/backlight
@@ -2071,9 +2127,9 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 	// V88: Fill 4 color bands (RED/GREEN/BLUE/WHITE) to test if display reads our
 	// data at all. Flush GGTT TLB. Toggle plane off/on. Probe transcoders.
 
-	// V88 diagnostics disabled for stability: this block mutates scanout state and
-	// touches framebuffer mappings during bring-up, which can trigger MCEs.
-	if (false && v60Count >= 1 && v60Count <= 30) {
+	// V88 scanout fill is intentionally opt-in: it paints debug bars/colors and can
+	// override normal Apple UI composition. Enable only for diagnostics with -ngreenv88.
+	if (isExperimentalMonitorEnabled() && isV88ScanoutFillEnabled() && v60Count >= 1 && v60Count <= 30) {
 		uint32_t surfAddr = NGreen::callback->readReg32(0x7019C);
 		uint32_t surfPage = surfAddr >> 12;
 
@@ -2163,7 +2219,7 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 			desc->release();
 		}
 
-		// 4. Re-arm PLANE_SURF (guard: zero → GGTT[0] → phys 0x3e800000 stolen mem → MCE)
+		// 4. Re-arm PLANE_SURF (guard: zero -> GGTT[0] -> stolen mem -> MCE)
 		if (filled > 0 && surfAddr != 0)
 			NGreen::callback->writeReg32(0x7019C, surfAddr);
 
@@ -2916,10 +2972,12 @@ bool Gen11::start(void *that,void  *param_1)
 			}
 		}
 		
-		// V78: Keep display-pipe disabling as an opt-in fallback only.
-		// Default path now keeps native display pipe capabilities to avoid black-screen
-		// regressions where only hardware cursor updates.
-		if (isDisplayPipeForceDisabled()) {
+		// V78: Disable GPU display pipe compositing when forced by boot-arg OR when
+		// experimental monitor (-ngreenexp) is active. In experimental mode, WS will
+		// attempt to open IOAccelDisplayPipeUserClient2 clients which V77 then kills,
+		// causing one unavoidable WindowServer recycle. Setting DisplayPipeSupported=0
+		// here prevents WS from spawning those clients in the first place — no recycle.
+		if (isDisplayPipeForceDisabled() || isExperimentalMonitorEnabled()) {
 			auto *dpCaps = OSDictionary::withCapacity(2);
 			if (dpCaps) {
 				auto *dpSupp = OSNumber::withNumber(0ULL, 32);
@@ -2928,7 +2986,11 @@ bool Gen11::start(void *that,void  *param_1)
 				if (trSupp) { dpCaps->setObject("TransactionsSupported", trSupp); trSupp->release(); }
 				accelSvc->setProperty("IOAccelDisplayPipeCapabilities", dpCaps);
 				dpCaps->release();
-				SYSLOG("ngreen", "V78: DisplayPipeSupported=0 forced by boot-arg");
+				if (isDisplayPipeForceDisabled()) {
+					SYSLOG("ngreen", "V78: DisplayPipeSupported=0 forced by boot-arg");
+				} else {
+					SYSLOG("ngreen", "V78: DisplayPipeSupported=0 set (experimental mode — prevents WS recycle)");
+				}
 			}
 		} else {
 			SYSLOG("ngreen", "V78: keeping native DisplayPipeSupported (explicit -ngreendp1)");
@@ -2944,42 +3006,49 @@ bool Gen11::start(void *that,void  *param_1)
 		SYSLOG("ngreen", "V45: post-registerService state=0x%llx (reg=%d match=%d)",
 			   (unsigned long long)svcState, !!(svcState & 0x02), !!(svcState & 0x04));
 		
-		if (isExperimentalMonitorEnabled()) {
-			// 8. Experimental diagnostics: delayed child checks and timer-driven MMIO monitors.
+		// V110: V59 delayed child checks + V74 EMR enforcer run unconditionally for
+		// non-real TGL. Without V59, IGAccelDevice stays at state=0x0, WindowServer
+		// never opens IOAccelDisplayPipeUserClient2, and the display pipe never activates.
+		// V74 keeps EMR masked so Apple can't re-enable error interrupts behind our back.
+		// V60 health monitor (which contains V77 DisplayPipe killer) remains opt-in via
+		// -ngreenexp — without it, the display pipe is not terminated after opening.
+		if (!NGreen::callback->isRealTGL) {
+			// 8. V59: Schedule delayed child checks to rescue stuck IGAccelDevice children.
 			v45ScheduleDelayedCheck(that, 3000);
 			v45ScheduleDelayedCheck(that, 10000);
-			v45ScheduleDelayedCheck(that, 15000);   // V56: teardown timing probe
-			v45ScheduleDelayedCheck(that, 20000);   // V56: teardown timing probe
+			v45ScheduleDelayedCheck(that, 15000);
+			v45ScheduleDelayedCheck(that, 20000);
 			v45ScheduleDelayedCheck(that, 30000);
 			v45ScheduleDelayedCheck(that, 60000);
 			v45ScheduleDelayedCheck(that, 120000);
-			SYSLOG("ngreen", "V59: experimental delayed child checks enabled");
+			SYSLOG("ngreen", "V59: scheduled delayed child checks at T+3,10,15,20,30,60,120s");
 
-			// V60/V74 are invasive and can affect broader compatibility; keep opt-in only.
-			if (!NGreen::callback->isRealTGL) {
-				{
-					auto monTimer = thread_call_allocate(v60GpuHealthMonitor,
-											 static_cast<thread_call_param_t>(static_cast<IOService *>(that)));
-					if (monTimer) {
-						uint64_t deadline;
-						clock_interval_to_deadline(2, kSecondScale, &deadline);
-						thread_call_enter_delayed(monTimer, deadline);
-						SYSLOG("ngreen", "V60: experimental GPU health monitor armed");
-					}
-				}
-				{
-					auto emrTimer = thread_call_allocate(v71EmrEnforcer,
-											 static_cast<thread_call_param_t>(static_cast<IOService *>(that)));
-					if (emrTimer) {
-						uint64_t deadline;
-						clock_interval_to_deadline(50, kMillisecondScale, &deadline);
-						thread_call_enter_delayed(emrTimer, deadline);
-						SYSLOG("ngreen", "V74: experimental EMR enforcer armed");
-					}
+			// V74: Start PERMANENT EMR enforcer — 50ms interval, runs forever.
+			{
+				auto emrTimer = thread_call_allocate(v71EmrEnforcer,
+										 static_cast<thread_call_param_t>(static_cast<IOService *>(that)));
+				if (emrTimer) {
+					uint64_t deadline;
+					clock_interval_to_deadline(50, kMillisecondScale, &deadline);
+					thread_call_enter_delayed(emrTimer, deadline);
+					SYSLOG("ngreen", "V74: EMR enforcer armed — 50ms interval, PERMANENT");
 				}
 			}
-		} else {
-			SYSLOG("ngreen", "compat mode: experimental V45/V59/V60/V74 timers are disabled (use -ngreenexp to enable)");
+
+			// V60: GPU health monitor (contains V77 DisplayPipe terminator) — opt-in only.
+			// Without this, IOAccelDisplayPipeUserClient2 is NOT killed after V59 opens it.
+			if (isExperimentalMonitorEnabled()) {
+				auto monTimer = thread_call_allocate(v60GpuHealthMonitor,
+										 static_cast<thread_call_param_t>(static_cast<IOService *>(that)));
+				if (monTimer) {
+					uint64_t deadline;
+					clock_interval_to_deadline(2, kSecondScale, &deadline);
+					thread_call_enter_delayed(monTimer, deadline);
+					SYSLOG("ngreen", "V60: GPU health monitor armed — 2s interval, 60 iterations (120s)");
+				}
+			} else {
+				SYSLOG("ngreen", "V110: V60 health monitor disabled — DisplayPipe will not be terminated (use -ngreenexp to enable)");
+			}
 		}
 	}
 	
@@ -4598,19 +4667,36 @@ uint8_t Gen11::hwRegsNeedUpdate
 }
 
 void Gen11::computeLaneCount(void *that, const void *timing, unsigned int linkRate, unsigned int bpp, unsigned int *laneCount) {
-	FunctionCast(computeLaneCount, callback->ocomputeLaneCount)(that, timing, linkRate, bpp, laneCount);
-	// V90: Stop forcing 4 lanes unconditionally. The moving "untuned TV" artifact
-	// suggests unstable link/refresh timing; preserve Apple's lane decision and log it.
-	if (laneCount) {
-		static int v90LaneCountLogs = 0;
-		if (v90LaneCountLogs < 20) {
-			v90LaneCountLogs++;
-			SYSLOG("ngreen", "V90L[%d]: linkRate=%u bpp=%u laneCount=%u",
-			       v90LaneCountLogs, linkRate, bpp, *laneCount);
+	if (!laneCount) return;
+
+	if (!NGreen::callback->isRealTGL) {
+		// V90L4: Apple's TGL computeLaneCount only handles standard DP rates (6/10/20/30).
+		// RPL-P VBT/panel uses rate=24 (24×270=6480 Mbps custom eDP rate) — Apple returns 0.
+		// Skip the original entirely for spoofed paths: default to 2 lanes (most common
+		// eDP configuration). Override via boot-arg "ngreenLanes=4" for 4-lane panels.
+		unsigned int lanes = 2;
+		int lanesArg = 0;
+		if (PE_parse_boot_argn("ngreenLanes", &lanesArg, sizeof(lanesArg)) &&
+		    (lanesArg == 1 || lanesArg == 2 || lanesArg == 4))
+			lanes = static_cast<unsigned int>(lanesArg);
+		*laneCount = lanes;
+
+		static int v90L4Logs = 0;
+		if (v90L4Logs < 20) {
+			v90L4Logs++;
+			SYSLOG("ngreen", "V90L4[%d]: linkRate=%u bpp=%u laneCount=%u (bypassed Apple)",
+			       v90L4Logs, linkRate, bpp, *laneCount);
 		}
-		// Keep a conservative fallback only for clearly invalid output.
-		if (*laneCount == 0)
-			*laneCount = 4;
+		return;
+	}
+
+	// Real TGL: use Apple's original implementation unmodified
+	FunctionCast(computeLaneCount, callback->ocomputeLaneCount)(that, timing, linkRate, bpp, laneCount);
+	static int v90L4RLogs = 0;
+	if (v90L4RLogs < 5) {
+		v90L4RLogs++;
+		SYSLOG("ngreen", "V90L4R[%d]: realTGL linkRate=%u bpp=%u laneCount=%u",
+		       v90L4RLogs, linkRate, bpp, *laneCount);
 	}
 }
 
@@ -4732,22 +4818,56 @@ void Gen11::IGHardwareBlit3DContextinitialize(void *that)
 		return;
 	}
 
-	SYSLOG("ngreen", "V69: IGHardwareBlit3DContext::initialize(%p)", that);
+	static int v69CallCount = 0;
+	v69CallCount++;
+	const bool v69Verbose = v69CallCount <= 6;
+
+	// Preserve real TGL behavior: always use Apple's original initializer.
+	if (NGreen::callback->isRealTGL) {
+		FunctionCast(IGHardwareBlit3DContextinitialize, callback->oIGHardwareBlit3DContextinitialize)(that);
+		return;
+	}
+
+	if (v69Verbose)
+		SYSLOG("ngreen", "V69: IGHardwareBlit3DContext::initialize[%d](%p)", v69CallCount, that);
 
 	// Dump context object internals — look for the GPU buffer mapping info
 	void *mappedBufPtr = getMember<void *>(that, 0xd8);
-	SYSLOG("ngreen", "V69: ctx->0xd8(IGMappedBuffer)=%p", mappedBufPtr);
+	if (v69Verbose)
+		SYSLOG("ngreen", "V69: ctx->0xd8(IGMappedBuffer)=%p", mappedBufPtr);
 
 	// Probe IGMappedBuffer internals: vtable, size, IOMemoryDescriptor*, base VA, etc.
-	if (mappedBufPtr) {
+	if (mappedBufPtr && v69Verbose) {
 		for (int i = 0; i < 12; i++) {
 			uint64_t val = getMember<uint64_t>(mappedBufPtr, i * 8);
 			SYSLOG("ngreen", "V69: mappedBuf[0x%02x]=0x%016llx", i * 8, (unsigned long long)val);
 		}
 	}
 
+	// V106: On spoofed paths, default to skip Apple's original init.
+	// The original still faults at +0x4c on some boots (page fault in SecurityAgent path).
+	// Preserve a diagnostic opt-in only: -ngreenV69AllowOriginal.
+	const bool allowOriginal = checkKernelArgument("-ngreenV69AllowOriginal");
+	uint64_t gpuBufBase = mappedBufPtr ? getMember<uint64_t>(mappedBufPtr, 0x18) : 0;
+	uint64_t gpuBufSize = mappedBufPtr ? getMember<uint64_t>(mappedBufPtr, 0x20) : 0;
+	bool safeForOriginal = mappedBufPtr && gpuBufBase != 0 && gpuBufSize >= 0xD040;
+	if (allowOriginal && safeForOriginal) {
+		SYSLOG("ngreen", "V105: calling original Blit3D init (base=0x%llx size=0x%llx)",
+		       (unsigned long long)gpuBufBase, (unsigned long long)gpuBufSize);
+		FunctionCast(IGHardwareBlit3DContextinitialize, callback->oIGHardwareBlit3DContextinitialize)(that);
+		SYSLOG("ngreen", "V105: original Blit3D init completed");
+		return;
+	}
+	if (allowOriginal && !safeForOriginal) {
+		SYSLOG("ngreen", "V106: -ngreenV69AllowOriginal requested but rejected (base=0x%llx size=0x%llx)",
+		       (unsigned long long)gpuBufBase, (unsigned long long)gpuBufSize);
+	} else if (v69Verbose || v69CallCount == 16 || v69CallCount == 64 || v69CallCount == 256) {
+		SYSLOG("ngreen", "V106: skip original Blit3D init on non-real TGL (base=0x%llx size=0x%llx)",
+		       (unsigned long long)gpuBufBase, (unsigned long long)gpuBufSize);
+	}
+
 	// Dump context fields 0xb0-0x120 (includes buffer pointers, sizes, GPU addresses)
-	for (int i = 0; i < 16; i++) {
+	for (int i = 0; v69Verbose && i < 16; i++) {
 		uint64_t val = getMember<uint64_t>(that, 0xb0 + i * 8);
 		if (val != 0) {
 			SYSLOG("ngreen", "V69: ctx[0x%03x]=0x%016llx", 0xb0 + i * 8, (unsigned long long)val);
@@ -4767,7 +4887,8 @@ void Gen11::IGHardwareBlit3DContextinitialize(void *that)
 	// DO NOT call original — crashes at initialize()+0x4c writing to unmapped page 0xD
 	// DO NOT call blit3d_initialize_scratch_space / blit3d_init_ctx — their hooks are not
 	// connected so oblit3d_init_ctx=0 → FunctionCast to addr 0 → instant crash
-	SYSLOG("ngreen", "V69: initialize complete (SKIPPED original — crash prevention)");
+	if (v69Verbose)
+		SYSLOG("ngreen", "V69: initialize complete (SKIPPED original — crash prevention)");
 
 }
 

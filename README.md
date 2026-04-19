@@ -8,7 +8,7 @@ Patches Apple's Tiger Lake (Gen12) graphics drivers to work with newer Intel iGP
 
 ## Status
 
-**Work in progress.** Framebuffer controller starts, combo PHY calibration patched, accelerator ring initialises, host-based scheduler (type 5) active with RCS ring running on RPL. Display pipeline working (eDP trained, cursor visible). WindowServer connects successfully — 12 user clients created (2x IGAccel2DContext, 2x IOAccelDisplayPipeUserClient2, 8x IGAccelSurface). System reaches login screen and stays alive (no kernel panic). DYLD patches hook `_cs_validate_page` early (before DeviceInfo) to ensure CoreDisplay is patched before WindowServer starts. Metal rendering enabled by default; V50 patches `gpu_bundle_find_trusted()` in libsystem_sandbox.dylib to redirect GPU bundle search from `/Library/GPUBundles` → `/Library/Extensions/` where the TGL driver actually lives (Apple never shipped a TGL Mac). Alternative: manually `sudo cp -R /Library/Extensions/AppleIntelTGLGraphicsMTLDriver.bundle /Library/GPUBundles/`. ICL Metal driver device-ID bypass uses mask-based matching for build portability. V52 adds CPUID-based cross-platform detection (`isRealTGL`) — RPL-specific patches (topology overrides, GuC stub, BCS reset, ForceWake override) are automatically skipped on genuine Tiger Lake hardware.
+**Work in progress.** Framebuffer controller starts, combo PHY calibration patched, accelerator ring initialises, host-based scheduler (type 5) active with RCS ring running on RPL. System reaches login screen and stays alive (no kernel panic). Experimental monitor mode (`-ngreenexp`) now disables GPU display-pipe compositing capability early (`DisplayPipeSupported=0`) to prevent WindowServer recycle loops while still allowing staged bring-up diagnostics. DYLD patches hook `_cs_validate_page` early (before DeviceInfo) to ensure CoreDisplay is patched before WindowServer starts. Metal rendering enabled by default; V50 patches `gpu_bundle_find_trusted()` in libsystem_sandbox.dylib to redirect GPU bundle search from `/Library/GPUBundles` → `/Library/Extensions/` where the TGL driver actually lives (Apple never shipped a TGL Mac). Alternative: manually `sudo cp -R /Library/Extensions/AppleIntelTGLGraphicsMTLDriver.bundle /Library/GPUBundles/`. ICL Metal driver device-ID bypass uses mask-based matching for build portability. V52 adds CPUID-based cross-platform detection (`isRealTGL`) — RPL-specific patches (topology overrides, GuC stub, BCS reset, ForceWake override) are automatically skipped on genuine Tiger Lake hardware.
 
 ### Important (Current Test State)
 
@@ -16,10 +16,17 @@ Patches Apple's Tiger Lake (Gen12) graphics drivers to work with newer Intel iGP
 - Early IGPU identity detection is confirmed working: Lilu reads `AAPL,ig-platform-id` (`9A490000`) via OpenCore DeviceProperties during `DeviceInfo` scan.
 - Platform-ID and device-ID injection now handled cleanly by config.plist only — NootedGreen no longer interferes mid-initialization.
 - System boots to login screen reliably with no visual corruption or kernel panics.
-- **Staged Metal bring-up** (V97+) — Metal is OFF by default. When enabled, CoreDisplay patches are applied in stages (0–3) to isolate WindowServer crashes. Stage 3 adds a NULL virtual-call guard in `RunFullDisplayPipe` instead of stubbing the whole function.
+- **Staged Metal bring-up** (V97+) — CoreDisplay patches are applied in stages (0–3) to isolate WindowServer crashes. On non-real TGL, stage 3 is clamped to stage 2 unless `-ngreenUnsafeStage3` is explicitly provided.
+- **V88 scanout fill is now opt-in** (`-ngreenv88`). Default stage/experimental boots no longer paint diagnostic bars over normal macOS layout.
 
 ### Recent Progress
 
+- **V110:** V59 delayed checks + V74 EMR enforcer run unconditionally on non-real TGL; V60 monitor remains opt-in via `-ngreenexp`.
+- **V109:** Added reference f2 probe boot-arg (`-ngreenRefProbeF2`) for targeted osinfo patch testing.
+- **V108:** Safe stage 2/3 keeps `GetMTLTexture` stubbed and also keeps `AccessComplete` safely bypassed when required.
+- **V106:** Blit3D original init is skipped by default on non-real TGL; opt-in diagnostic path via `-ngreenV69AllowOriginal`.
+- **V104:** Stage 3 clamp on non-real TGL unless explicitly overridden with `-ngreenUnsafeStage3`.
+- **V98/V98T/V90L4:** Conservative eDP training and lane policy diagnostics for spoofed paths.
 - **V103:** Added `-ngreenUnsafeGetMTLTexture` safe/unsafe split — GetMTLTexture is stubbed by default in stages 2–3, restorable for crash diagnostics.
 - **V102:** Added `-ngreenSkylBypass` — optional SkyLight conditional branch NOP for stage-3 black-screen diagnostics.
 - **V101:** Staged Metal bring-up system (`ngreenFullMTLStage=0..3`). Stage 3 uses a NULL-guarded `RunFullDisplayPipe` with `test rdi,rdi; jz` instead of stubbing the entire function.
@@ -31,7 +38,7 @@ Patches Apple's Tiger Lake (Gen12) graphics drivers to work with newer Intel iGP
 
 ### Current Status
 
-System boots to login screen reliably. Display output is stable with Metal OFF (default). Metal bring-up is in staged testing — stage 3 allows `RunFullDisplayPipe` to execute with a NULL pointer guard, avoiding the previous full-function stub. GetMTLTexture is kept stubbed by default for safety. Next focus: stage-3 stability under Metal ON, SkyLight interaction, and GPU memory pressure testing.
+System boots to login screen reliably. Stage-2 Metal bring-up (`ngreenFullMTLStage=2`) is currently the recommended path on non-real TGL. Experimental mode no longer forces a WindowServer recycle by default because display-pipe capability is disabled up-front in that mode. V88 visual fill is opt-in only (`-ngreenv88`) so default boots preserve normal Apple UI layout.
 
 ## Requirements
 
@@ -73,8 +80,14 @@ These properties are essential for correct platform identification and WEG coexi
 | `-ngreenFullMTLTest` | Legacy shortcut — sets `ngreenFullMTLStage=1` if no explicit stage is set |
 | `-ngreenUnsafeGetMTLTexture` | Restore the real `GetMTLTexture` call in stages 2 and 3 (crash-oriented diagnostics). By default, GetMTLTexture is stubbed to return NULL for safety. |
 | `-ngreenSkylBypass` | Enable SkyLight conditional branch bypass in stage 3 — for black-screen diagnostics |
+| `-ngreenUnsafeStage3` | Allow stage 3 on non-real TGL (otherwise `ngreenFullMTLStage=3` is clamped to stage 2) |
+| `-ngreenReallyUnsafeGetMTLTexture` | Force unsafe GetMTLTexture restore on non-real TGL (bypasses safety ignore of `-ngreenUnsafeGetMTLTexture`) |
 | `-nbdyldoff` | **Disable ALL DYLD patches** (CoreDisplay, OpenGL, Metal, SkyLight) — debug only |
-| `-ngreenexp` / `ngreenexp=1` | Enable experimental runtime monitor/timer paths (disabled by default for compatibility) |
+| `-ngreenexp` / `ngreenexp=1` | Enable experimental runtime monitor/timer paths (V60 monitor) and force `DisplayPipeSupported=0` in accelerator capabilities to prevent WS recycle loops |
+| `-ngreenv88` / `ngreenv88=1` | Enable V88 scanout fill + plane toggle diagnostics (draws test bars/colors; off by default) |
+| `-ngreenRefProbeF2` / `ngreenRefProbeF2=1` | Enable reference f2 osinfo patch probe on non-real TGL (diagnostic only) |
+| `-ngreenV69AllowOriginal` | Allow original Blit3D initialize on non-real TGL when safety preconditions are met (crash-oriented diagnostic) |
+| `ngreenLanes=1|2|4` | Override lane count used by non-real TGL computeLaneCount bypass (default 2 lanes) |
 | `-ngreenforceprops` / `ngreenforceprops=1` | Enable legacy forced IGPU property injection (`AAPL,ig-platform-id`, `model`, `saved-config`, etc.). Disabled by default in compatibility-first mode. |
 | `IGLogLevel=8` | Maximum Intel GPU driver logging |
 | `-liludbg` | Enable Lilu debug logging |
@@ -92,6 +105,8 @@ Metal rendering on RPL+TGL spoof causes WindowServer crashes in CoreDisplay. To 
 | **3** | NULL-guarded | Real | Stubbed by default | RunFullDisplayPipe runs with a NULL virtual-call guard; GetMTLTexture stubbed unless `-ngreenUnsafeGetMTLTexture`. Optional `-ngreenSkylBypass` NOPs the SkyLight branch. |
 
 The NULL virtual-call guard in stage 3 replaces the original `mov rdi,[r14+0x888]; mov rax,[rdi]; call [rax+0x28]` with `mov rdi,...; test rdi,rdi; jz +6; nop` — skipping the virtual call when the display pipe pointer is NULL instead of crashing.
+
+On non-real TGL systems, requesting stage 3 is clamped to stage 2 unless `-ngreenUnsafeStage3` is present.
 
 ## Compatibility-First Defaults
 

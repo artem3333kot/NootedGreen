@@ -172,6 +172,13 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 	static const uint8_t f_getmtltex_sonoma[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x81, 0xec, 0x68, 0x01, 0x00, 0x00, 0x49, 0x89, 0xf6, 0x49, 0x89, 0xff};
 	static const uint8_t r_getmtltex_sonoma[] = {0x31, 0xC0, 0xC3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
 	
+	//CoreDisplay::MetalDevice::GetMTLCommandQueue() const - return NULL (Sonoma 14.7.1)
+	//Called from AccessComplete with rdi=NULL (NULL MetalDevice), crashes at mov rax,[rdi+8] (+30).
+	//Pattern (26 bytes): push rbp; mov rbp,rsp; push r15; push r14; push rbx; sub rsp,0x88;
+	//  mov rax,[rip+0x3f8829e9]; mov rax,[rax]  (first two insns after frame setup, no ambiguity)
+	static const uint8_t f_getmtlcq_sonoma[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x48, 0x81, 0xec, 0x88, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x05, 0xe9, 0x29, 0x88, 0x3f, 0x48, 0x8b, 0x00};
+	static const uint8_t r_getmtlcq_sonoma[] = {0x31, 0xc0, 0xc3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+
 	//CoreDisplay::DisplaySurface::AccessComplete - return immediately (Sonoma 14.7.1)
 	//AccessComplete calls multiple Metal functions (GetMTLTexture, GetMTLCommandQueue, etc.)
 	//on a NULL MetalDevice. Patching individual Metal functions is whack-a-mole.
@@ -209,6 +216,7 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
         static bool fullMTLChecked = false;
         static int fullMTLStage = 0;
 		static bool skylBypass = false;
+		static bool unsafeGetMTLTexture = false;
         if (!noMetalChecked) {
 			// Safe default
 			noMetal = true;
@@ -231,8 +239,9 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 			// Stages are only used when Metal is ON:
 			//   0 = keep all safety stubs
 			//   1 = re-enable AccessComplete only
-			//   2 = re-enable AccessComplete + GetMTLTexture
-			//   3 = re-enable AccessComplete + GetMTLTexture + RunFullDisplayPipe
+			//   2 = re-enable AccessComplete; keep GetMTLTexture stubbed by default
+			//   3 = re-enable RunFullDisplayPipe + AccessComplete; keep GetMTLTexture stubbed by default
+			// Unsafe opt-in: -ngreenUnsafeGetMTLTexture restores real GetMTLTexture in stage 2/3.
 			int fullMTLArg = 0;
 			if (PE_parse_boot_argn("ngreenFullMTLStage", &fullMTLArg, sizeof(fullMTLArg))) {
 				if (fullMTLArg < 0) fullMTLArg = 0;
@@ -241,6 +250,22 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 			}
 			if (checkKernelArgument("-ngreenFullMTLTest") && fullMTLStage == 0)
 				fullMTLStage = 1;
+
+			// Preserve real TGL behavior. On spoofed RPL/ADL paths, stage-3 is known to
+			// trigger WindowServer watchdog loops unless explicitly requested for diagnostics.
+			const bool allowUnsafeStage3 = checkKernelArgument("-ngreenUnsafeStage3");
+			if (!NGreen::callback->isRealTGL && fullMTLStage > 2 && !allowUnsafeStage3) {
+				SYSLOG("DYLD", "V104: clamping FullMTL stage %d -> 2 on non-real TGL (use -ngreenUnsafeStage3 to override)", fullMTLStage);
+				fullMTLStage = 2;
+			}
+
+			// Keep GetMTLTexture stubbed unless explicitly asked for crash-oriented diagnostics.
+			unsafeGetMTLTexture = checkKernelArgument("-ngreenUnsafeGetMTLTexture");
+			if (!NGreen::callback->isRealTGL && unsafeGetMTLTexture &&
+			    !checkKernelArgument("-ngreenReallyUnsafeGetMTLTexture")) {
+				SYSLOG("DYLD", "V107: ignoring -ngreenUnsafeGetMTLTexture on non-real TGL; use -ngreenReallyUnsafeGetMTLTexture to force it");
+				unsafeGetMTLTexture = false;
+			}
 
 			// Optional SkyLight branch bypass for stage-3 black-screen diagnostics.
 			// Enable with: -ngreenSkylBypass
@@ -251,9 +276,11 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 			SYSLOG("DYLD", "V101: FullMTL stage=%d (%s)", fullMTLStage,
 				fullMTLStage == 0 ? "all safety stubs active" :
 				fullMTLStage == 1 ? "AccessComplete enabled" :
-				fullMTLStage == 2 ? "AccessComplete+GetMTLTexture enabled" :
-				"RunFullDisplayPipe+GetMTLTexture+AccessComplete enabled");
+				fullMTLStage == 2 ? "AccessComplete enabled (GetMTLTexture stubbed by default)" :
+				"RunFullDisplayPipe+AccessComplete enabled (GetMTLTexture stubbed by default)");
 			SYSLOG("DYLD", "V102: SkyLight bypass=%s", skylBypass ? "ON" : "OFF");
+			SYSLOG("DYLD", "V103: Unsafe GetMTLTexture=%s", unsafeGetMTLTexture ? "ON" : "OFF");
+			SYSLOG("DYLD", "V104: Unsafe stage3 override=%s", allowUnsafeStage3 ? "ON" : "OFF");
         }
         
 		if (!noMetal) {
@@ -268,18 +295,44 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 				{f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
 				{f_skipfdp_sonoma, r_skipfdp_sonoma, "RunFullDisplayPipe skip entire function (Sonoma, Metal ON)"},
 				{f_getmtltex_sonoma, r_getmtltex_sonoma, "GetMTLTexture return NULL (Sonoma, Metal ON)"},
+				{f_getmtlcq_sonoma, r_getmtlcq_sonoma, "GetMTLCommandQueue return NULL (Sonoma, Metal ON)"},
 			};
 			const DYLDPatch stage2Patches[] = {
 				{f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
 				{f_skipfdp_sonoma, r_skipfdp_sonoma, "RunFullDisplayPipe skip entire function (Sonoma, Metal ON)"},
+				{f_getmtlcq_sonoma, r_getmtlcq_sonoma, "GetMTLCommandQueue return NULL (Sonoma, Metal ON)"},
+			};
+			const DYLDPatch stage2SafePatches[] = {
+				{f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
+				{f_skipfdp_sonoma, r_skipfdp_sonoma, "RunFullDisplayPipe skip entire function (Sonoma, Metal ON)"},
+				{f_getmtltex_sonoma, r_getmtltex_sonoma, "GetMTLTexture return NULL (Sonoma, Metal ON, safe stage2)"},
+				{f_getmtlcq_sonoma, r_getmtlcq_sonoma, "GetMTLCommandQueue return NULL (Sonoma, Metal ON, safe stage2)"},
+				// V108: AccessComplete must also be skipped when GetMTLTexture is stubbed (stage2 safe).
+				// AccessComplete dereferences the returned NULL texture/queue pointer, causing WS SIGSEGV.
+				{f_skipac_sonoma, r_skipac_sonoma, "AccessComplete skip (Sonoma, Metal ON, safe stage2)"},
 			};
 			const DYLDPatch stage3Patches[] = {
 				{f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
 				{f_runfdp_guard_sonoma, r_runfdp_guard_sonoma, "RunFullDisplayPipe NULL vcall guard (Sonoma, Metal ON)"},
+				{f_getmtlcq_sonoma, r_getmtlcq_sonoma, "GetMTLCommandQueue return NULL (Sonoma, Metal ON)"},
+			};
+			const DYLDPatch stage3SafePatches[] = {
+				{f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
+				{f_runfdp_guard_sonoma, r_runfdp_guard_sonoma, "RunFullDisplayPipe NULL vcall guard (Sonoma, Metal ON)"},
+				{f_getmtltex_sonoma, r_getmtltex_sonoma, "GetMTLTexture return NULL (Sonoma, Metal ON, safe stage3)"},
+				{f_getmtlcq_sonoma, r_getmtlcq_sonoma, "GetMTLCommandQueue return NULL (Sonoma, Metal ON, safe stage3)"},
 			};
 			const DYLDPatch stage3SkylPatches[] = {
 				{f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
 				{f_runfdp_guard_sonoma, r_runfdp_guard_sonoma, "RunFullDisplayPipe NULL vcall guard (Sonoma, Metal ON)"},
+				{f_getmtlcq_sonoma, r_getmtlcq_sonoma, "GetMTLCommandQueue return NULL (Sonoma, Metal ON)"},
+				{f4, r4, "SkyLight conditional bypass (Sonoma, Metal ON)"},
+			};
+			const DYLDPatch stage3SafeSkylPatches[] = {
+				{f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
+				{f_runfdp_guard_sonoma, r_runfdp_guard_sonoma, "RunFullDisplayPipe NULL vcall guard (Sonoma, Metal ON)"},
+				{f_getmtltex_sonoma, r_getmtltex_sonoma, "GetMTLTexture return NULL (Sonoma, Metal ON, safe stage3)"},
+				{f_getmtlcq_sonoma, r_getmtlcq_sonoma, "GetMTLCommandQueue return NULL (Sonoma, Metal ON, safe stage3)"},
 				{f4, r4, "SkyLight conditional bypass (Sonoma, Metal ON)"},
 			};
 
@@ -289,15 +342,30 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 				patches = stage1Patches;
 				patchCount = arrsize(stage1Patches);
 			} else if (fullMTLStage == 2) {
-				patches = stage2Patches;
-				patchCount = arrsize(stage2Patches);
+				if (unsafeGetMTLTexture) {
+					patches = stage2Patches;
+					patchCount = arrsize(stage2Patches);
+				} else {
+					patches = stage2SafePatches;
+					patchCount = arrsize(stage2SafePatches);
+				}
 			} else if (fullMTLStage >= 3) {
 				if (skylBypass) {
-					patches = stage3SkylPatches;
-					patchCount = arrsize(stage3SkylPatches);
+					if (unsafeGetMTLTexture) {
+						patches = stage3SkylPatches;
+						patchCount = arrsize(stage3SkylPatches);
+					} else {
+						patches = stage3SafeSkylPatches;
+						patchCount = arrsize(stage3SafeSkylPatches);
+					}
 				} else {
-					patches = stage3Patches;
-					patchCount = arrsize(stage3Patches);
+					if (unsafeGetMTLTexture) {
+						patches = stage3Patches;
+						patchCount = arrsize(stage3Patches);
+					} else {
+						patches = stage3SafePatches;
+						patchCount = arrsize(stage3SafePatches);
+					}
 				}
 			}
 

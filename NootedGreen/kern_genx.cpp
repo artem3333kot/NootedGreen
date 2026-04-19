@@ -353,16 +353,66 @@ bool Genx::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t a
 
 IOReturn Genx::wrapICLReadAUX(void *that, uint32_t address, void *buffer, uint32_t length) {
 
-	IOReturn retVal =	FunctionCast(wrapICLReadAUX, callback->orgICLReadAUX)(that,address, buffer, length );
+	IOReturn retVal = FunctionCast(wrapICLReadAUX, callback->orgICLReadAUX)(that, address, buffer, length);
 
-	if (address != 0x0000 && address != 0x2200)	return retVal;
-	
+	static int auxLogCount = 0;
+	if (auxLogCount < 40) {
+		auxLogCount++;
+		uint8_t *b = reinterpret_cast<uint8_t *>(buffer);
+		if (length >= 2)
+			SYSLOG("ngreen", "V97AUX[%d]: addr=0x%04x len=%u ret=0x%x [0]=0x%02x [1]=0x%02x",
+			       auxLogCount, address, length, retVal, b ? b[0] : 0xFF, (b && length >= 2) ? b[1] : 0xFF);
+		else
+			SYSLOG("ngreen", "V97AUX[%d]: addr=0x%04x len=%u ret=0x%x",
+			       auxLogCount, address, length, retVal);
+	}
+
+	if (!NGreen::callback->isRealTGL && address == 0x0100 && buffer && length >= 1) {
+		// V98T: Clamp observed link-training set to HBR2 + 2 lanes on spoofed path.
+		// Some panel/driver combinations oscillate with aggressive defaults (HBR3 / 4-lane bits).
+		auto *raw = reinterpret_cast<uint8_t *>(buffer);
+		if (raw[0] > 0x14) raw[0] = 0x14;      // LINK_BW_SET <= HBR2
+		if (length >= 2) {
+			raw[1] = (raw[1] & 0xE0) | 0x02;   // lane count = 2, keep upper feature bits
+		}
+		static int v98tLogs = 0;
+		if (v98tLogs < 10) {
+			v98tLogs++;
+			if (length >= 2)
+				SYSLOG("ngreen", "V98T[%d]: clamped 0x0100 read to bw=0x%02x lanes=0x%02x",
+				       v98tLogs, raw[0], raw[1]);
+			else
+				SYSLOG("ngreen", "V98T[%d]: clamped 0x0100 read to bw=0x%02x (len=1)",
+				       v98tLogs, raw[0]);
+		}
+	}
+
+	if (address != 0x0000 && address != 0x2200) return retVal;
+
+	if (length < sizeof(DPCDCap16) || buffer == nullptr)
+		return retVal;
+
 	auto caps = reinterpret_cast<DPCDCap16*>(buffer);
-	
+
+	if (!NGreen::callback->isRealTGL) {
+		// V98: Spoofed RPL path is unstable with aggressive sink caps (HBR3/deep-color).
+		// Advertise a conservative max link rate so Apple's training chooses safer timings.
+		if (caps->maxLinkRate > 0x14) {
+			caps->maxLinkRate = 0x14; // HBR2 (5.4 Gbps)
+		}
+		caps->maxLaneCount = (caps->maxLaneCount & 0xE0) | 0x02; // advertise max 2 lanes
+		static int v98Logs = 0;
+		if (v98Logs < 10) {
+			v98Logs++;
+			SYSLOG("ngreen", "V98[%d]: capped DPCD caps @0x%04x to maxLinkRate=0x%02x maxLane=0x%02x",
+			       v98Logs, address, caps->maxLinkRate, caps->maxLaneCount);
+		}
+	}
+
 	if (caps->revision < 0x03) {
 		caps->maxLinkRate=0;
 	}
-	
+
 	return retVal;
 }
 
