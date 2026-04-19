@@ -187,8 +187,11 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 	//  mov rax, [rdi]
 	//  call qword ptr [rax+0x28]
 	//Replace with test/jump so the call is skipped when rdi is NULL.
+	// Original 13 bytes: mov rdi,[r14+0x888]; mov rax,[rdi]; call [rax+0x28]
+	// Replacement: keep the load, add test rdi,rdi; jz +6 (skips the 6-byte call sequence); nop
+	// With stale rdi=1 before my previous broken patch, the load was absent — fix by restoring it.
 	static const uint8_t f_runfdp_guard_sonoma[] = {0x49, 0x8b, 0xbe, 0x88, 0x08, 0x00, 0x00, 0x48, 0x8b, 0x07, 0xff, 0x50, 0x28};
-	static const uint8_t r_runfdp_guard_sonoma[] = {0x48, 0x85, 0xff, 0x74, 0x06, 0x90, 0x90, 0x48, 0x8b, 0x07, 0xff, 0x50, 0x28};
+	static const uint8_t r_runfdp_guard_sonoma[] = {0x49, 0x8b, 0xbe, 0x88, 0x08, 0x00, 0x00, 0x48, 0x85, 0xff, 0x74, 0x06, 0x90};
 	
 	
 	//skyl
