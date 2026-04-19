@@ -16,17 +16,22 @@ Patches Apple's Tiger Lake (Gen12) graphics drivers to work with newer Intel iGP
 - Early IGPU identity detection is confirmed working: Lilu reads `AAPL,ig-platform-id` (`9A490000`) via OpenCore DeviceProperties during `DeviceInfo` scan.
 - Platform-ID and device-ID injection now handled cleanly by config.plist only — NootedGreen no longer interferes mid-initialization.
 - System boots to login screen reliably with no visual corruption or kernel panics.
+- **Staged Metal bring-up** (V97+) — Metal is OFF by default. When enabled, CoreDisplay patches are applied in stages (0–3) to isolate WindowServer crashes. Stage 3 adds a NULL virtual-call guard in `RunFullDisplayPipe` instead of stubbing the whole function.
 
-### Recent Progress (V72–V75)
+### Recent Progress
 
-- **V75:** **CRITICAL FIX** — Removed post-`awaitPublishing` property override race condition. NootedGreen was modifying `AAPL,ig-platform-id` and `device-id` AFTER publishing IGPU to the registry, causing the TGL framebuffer driver to read properties mid-initialization. This resulted in cursor corruption (TV static on ring buffer). Platform-ID and device-ID are now injected cleanly via OpenCore config.plist only. Display output now stable and corruption-free.
-- **V74:** Permanent EMR enforcer — 50ms timer runs indefinitely, keeping ERROR_GEN6 masked. System survives full boot without kernel panic. IGAccelDevice stays alive (dev=0x1e at V60M[60]).
-- **V73:** Fixed double-dereference crash in blit3D initialize hook. Three `IGHardwareBlit3DContext::initialize()` calls now complete successfully.
-- **V72:** EMR write interception on all MMIO write paths (discovered Apple uses direct MMIO, not WriteRegister32 — hooks don't fire, but timer approach works).
+- **V103:** Added `-ngreenUnsafeGetMTLTexture` safe/unsafe split — GetMTLTexture is stubbed by default in stages 2–3, restorable for crash diagnostics.
+- **V102:** Added `-ngreenSkylBypass` — optional SkyLight conditional branch NOP for stage-3 black-screen diagnostics.
+- **V101:** Staged Metal bring-up system (`ngreenFullMTLStage=0..3`). Stage 3 uses a NULL-guarded `RunFullDisplayPipe` with `test rdi,rdi; jz` instead of stubbing the entire function.
+- **V97:** Metal rendering switched to OFF by default. WindowServer crash reports showed NULL deref in `CoreDisplay::DisplayPipe::RunFullDisplayPipe` when Metal display-pipe was active.
+- **V75:** **CRITICAL FIX** — Removed post-`awaitPublishing` property override race condition. Display output now stable and corruption-free.
+- **V74:** Permanent EMR enforcer — 50ms timer runs indefinitely, keeping ERROR_GEN6 masked.
+- **V73:** Fixed double-dereference crash in blit3D initialize hook.
+- **V72:** EMR write interception on all MMIO write paths.
 
-### Current Status (V75)
+### Current Status
 
-**RESOLVED:** Display output is now stable and corruption-free. Platform-ID and device-ID injection no longer race with framebuffer driver initialization. System boots to login screen without visual artifacts or kernel panics. Cursor rendering is correct. Next focus: GPU memory pressure testing and prolonged load stability.
+System boots to login screen reliably. Display output is stable with Metal OFF (default). Metal bring-up is in staged testing — stage 3 allows `RunFullDisplayPipe` to execute with a NULL pointer guard, avoiding the previous full-function stub. GetMTLTexture is kept stubbed by default for safety. Next focus: stage-3 stability under Metal ON, SkyLight interaction, and GPU memory pressure testing.
 
 ## Requirements
 
@@ -62,14 +67,31 @@ These properties are essential for correct platform identification and WEG coexi
 | `ngreenSched=N` | Select GPU scheduler type: `3` = GuC firmware, `4` = IGScheduler4, `5` = host preemptive (default: `3` on real TGL, `5` on RPL/ADL) |
 | `ngreen-dmc=skip` | Skip DMC firmware |
 | `-allow3d` | Force 3D acceleration |
-| `-ngreenNoMetal` | Disable Metal rendering — stub out CoreDisplay Metal paths to prevent NULL MTLDevice crashes (display-only debug mode) |
-| `-ngreenAllowMetal` | Legacy flag (backward compat) — forces Metal ON, equivalent to not setting `-ngreenNoMetal` |
+| `-ngreenNoMetal` / `ngreenNoMetal=0\|1` | Disable Metal rendering — stub out CoreDisplay Metal paths to prevent NULL MTLDevice crashes (display-only debug mode). Metal is OFF by default; use `ngreenNoMetal=0` or `-ngreenAllowMetal` to enable. |
+| `-ngreenAllowMetal` | Legacy flag — forces Metal ON, equivalent to `ngreenNoMetal=0` |
+| `ngreenFullMTLStage=N` | Staged Metal bring-up (0–3). See **Staged Metal Bring-Up** below for details. Only meaningful when Metal is ON. |
+| `-ngreenFullMTLTest` | Legacy shortcut — sets `ngreenFullMTLStage=1` if no explicit stage is set |
+| `-ngreenUnsafeGetMTLTexture` | Restore the real `GetMTLTexture` call in stages 2 and 3 (crash-oriented diagnostics). By default, GetMTLTexture is stubbed to return NULL for safety. |
+| `-ngreenSkylBypass` | Enable SkyLight conditional branch bypass in stage 3 — for black-screen diagnostics |
 | `-nbdyldoff` | **Disable ALL DYLD patches** (CoreDisplay, OpenGL, Metal, SkyLight) — debug only |
 | `-ngreenexp` / `ngreenexp=1` | Enable experimental runtime monitor/timer paths (disabled by default for compatibility) |
 | `-ngreenforceprops` / `ngreenforceprops=1` | Enable legacy forced IGPU property injection (`AAPL,ig-platform-id`, `model`, `saved-config`, etc.). Disabled by default in compatibility-first mode. |
 | `IGLogLevel=8` | Maximum Intel GPU driver logging |
 | `-liludbg` | Enable Lilu debug logging |
 | `liludump=60` | Dump Lilu logs after 60 seconds |
+
+## Staged Metal Bring-Up
+
+Metal rendering on RPL+TGL spoof causes WindowServer crashes in CoreDisplay. To isolate which call is responsible, DYLD patches are applied in stages (controlled by `ngreenFullMTLStage=N`). Each higher stage re-enables one more real CoreDisplay function:
+
+| Stage | RunFullDisplayPipe | AccessComplete | GetMTLTexture | Notes |
+|-------|-------------------|---------------|---------------|-------|
+| **0** (default) | Stubbed (ret) | Stubbed (ret) | Stubbed (ret NULL) | All safety stubs active — WindowServer stable, no Metal rendering |
+| **1** | Stubbed | Stubbed | Stubbed (ret NULL) | Re-enables AccessComplete only (legacy `-ngreenFullMTLTest`) |
+| **2** | Stubbed | Real | Stubbed by default | GetMTLTexture stubbed unless `-ngreenUnsafeGetMTLTexture` |
+| **3** | NULL-guarded | Real | Stubbed by default | RunFullDisplayPipe runs with a NULL virtual-call guard; GetMTLTexture stubbed unless `-ngreenUnsafeGetMTLTexture`. Optional `-ngreenSkylBypass` NOPs the SkyLight branch. |
+
+The NULL virtual-call guard in stage 3 replaces the original `mov rdi,[r14+0x888]; mov rax,[rdi]; call [rax+0x28]` with `mov rdi,...; test rdi,rdi; jz +6; nop` — skipping the virtual call when the display pipe pointer is NULL instead of crashing.
 
 ## Compatibility-First Defaults
 
