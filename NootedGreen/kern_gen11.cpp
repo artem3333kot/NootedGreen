@@ -72,6 +72,39 @@ static bool isExperimentalMonitorEnabled() {
 	return checkKernelArgument("-ngreenexp");
 }
 
+static bool isDisplayPipeForceDisabled() {
+	// Safe default for RPL+TGL spoof path:
+	// WindowServer repeatedly crashes in CoreDisplay::DisplayPipe::RunFullDisplayPipe
+	// with native display-pipe enabled. Keep it disabled unless explicitly requested.
+	int nativeDisplayPipe = 0;
+	if (PE_parse_boot_argn("ngreendp1", &nativeDisplayPipe, sizeof(nativeDisplayPipe))) {
+		if (nativeDisplayPipe != 0)
+			return false;
+	}
+
+	if (checkKernelArgument("-ngreendp1"))
+		return false;
+
+	int enabled = 0;
+	if (PE_parse_boot_argn("ngreendp0", &enabled, sizeof(enabled))) {
+		return enabled != 0;
+	}
+
+	if (checkKernelArgument("-ngreendp0"))
+		return true;
+
+	return true;
+}
+
+static bool isV93PlaneGuardEnabled() {
+	int enabled = 0;
+	if (PE_parse_boot_argn("ngreenv93", &enabled, sizeof(enabled))) {
+		return enabled != 0;
+	}
+
+	return checkKernelArgument("-ngreenv93");
+}
+
 bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
 	
 	if (kextG11FB.loadIndex == index) {
@@ -272,6 +305,9 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			{"__ZN19AppleIntelPowerWell19enableDisplayEngineEv",enableDisplayEngine, this->oenableDisplayEngine},
 			{"__ZN17AppleIntelPortHAL14enableComboPhyEv",enableComboPhyEv, this->oenableComboPhyEv},
 			{"__ZN14AppleIntelPort16computeLaneCountEPK29IODetailedTimingInformationV2jjPj",computeLaneCount, this->ocomputeLaneCount},
+			// V96: Force display online — WEG's getDisplayStatus hook (FOD) fails with
+			// "err 2" on TGL kext because that symbol doesn't exist. TGL uses getOnlineInfo.
+			{"__ZN21AppleIntelFramebuffer13getOnlineInfoEP21AppleIntelDisplayPathPhS2_", getOnlineInfo, this->ogetOnlineInfo},
 			{"__ZN19AppleIntelPowerWell21hwSetPowerWellStatePGEbj", releaseDoorbell},
 			{"__ZN19AppleIntelPowerWell22hwSetPowerWellStateAuxEbj",hwSetPowerWellStateAux, this->ohwSetPowerWellStateAux},
 			{"__ZN19AppleIntelPowerWell22hwSetPowerWellStateDDIEbj",hwSetPowerWellStateDDI, this->ohwSetPowerWellStateDDI},
@@ -2880,13 +2916,10 @@ bool Gen11::start(void *that,void  *param_1)
 			}
 		}
 		
-		// V78: Set DisplayPipeSupported=0 UNCONDITIONALLY on accelerator service.
-		// V77 only set this inside if(!hasMetal) which never fires when personality
-		// already provides MetalPluginName. The IOAccelerator2D.plugin reads this
-		// property to decide whether to create IOAccelDisplayPipeUserClient2.
-		// Without GPU command submission working, display pipe compositing crashes
-		// WindowServer in CoreDisplay::DisplayPipe::RunFullDisplayPipe (NULL deref).
-		{
+		// V78: Keep display-pipe disabling as an opt-in fallback only.
+		// Default path now keeps native display pipe capabilities to avoid black-screen
+		// regressions where only hardware cursor updates.
+		if (isDisplayPipeForceDisabled()) {
 			auto *dpCaps = OSDictionary::withCapacity(2);
 			if (dpCaps) {
 				auto *dpSupp = OSNumber::withNumber(0ULL, 32);
@@ -2895,8 +2928,10 @@ bool Gen11::start(void *that,void  *param_1)
 				if (trSupp) { dpCaps->setObject("TransactionsSupported", trSupp); trSupp->release(); }
 				accelSvc->setProperty("IOAccelDisplayPipeCapabilities", dpCaps);
 				dpCaps->release();
-				SYSLOG("ngreen", "V78: DisplayPipeSupported=0 set on accelerator service");
+				SYSLOG("ngreen", "V78: DisplayPipeSupported=0 forced by boot-arg");
 			}
+		} else {
+			SYSLOG("ngreen", "V78: keeping native DisplayPipeSupported (explicit -ngreendp1)");
 		}
 		
 		// 6. Explicit registerService() — ensures the service is visible to IOKit matching
@@ -3686,9 +3721,8 @@ void Gen11::radWriteRegister32f(void *that,unsigned long param_1, UInt32 param_2
 
 void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 {
-	// V93: Prevent fatal display-engine fetches from stolen-memory base.
-	// Generalized for multiple Gen11 display pipes/planes instead of one hardcoded register pair.
-	// If an enabled plane gets SURF=0, hardware may fetch GGTT[0] (e.g. phys 0x3e800000) and trigger MCE.
+	// V93: optional plane SURF zero-write guard.
+	// Disabled by default due black-screen regressions; enable only with -ngreenv93.
 	struct V93PlaneSurfState {
 		uint32_t surfReg;
 		uint32_t lastNonZeroSurf;
@@ -3711,7 +3745,7 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 		return nullptr;
 	};
 
-	if (NGreen::callback) {
+	if (NGreen::callback && isV93PlaneGuardEnabled()) {
 		const uint32_t reg = static_cast<uint32_t>(param_1 & 0xFFFFF);
 		const bool looksLikePlaneSurf =
 			(reg >= 0x60000 && reg <= 0xBFFFF) &&
@@ -4577,6 +4611,22 @@ void Gen11::computeLaneCount(void *that, const void *timing, unsigned int linkRa
 		// Keep a conservative fallback only for clearly invalid output.
 		if (*laneCount == 0)
 			*laneCount = 4;
+	}
+}
+
+void Gen11::getOnlineInfo(void *that, void *displayPath, unsigned char *online, unsigned char *changed) {
+	// V96: Force display online. WEG's force-online (FOD) targets getDisplayStatus which
+	// does not exist in the TGL framebuffer kext — Lilu reports "failed to solve" err 2
+	// at boot. The TGL kext uses getOnlineInfo instead. Without this override the eDP
+	// connector is treated as disconnected on RPL hardware → black screen + TV static cursor
+	// (WindowServer doesn't render desktop; hardware cursor reads from uninitialized VRAM).
+	FunctionCast(getOnlineInfo, callback->ogetOnlineInfo)(that, displayPath, online, changed);
+	static int v96Logs = 0;
+	unsigned char origOnline = online ? *online : 0xFF;
+	if (online) *online = 1;
+	if (v96Logs < 8) {
+		v96Logs++;
+		SYSLOG("ngreen", "V96: getOnlineInfo: orig=%d forced=1 (fb=%p dp=%p)", origOnline, that, displayPath);
 	}
 }
 

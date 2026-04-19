@@ -187,33 +187,98 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 	static const uint8_t r4[] = {0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0xE8, 0x75, 0x3D, 0xEC, 0xFF, 0x4C, 0x8B, 0x3D, 0x58, 0xCC, 0x91, 0x3E, 0x4C, 0x89, 0xFF, 0xBE, 0x10, 0x00, 0x00, 0x00, 0xE8, 0x09, 0xEA, 0x1C, 0x00, 0x84, 0xC0, 0x0F, 0x84, 0x51, 0xFA, 0xFF, 0xFF};
 	
 	
-    if (getKernelVersion() >= KernelVersion::Ventura) {
-        // V50: Metal is ON by default. gpu_bundle_find_trusted path patch
-        // redirects /Library/GPUBundles → /Library/Extensions so Metal finds
-        // the TGL driver. ICL f2 bypass handles device-ID checks as fallback.
-        // Use -ngreenNoMetal to disable Metal and apply CoreDisplay stubs.
+	if (getKernelVersion() >= KernelVersion::Ventura) {
+		// V97: Metal is OFF by default on the RPL+TGL spoof path.
+		// WindowServer crash reports show NULL deref in
+		// CoreDisplay::DisplayPipe::RunFullDisplayPipe when Metal display-pipe is active.
+		// Keep CoreDisplay safety stubs enabled by default; opt into Metal explicitly.
         static bool noMetalChecked = false;
         static bool noMetal = false;
+        static bool fullMTLChecked = false;
+        static int fullMTLStage = 0;
         if (!noMetalChecked) {
-            noMetal = checkKernelArgument("-ngreenNoMetal");
+			// Safe default
+			noMetal = true;
+
+			// Optional explicit scalar boot-arg support: ngreenNoMetal=0|1
+			int noMetalArg = 0;
+			if (PE_parse_boot_argn("ngreenNoMetal", &noMetalArg, sizeof(noMetalArg))) {
+				noMetal = (noMetalArg != 0);
+			}
+
+			// Legacy flag still supported
+			if (checkKernelArgument("-ngreenNoMetal"))
+				noMetal = true;
+
+			// Explicit opt-in to Metal for experiments
             bool legacyAllow = checkKernelArgument("-ngreenAllowMetal");
             if (legacyAllow) noMetal = false;
+
+			// Experimental staged bring-up of full Metal path.
+			// Stages are only used when Metal is ON:
+			//   0 = keep all safety stubs
+			//   1 = re-enable AccessComplete only
+			//   2 = re-enable AccessComplete + GetMTLTexture
+			//   3 = re-enable AccessComplete + GetMTLTexture + RunFullDisplayPipe
+			int fullMTLArg = 0;
+			if (PE_parse_boot_argn("ngreenFullMTLStage", &fullMTLArg, sizeof(fullMTLArg))) {
+				if (fullMTLArg < 0) fullMTLArg = 0;
+				if (fullMTLArg > 3) fullMTLArg = 3;
+				fullMTLStage = fullMTLArg;
+			}
+			if (checkKernelArgument("-ngreenFullMTLTest") && fullMTLStage == 0)
+				fullMTLStage = 1;
+			fullMTLChecked = true;
             noMetalChecked = true;
             SYSLOG("DYLD", "V50: Metal=%s (-ngreenNoMetal=%d)", noMetal ? "OFF" : "ON", noMetal);
+			SYSLOG("DYLD", "V101: FullMTL stage=%d (%s)", fullMTLStage,
+				fullMTLStage == 0 ? "all safety stubs active" :
+				fullMTLStage == 1 ? "AccessComplete enabled" :
+				fullMTLStage == 2 ? "AccessComplete+GetMTLTexture enabled" :
+				"RunFullDisplayPipe+GetMTLTexture+AccessComplete enabled");
         }
         
-        if (!noMetal) {
-            // Metal ON: only apply assertion bypass — let Metal/CoreDisplay run with GPU
-            const DYLDPatch patches[] = {
-                {f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
-            };
-            DYLDPatch::applyAll(patches, const_cast<void *>(data), PAGE_SIZE);
+		if (!noMetal) {
+			// V101: staged Boot C hardening for full-MTL bring-up.
+			const DYLDPatch stage0Patches[] = {
+				{f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
+				{f_skipfdp_sonoma, r_skipfdp_sonoma, "RunFullDisplayPipe skip entire function (Sonoma, Metal ON)"},
+				{f_getmtltex_sonoma, r_getmtltex_sonoma, "GetMTLTexture return NULL (Sonoma, Metal ON)"},
+				{f_skipac_sonoma, r_skipac_sonoma, "AccessComplete skip (Sonoma, Metal ON)"},
+			};
+			const DYLDPatch stage1Patches[] = {
+				{f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
+				{f_skipfdp_sonoma, r_skipfdp_sonoma, "RunFullDisplayPipe skip entire function (Sonoma, Metal ON)"},
+				{f_getmtltex_sonoma, r_getmtltex_sonoma, "GetMTLTexture return NULL (Sonoma, Metal ON)"},
+			};
+			const DYLDPatch stage2Patches[] = {
+				{f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
+				{f_skipfdp_sonoma, r_skipfdp_sonoma, "RunFullDisplayPipe skip entire function (Sonoma, Metal ON)"},
+			};
+			const DYLDPatch stage3Patches[] = {
+				{f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
+			};
+
+			const DYLDPatch *patches = stage0Patches;
+			size_t patchCount = arrsize(stage0Patches);
+			if (fullMTLStage == 1) {
+				patches = stage1Patches;
+				patchCount = arrsize(stage1Patches);
+			} else if (fullMTLStage == 2) {
+				patches = stage2Patches;
+				patchCount = arrsize(stage2Patches);
+			} else if (fullMTLStage >= 3) {
+				patches = stage3Patches;
+				patchCount = arrsize(stage3Patches);
+			}
+
+			DYLDPatch::applyAll(patches, patchCount, const_cast<void *>(data), PAGE_SIZE);
         } else {
             // Metal OFF: stub out CoreDisplay Metal paths to prevent NULL MTLDevice crashes
             const DYLDPatch patches[] = {
                 {f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
                 {f_skipfdp_sonoma, r_skipfdp_sonoma, "RunFullDisplayPipe skip entire function (Sonoma)"},
-                {f_skippresent_sonoma, r_skippresent_sonoma, "Display::Present skip (Sonoma)"},
+                // V98: removed Display::Present stub — allow hardware scanout path
                 {f_getmtltex_sonoma, r_getmtltex_sonoma, "GetMTLTexture return NULL (Sonoma)"},
                 {f_skipac_sonoma, r_skipac_sonoma, "AccessComplete skip (Sonoma)"},
             };

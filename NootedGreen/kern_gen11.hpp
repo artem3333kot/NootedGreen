@@ -1409,6 +1409,12 @@ private:
 	// computes 2 (sufficient bandwidth for 60 Hz) causing a PHY/transcoder mismatch.
 	static void computeLaneCount(void *that, const void *timing, unsigned int linkRate, unsigned int bpp, unsigned int *laneCount);
 	mach_vm_address_t ocomputeLaneCount {};
+
+	// V96: Force display online — WEG's force-online (FOD) hooks getDisplayStatus which
+	// does NOT exist in the TGL framebuffer kext, so it fails with "err 2" at boot.
+	// The TGL FB uses getOnlineInfo instead; hook it here to unconditionally report online.
+	static void getOnlineInfo(void *that, void *displayPath, unsigned char *online, unsigned char *changed);
+	mach_vm_address_t ogetOnlineInfo {};
 	
 	static void blit3d_submit_rectlist(void *param_1,void *param_2,void *param_3);
 	mach_vm_address_t oblit3d_submit_rectlist {};
