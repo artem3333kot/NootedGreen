@@ -16,14 +16,14 @@ Patches Apple's Tiger Lake (Gen12) graphics drivers to work with newer Intel iGP
 - Early IGPU identity detection is confirmed working: Lilu reads `AAPL,ig-platform-id` (`9A490000`) via OpenCore DeviceProperties during `DeviceInfo` scan.
 - Platform-ID and device-ID injection now handled cleanly by config.plist only — NootedGreen no longer interferes mid-initialization.
 - System boots to login screen reliably with no visual corruption or kernel panics.
-- CoreDisplay DYLD path is now compact and always-on for Ventura+/Sonoma with four hardcoded safety patches: assertion bypass, RunFullDisplayPipe NULL vcall guard, GetMTLTexture NULL stub, and GetMTLCommandQueue NULL stub.
+- CoreDisplay DYLD path keeps assertion bypass always-on for Ventura+/Sonoma. Stage-3 safety stubs (RunFullDisplayPipe NULL guard, GetMTLTexture NULL stub, GetMTLCommandQueue NULL stub) are now applied only on non-real TGL unless full-MTL mode is forced.
 - `DisplayPipeSupported` native path is now the default. Use `-ngreendp0` only for forced fallback testing.
 - V77 display-pipe client termination is disabled by default (delay defaults to full monitor window).
 - **V88 scanout fill remains opt-in** (`-ngreenv88`). Default boots do not paint diagnostic bars over normal UI layout.
 
 ### Recent Progress
 
-- **DYLD compact baseline:** Removed staged/full-MTL boot-arg matrix and debug toggles. Ventura+/Sonoma now always applies the compact 4-patch CoreDisplay safety set.
+- **DYLD compact baseline:** Assertion bypass remains baseline on Ventura+/Sonoma. Stage-3 safety stubs are conditional (non-real TGL default), with full-MTL override available via `-ngreenfullmtl`.
 - **DisplayPipe defaults updated:** Native `DisplayPipeSupported` is default. `-ngreendp0` is explicit fallback.
 - **V77 default policy updated:** kill delay default is full monitor window (no automatic client termination unless explicitly requested).
 - **V96 connector state update:** `getOnlineInfo` forces online + changed for stronger hotplug/state propagation.
@@ -78,6 +78,7 @@ These properties are essential for correct platform identification and WEG coexi
 | `-ngreendp1` / `ngreendp1=1` | Explicitly keep native `DisplayPipeSupported` path (default behavior) |
 | `ngreenV77DelayKill=N` | Delay V77 display-pipe client termination by `N` monitor iterations (`0..60`, default `60` = effectively disabled) |
 | `-ngreenv88` / `ngreenv88=1` | Enable V88 scanout fill + plane toggle diagnostics (draws test bars/colors; off by default) |
+| `-ngreenfullmtl` / `ngreenfullmtl=1` | Force full CoreDisplay Metal path on Ventura+/Sonoma by skipping Stage-3 NULL safety stubs (GetMTLTexture/GetMTLCommandQueue/RunFullDisplayPipe guard). Use only for full-MTL bring-up validation. |
 | `-ngreenRefProbeF2` / `ngreenRefProbeF2=1` | Enable reference f2 osinfo patch probe on non-real TGL (diagnostic only) |
 | `-ngreenV69AllowOriginal` | Allow original Blit3D initialize on non-real TGL when safety preconditions are met (crash-oriented diagnostic) |
 | `ngreenLanes=1|2|4` | Override lane count used by non-real TGL computeLaneCount bypass (default 2 lanes) |
@@ -152,6 +153,24 @@ For GPU acceleration, the following userspace driver bundles must be installed i
 | `AppleIntelGraphicsShared.bundle` | Shared graphics library |
 
 These bundles are loaded by name (via `MetalPluginName`, `IOGLBundleName`, etc.), not by `CFBundleIdentifier`. They are not shipped with NootedGreen and must be sourced separately.
+
+### Driver path resolution and fallback order
+
+NootedGreen keeps a strict load-path policy for Gen11/Gen12 bring-up:
+
+- **Primary (preferred): TGL from `/Library/Extensions`**
+	- `AppleIntelTGLGraphicsFramebuffer.kext`
+	- `AppleIntelTGLGraphics.kext`
+- **Fallback: ICL from `/System/Library/Extensions`**
+	- `AppleIntelICLLPGraphicsFramebuffer.kext`
+	- `AppleIntelICLGraphics.kext`
+
+Runtime guards enforce this behavior:
+
+- If TGL framebuffer loads, ICL framebuffer processing is skipped.
+- If TGL accelerator loads, ICL accelerator processing is skipped.
+
+For Metal bundle discovery, DYLD patching still prioritizes `/Library/Extensions` first (via `gpu_bundle_find_trusted` path rewrite), with `/System/Library/Extensions` retained as fallback.
 
 ## Compatibility
 

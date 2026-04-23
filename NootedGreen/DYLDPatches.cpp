@@ -10,6 +10,15 @@
 DYLDPatches *DYLDPatches::callback = nullptr;
 void DYLDPatches::init() { callback = this; }
 
+static bool shouldForceFullMetalPath() {
+	int enabled = 0;
+	if (PE_parse_boot_argn("ngreenfullmtl", &enabled, sizeof(enabled))) {
+		return enabled != 0;
+	}
+
+	return checkKernelArgument("-ngreenfullmtl");
+}
+
 void DYLDPatches::processPatcher(KernelPatcher &patcher) {
 
     auto *entry = IORegistryEntry::fromPath("/", gIODTPlane);
@@ -157,14 +166,29 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 	static const uint8_t r_runfdp_guard_sonoma[] = {0x49, 0x8b, 0xbe, 0x88, 0x08, 0x00, 0x00, 0x48, 0x85, 0xff, 0x74, 0x06, 0x90};
 
 	if (getKernelVersion() >= KernelVersion::Ventura) {
-		// Hardcoded stage-3 Metal: assertion bypass + RunFullDisplayPipe NULL-guard
-		// + GetMTLTexture/CQ stubs. AccessComplete is live (not skipped).
-		const DYLDPatch metalPatches[] = {
+		const bool isRealTGL = NGreen::callback && NGreen::callback->isRealTGL;
+		const bool forceFullMTL = shouldForceFullMetalPath();
+		static bool loggedMetalMode = false;
+		if (!loggedMetalMode) {
+			const bool fullMTLActive = isRealTGL || forceFullMTL;
+			SYSLOG("DYLD", "FULL_MTL_ACTIVE=%d (isRealTGL=%d forceFullMTL=%d)", fullMTLActive, isRealTGL, forceFullMTL);
+			loggedMetalMode = true;
+		}
+
+		const DYLDPatch assertionPatch[] = {
 			{f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
-			{f_runfdp_guard_sonoma, r_runfdp_guard_sonoma, "RunFullDisplayPipe NULL vcall guard (Sonoma)"},
-			{f_getmtltex_sonoma, r_getmtltex_sonoma, "GetMTLTexture return NULL (Sonoma)"},
-			{f_getmtlcq_sonoma, r_getmtlcq_sonoma, "GetMTLCommandQueue return NULL (Sonoma)"},
 		};
-		DYLDPatch::applyAll(metalPatches, const_cast<void *>(data), PAGE_SIZE);
+		DYLDPatch::applyAll(assertionPatch, const_cast<void *>(data), PAGE_SIZE);
+
+		if (!isRealTGL && !forceFullMTL) {
+			const DYLDPatch safetyPatches[] = {
+				{f_runfdp_guard_sonoma, r_runfdp_guard_sonoma, "RunFullDisplayPipe NULL vcall guard (Sonoma)"},
+				{f_getmtltex_sonoma, r_getmtltex_sonoma, "GetMTLTexture return NULL (Sonoma)"},
+				{f_getmtlcq_sonoma, r_getmtlcq_sonoma, "GetMTLCommandQueue return NULL (Sonoma)"},
+			};
+			DYLDPatch::applyAll(safetyPatches, const_cast<void *>(data), PAGE_SIZE);
+		} else {
+			SYSLOG("DYLD", "Stage-3 safety stubs skipped (isRealTGL=%d forceFullMTL=%d)", isRealTGL, forceFullMTL);
+		}
 	}
 }
