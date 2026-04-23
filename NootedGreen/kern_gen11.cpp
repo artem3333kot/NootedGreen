@@ -4002,23 +4002,28 @@ void  Gen11::prepareToEnterWake(void *that)
 
 void Gen11::enableComboPhyEv(void *that)
 {
-	// RPL-P combo PHY is fully calibrated by firmware before macOS boots.
-	// The TGL driver's enableComboPhyEv reads PORT_COMP_DW3 fuse registers and
-	// validates vccIO / process fields against TGL-specific ranges. RPL-P silicon
-	// fuse values don't match TGL expectations → panic at AppleIntelPortHAL.cpp:2405
-	// ("Values for vccIO & process are invalid") via .cold.1.
-	// V32 tried conditional skip (check OOB first) but register reads returned
-	// misleading values before PHY power-up, letting the original run and panic.
-	// V33: skip unconditionally — firmware calibration is sufficient for RPL-P.
-	static const uint32_t dw3Regs[] = { 0x16210Cu, 0x06C10Cu };
-	for (int i = 0; i < 2; i++) {
-		uint32_t val = NGreen::callback->readReg32(dw3Regs[i]);
-		uint32_t vccIO   = (val >> 24) & 0x3u;
-		uint32_t process = (val >> 26) & 0x3u;
-		SYSLOG("ngreen", "enableComboPhyEv: PHY%c DW3=0x%x vccIO=%u process=%u (skipped)",
-		       'A' + i, val, vccIO, process);
+	// V34: Combo PHY initialization guard for RPL/ADL.
+	// The TGL driver's enableComboPhyEv reads PORT_COMP_DW3 @ 0x16210c/0x06c10c
+	// and validates vccIO/process fields against TGL ranges. For RPL-P (non-TGL spoof):
+	// - Register reads at those addresses trigger GPU fabric MCE (machine-check exception)
+	// - Original function also fails with silicon-specific fuse value mismatches
+	// Solution: Skip our probe logic AND let original run for RPL (firmware is sufficient).
+	// For TGL spoofs (ADL-P), skip original (causes panic from fuse mismatch).
+	const bool isRealTGL = NGreen::callback && NGreen::callback->isRealTGL;
+	const uint32_t cpuModel = NGreen::callback ? NGreen::callback->cpuModel : 0;
+	
+	// CPUs: 0x8C/0x8D = real TGL, 0x9A = ADL-P, 0xBA = RPL-P, etc.
+	const bool isRPLorLater = !isRealTGL && (cpuModel >= 0xBA);  // RPL (0xBA) and newer archs
+	
+	if (isRPLorLater) {
+		// RPL/newer: firmware handles calibration, DW3 reads cause MCE → skip probe + call original
+		SYSLOG("ngreen", "enableComboPhyEv: RPL/ADL — skipping probe (MCE risk), calling original (firmware OK)");
+		FunctionCast(enableComboPhyEv, callback->oenableComboPhyEv)(that);
+		return;
 	}
-	SYSLOG("ngreen", "enableComboPhyEv: RPL-P — skipping original unconditionally (firmware calibrated)");
+	
+	// TGL spoof (ADL-P): firmware NOT sufficient, but DW3 fuse check causes panic → skip both
+	SYSLOG("ngreen", "enableComboPhyEv: TGL spoof (ADL-P) — skipping probe & original (fuse mismatch)");
 };
 
 void Gen11::setPanelPowerState(void *that,bool param_1)
