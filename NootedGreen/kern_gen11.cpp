@@ -926,6 +926,27 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 			0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00
 		};
+
+		// Some Sonoma builds encode the same readiness failure jump as long form:
+		//   ff 90 70 09 00 00; 84 c0; 0f 84 xx xx xx xx
+		// Patch 0f 84 rel32 -> 6x NOP to force success path.
+		// Keep this optional (non-fatal) to avoid boot regressions when pattern differs.
+		static const uint8_t f_devstart_long[] = {
+			0xff, 0x90, 0x70, 0x09, 0x00, 0x00,
+			0x84, 0xc0, 0x0f, 0x84, 0x00, 0x00, 0x00, 0x00
+		};
+		static const uint8_t m_devstart_long[] = {
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00
+		};
+		static const uint8_t r_devstart_long[] = {
+			0xff, 0x90, 0x70, 0x09, 0x00, 0x00,
+			0x84, 0xc0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90
+		};
+		static const uint8_t rm_devstart_long[] = {
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff
+		};
 		
 
 		
@@ -951,6 +972,23 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				};
 				PANIC_COND(!LookupPatchPlus::applyAll(patcher, patchesRPL, address, size), "ngreen",
 					"kextG11HWT Failed to apply RPL-specific patches!");
+
+				// Optional secondary signature for Sonoma variants with long JE encoding.
+				LookupPatchPlus const patchRPLDevstartLong {
+					activeKext,
+					f_devstart_long,
+					m_devstart_long,
+					r_devstart_long,
+					rm_devstart_long,
+					arrsize(f_devstart_long),
+					1
+				};
+				if (patchRPLDevstartLong.apply(patcher, address, size)) {
+					SYSLOG("ngreen", "V52: Applied optional long-form deviceStart readiness bypass");
+				} else {
+					SYSLOG("ngreen", "V52: Optional long-form deviceStart bypass not found on this build");
+				}
+
 				SYSLOG("ngreen", "V52: Applied RPL-specific patches (topology hardcode + BCS bypass)");
 			} else {
 				SYSLOG("ngreen", "V52: Real TGL — skipping topology hardcodes and BCS bypass");
