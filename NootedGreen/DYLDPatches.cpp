@@ -187,8 +187,6 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 				{f_getmtlcq_sonoma, r_getmtlcq_sonoma, "GetMTLCommandQueue return NULL (Sonoma)"},
 			};
 			DYLDPatch::applyAll(safetyPatches, const_cast<void *>(data), PAGE_SIZE);
-		} else {
-			SYSLOG("DYLD", "Stage-3 safety stubs skipped (isRealTGL=%d forceFullMTL=%d)", isRealTGL, forceFullMTL);
 		}
 	}
 }
