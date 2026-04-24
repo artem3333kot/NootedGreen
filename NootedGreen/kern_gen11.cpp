@@ -7,7 +7,7 @@
 #include <IOKit/IOCatalogue.h>
 #include <kern/thread_call.h>
 
-// ==== 4 kextInfos: TGL from /Library/Extensions, ICL fallback from /System/Library/Extensions ====
+// ==== 6 kextInfos: ICL fallback + dual TGL identities (com.xxxxx and com.apple) from /Library/Extensions ====
 
 // ICL FB — com.apple (fallback path)
 static const char *pathsICLFB[] = {
@@ -31,6 +31,11 @@ static KernelPatcher::KextInfo kextG11FBT {"com.xxxxx.driver.AppleIntelTGLGraphi
     {false, false, false, true}, {},
     KernelPatcher::KextInfo::Unloaded};
 
+// TGL FB — com.apple (loaded from /Library/Extensions/)
+static KernelPatcher::KextInfo kextG11FBTA {"com.apple.driver.AppleIntelTGLGraphicsFramebuffer", pathsTGLFB, 1,
+	{false, false, false, true}, {},
+	KernelPatcher::KextInfo::Unloaded};
+
 // TGL HW — com.xxxxx (loaded from /Library/Extensions/)
 static const char *pathsTGLHW[] = {
     "/Library/Extensions/AppleIntelTGLGraphics.kext/Contents/MacOS/AppleIntelTGLGraphics",
@@ -39,15 +44,22 @@ static KernelPatcher::KextInfo kextG11HWT {"com.xxxxx.driver.AppleIntelTGLGraphi
     {false, false, false, true}, {},
     KernelPatcher::KextInfo::Unloaded};
 
+// TGL HW — com.apple (loaded from /Library/Extensions/)
+static KernelPatcher::KextInfo kextG11HWTA {"com.apple.driver.AppleIntelTGLGraphics", pathsTGLHW, 1,
+	{false, false, false, true}, {},
+	KernelPatcher::KextInfo::Unloaded};
+
 Gen11 *Gen11::callback = nullptr;
 
 void Gen11::init() {
 	callback = this;
-	// 4 kextInfos: ICL FB, ICL HW, TGL FB, TGL HW
+	// 6 kextInfos: ICL FB/HW + TGL FB/HW for both com.xxxxx and com.apple identities
 	lilu.onKextLoadForce(&kextG11FB);
 	lilu.onKextLoadForce(&kextG11HW);
 	lilu.onKextLoadForce(&kextG11FBT);
+	lilu.onKextLoadForce(&kextG11FBTA);
 	lilu.onKextLoadForce(&kextG11HWT);
+	lilu.onKextLoadForce(&kextG11HWTA);
 }
 
 static bool isWEGCoexistMode() {
@@ -295,9 +307,9 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		return true;
 		
 		
-	}	else if (kextG11FBT.loadIndex == index) {
+	}	else if (kextG11FBT.loadIndex == index || kextG11FBTA.loadIndex == index) {
 		this->tglFBLoaded = true;
-		auto *activeKext = &kextG11FBT;
+		auto *activeKext = (kextG11FBTA.loadIndex == index) ? &kextG11FBTA : &kextG11FBT;
 		NGreen::callback->setRMMIOIfNecessary();
 		SYSLOG("ngreen", "init AppleIntelTGLGraphicsFramebuffer");
 		
@@ -753,9 +765,9 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 
 		return true;
 
-    } else if (kextG11HWT.loadIndex == index) {
+	} else if (kextG11HWT.loadIndex == index || kextG11HWTA.loadIndex == index) {
 		this->tglHWLoaded = true;
-		auto *activeKext = &kextG11HWT;
+		auto *activeKext = (kextG11HWTA.loadIndex == index) ? &kextG11HWTA : &kextG11HWT;
 		SYSLOG("ngreen", "init AppleIntelTGLGraphics (HW accelerator)");
 		NGreen::callback->setRMMIOIfNecessary();
 /*
