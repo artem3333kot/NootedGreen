@@ -4959,21 +4959,29 @@ void Gen11::IGHardwareBlit3DContextinitialize(void *that)
 
 	// V106: On spoofed paths, default to skip Apple's original init.
 	// The original still faults at +0x4c on some boots (page fault in SecurityAgent path).
-	// Preserve a diagnostic opt-in only: -ngreenV69AllowOriginal.
+	// In full-MTL mode we now prefer original init to avoid null objects in CoreDisplay.
+	// Use -ngreenV69SkipOriginal to force old skip behavior for troubleshooting.
 	const bool allowOriginal = checkKernelArgument("-ngreenV69AllowOriginal");
+	const bool forceFullMTL = shouldForceFullMetalPath();
+	const bool skipOriginal = checkKernelArgument("-ngreenV69SkipOriginal");
 	uint64_t gpuBufBase = mappedBufPtr ? getMember<uint64_t>(mappedBufPtr, 0x18) : 0;
 	uint64_t gpuBufSize = mappedBufPtr ? getMember<uint64_t>(mappedBufPtr, 0x20) : 0;
 	bool safeForOriginal = mappedBufPtr && gpuBufBase != 0 && gpuBufSize >= 0xD040;
-	if (allowOriginal && safeForOriginal) {
-		SYSLOG("ngreen", "V105: calling original Blit3D init (base=0x%llx size=0x%llx)",
+	const bool shouldTryOriginal = (!NGreen::callback->isRealTGL && forceFullMTL && !skipOriginal) ||
+		(allowOriginal && safeForOriginal);
+	if (shouldTryOriginal) {
+		SYSLOG("ngreen", "V111B: calling original Blit3D init (fullMTL=%d allow=%d skip=%d base=0x%llx size=0x%llx)",
+		       forceFullMTL, allowOriginal, skipOriginal,
 		       (unsigned long long)gpuBufBase, (unsigned long long)gpuBufSize);
 		FunctionCast(IGHardwareBlit3DContextinitialize, callback->oIGHardwareBlit3DContextinitialize)(that);
-		SYSLOG("ngreen", "V105: original Blit3D init completed");
+		SYSLOG("ngreen", "V111B: original Blit3D init completed");
 		return;
 	}
 	if (allowOriginal && !safeForOriginal) {
 		SYSLOG("ngreen", "V106: -ngreenV69AllowOriginal requested but rejected (base=0x%llx size=0x%llx)",
 		       (unsigned long long)gpuBufBase, (unsigned long long)gpuBufSize);
+	} else if (!NGreen::callback->isRealTGL && forceFullMTL && skipOriginal) {
+		SYSLOG("ngreen", "V111B: full-MTL active but original Blit3D init skipped by -ngreenV69SkipOriginal");
 	} else if (v69Verbose || v69CallCount == 16 || v69CallCount == 64 || v69CallCount == 256) {
 		SYSLOG("ngreen", "V106: skip original Blit3D init on non-real TGL (base=0x%llx size=0x%llx)",
 		       (unsigned long long)gpuBufBase, (unsigned long long)gpuBufSize);
