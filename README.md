@@ -261,6 +261,7 @@ Open `NootedGreen.xcodeproj` and select the **NootedGreen** scheme to build the 
 ## Authors
 
 - **Stefano Giammori** ([@sgiammori](https://github.com/sgiammori)) — reverse engineering, driver development, hardware testing
+- Thanks to [@shl628](https://github.com/shl628) and [@jalavoui](https://github.com/jalavoui), developers of NootedBlue
 - **Claude Sonnet** (Anthropic) — AI pair-programming, code generation, debug analysis
 - **Claude Opus 4.6** via GitHub Copilot — AI pair-programming, code generation, debug analysis
 
