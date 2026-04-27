@@ -6614,6 +6614,29 @@ unsigned long Gen11::resetGraphicsEngine(void *that,void *param_1)
 		if (postErr)
 			SYSLOG("ngreen", "V71: resetGfxEng post-clear ERR=0x%x", postErr);
 	}
+
+	// V153: RPL-only reset fallback.
+	// We are seeing resetGraphicsEngine return 1025 in a tight loop even when
+	// both rings are already quiescent and ERROR_GEN6 is clean. That loop alone
+	// is enough to starve WindowServer and trigger watchdog timeout.
+	// Preserve real TGL behavior; on spoofed RPL only, treat this specific
+	// quiescent 1025 as success so callers can progress beyond reset storm.
+	if (!NGreen::callback->isRealTGL && ret == 1025) {
+		uint32_t rcsCtl = NGreen::callback->readReg32(RING_CTL(RENDER_RING_BASE));
+		uint32_t rcsHead = NGreen::callback->readReg32(RING_HEAD(RENDER_RING_BASE));
+		uint32_t rcsTail = NGreen::callback->readReg32(RING_TAIL(RENDER_RING_BASE));
+		uint32_t bcsCtl = NGreen::callback->readReg32(RING_CTL(BLT_RING_BASE));
+		uint32_t bcsHead = NGreen::callback->readReg32(RING_HEAD(BLT_RING_BASE));
+		uint32_t bcsTail = NGreen::callback->readReg32(RING_TAIL(BLT_RING_BASE));
+		uint32_t err = NGreen::callback->readReg32(ERROR_GEN6);
+
+		const bool rcsQuiescent = (rcsCtl == 0 && rcsHead == rcsTail);
+		const bool bcsQuiescent = (bcsCtl == 0 && bcsHead == bcsTail);
+		if (rcsQuiescent && bcsQuiescent && err == 0) {
+			SYSLOG("ngreen", "V153[%d]: coercing reset ret=1025 -> 0 (quiescent RCS/BCS, ERROR_GEN6=0)", v63ResetCount);
+			return 0;
+		}
+	}
 	
 	return ret;
 }
