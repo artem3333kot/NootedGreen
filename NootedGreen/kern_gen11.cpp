@@ -6494,8 +6494,9 @@ void Gen11::IGScheduler5resume(void *that) {
 unsigned long Gen11::resetGraphicsEngine(void *that,void *param_1)
 {
 	static int v63ResetCount = 0;
+	static int v154ConsecQuiescentFails = 0;
 	v63ResetCount++;
-	SYSLOG("ngreen", "V63: resetGraphicsEngine call #%d", v63ResetCount);
+	SYSLOG("ngreen", "V63: resetGraphicsEngine call #%d (consec_q=%d)", v63ResetCount, v154ConsecQuiescentFails);
 	
 	//GT workarounds: the list of these WAs is applied whenever these registers
 	//*   revert to their default values: on GPU reset, suspend/resume [1]_, etc.
@@ -6550,6 +6551,29 @@ unsigned long Gen11::resetGraphicsEngine(void *that,void *param_1)
 		}
 		NGreen::callback->writeReg32(RING_EMR(RENDER_RING_BASE), 0xFFFFFFFF);
 		NGreen::callback->writeReg32(RING_EMR(BLT_RING_BASE), 0xFFFFFFFF);
+	}
+
+	// V154: RPL-only circuit-breaker — after 3 consecutive quiescent ret=1025 resets,
+	// skip calling the original entirely. The health monitor (V60M) calls us every 2s
+	// for up to 120s; if hardware is already quiescent and the original always returns
+	// 1025, those 60 calls waste the entire watchdog budget. Short-circuiting them lets
+	// WindowServer continue and prevents the watchdog from firing.
+	if (!NGreen::callback->isRealTGL && v154ConsecQuiescentFails >= 3) {
+		uint32_t rCtl  = NGreen::callback->readReg32(RING_CTL(RENDER_RING_BASE));
+		uint32_t rHead = NGreen::callback->readReg32(RING_HEAD(RENDER_RING_BASE));
+		uint32_t rTail = NGreen::callback->readReg32(RING_TAIL(RENDER_RING_BASE));
+		uint32_t bCtl  = NGreen::callback->readReg32(RING_CTL(BLT_RING_BASE));
+		uint32_t bHead = NGreen::callback->readReg32(RING_HEAD(BLT_RING_BASE));
+		uint32_t bTail = NGreen::callback->readReg32(RING_TAIL(BLT_RING_BASE));
+		uint32_t err   = NGreen::callback->readReg32(ERROR_GEN6);
+		if (rCtl == 0 && rHead == rTail && bCtl == 0 && bHead == bTail && err == 0) {
+			SYSLOG("ngreen", "V154[%d]: circuit-open — skipping original reset (%d consec quiescent fails)",
+			       v63ResetCount, v154ConsecQuiescentFails);
+			return 0;
+		}
+		// State changed — open circuit no longer valid, reset counter
+		v154ConsecQuiescentFails = 0;
+		SYSLOG("ngreen", "V154[%d]: circuit reset (non-quiescent state detected)", v63ResetCount);
 	}
 
 	// V152: On RPL spoof, drain/disable the BCS ring before calling the original
@@ -6633,11 +6657,14 @@ unsigned long Gen11::resetGraphicsEngine(void *that,void *param_1)
 		const bool rcsQuiescent = (rcsCtl == 0 && rcsHead == rcsTail);
 		const bool bcsQuiescent = (bcsCtl == 0 && bcsHead == bcsTail);
 		if (rcsQuiescent && bcsQuiescent && err == 0) {
-			SYSLOG("ngreen", "V153[%d]: coercing reset ret=1025 -> 0 (quiescent RCS/BCS, ERROR_GEN6=0)", v63ResetCount);
+			v154ConsecQuiescentFails++;
+			SYSLOG("ngreen", "V153[%d]: coercing reset ret=1025 -> 0 (quiescent RCS/BCS, ERROR_GEN6=0, consec=%d)",
+			       v63ResetCount, v154ConsecQuiescentFails);
 			return 0;
 		}
 	}
-	
+	// Non-quiescent failure or genuine success — reset circuit-breaker counter
+	v154ConsecQuiescentFails = 0;
 	return ret;
 }
 
