@@ -5676,6 +5676,17 @@ uint32_t Gen11::submitBlit(void *that, void *param_1, void *param_2, void *param
 
 void * Gen11::getBlit2DContext(void *that,bool param_1)
 {
+	// V151 DIAGNOSTIC: Track call frequency to understand init vs render phase
+	if (!NGreen::callback->isRealTGL) {
+		static int v127CallCount = 0;
+		v127CallCount++;
+		bool isInitPhase = v127CallCount < 100;
+		if (v127CallCount <= 20 || (v127CallCount > 100 && v127CallCount <= 120)) {
+			SYSLOG("ngreen", "V127[%d]: getBlit2DContext called (phase=%s) task=%p force=%d",
+			       v127CallCount, isInitPhase ? "INIT" : "RENDER", that, param_1 ? 1 : 0);
+		}
+	}
+	
 	// V127: On non-real-TGL (RPL spoof), allow Blit2D context to initialize so that
 	// barrierSubmission (which dereferences ctx+0xb8 unconditionally) doesn't crash.
 	// We call the original and validate ctx+0xb8 before returning: if the context
@@ -6017,8 +6028,12 @@ uint32_t Gen11::beginCoalescedSegment(void *that) {
 	if (!NGreen::callback->isRealTGL) {
 		// Mirror the first write in Apple's implementation to keep queue state coherent
 		// for callers that poll this field during segment lifecycle.
+		static int v124CallCount = 0;
+		v124CallCount++;
 		reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(that) + 0x830)[0] = 0xFFFFFFFF;
-		DBGLOG("ngreen", "V124b: beginCoalescedSegment bypassed on RPL (state primed)");
+		if (v124CallCount <= 50 || v124CallCount % 100 == 0) {
+			SYSLOG("ngreen", "V124[%d]: beginCoalescedSegment bypassed on RPL (state primed) queue=%p", v124CallCount, that);
+		}
 		return 1;
 	}
 	return FunctionCast(beginCoalescedSegment, callback->obeginCoalescedSegment)(that);
@@ -6032,9 +6047,14 @@ uint8_t Gen11::barrierSubmission(void *queue, void *accelerator, void *cmdDesc,
 		//   ngreenV130=0 or -ngreenV130fail -> bypass and return 0 (default)
 		//   ngreenV130=1 or -ngreenV130pass -> bypass and return 1
 		//   ngreenV130=2 or -ngreenV130orig -> call original implementation
+		// NOTE: on spoofed RPL this is unsafe unless explicitly forced because
+		// the original path submits Blit2D/Blit3D barriers through BCS.
+		// Use -ngreenV130forceorig only when intentionally validating that path.
 		static int v130Mode = -1;
+		static bool v130ModeInitialized = false;
 		if (v130Mode < 0) {
 			int parsed = 0;
+			const bool forceOrig = checkKernelArgument("-ngreenV130forceorig");
 			if (PE_parse_boot_argn("ngreenV130", &parsed, sizeof(parsed))) {
 				v130Mode = parsed;
 			} else if (checkKernelArgument("-ngreenV130orig")) {
@@ -6046,24 +6066,55 @@ uint8_t Gen11::barrierSubmission(void *queue, void *accelerator, void *cmdDesc,
 			} else {
 				v130Mode = 0;
 			}
-			SYSLOG("ngreen", "V130: barrierSubmission spoof mode=%d (0=ret0,1=ret1,2=orig)", v130Mode);
+
+			if (v130Mode == 2 && !forceOrig) {
+				SYSLOG("ngreen", "V150: ngreenV130orig requested on spoofed RPL; forcing mode=1 to avoid BCS barrier stall (use -ngreenV130forceorig to override)");
+				v130Mode = 1;
+			}
+			v130ModeInitialized = true;
+			SYSLOG("ngreen", "V130: INIT barrierSubmission spoof mode=%d (0=bypass-ret0, 1=bypass-ret1, 2=call-original) forceOrig=%d",
+			       v130Mode, forceOrig ? 1 : 0);
 		}
 
 		static int v130CallCount = 0;
-		if (v130CallCount < 24) {
-			v130CallCount++;
-			SYSLOG("ngreen", "V130[%d]: q=%p acc=%p cmd=%p evt=%p count=%u list=%p mode=%d",
-			       v130CallCount, queue, accelerator, cmdDesc, event,
-			       static_cast<unsigned>(count), list, v130Mode);
+		static int v130CallInitPhase = 0;
+		static int v130CallRenderPhase = 0;
+		
+		v130CallCount++;
+		// V151 DIAGNOSTIC: Enhanced logging to trace call patterns through init vs render phases
+		// First ~100 calls are typically device init; thousands indicate rendering phase
+		bool isInitPhase = v130CallCount < 100;
+		if (isInitPhase) v130CallInitPhase++;
+		else v130CallRenderPhase++;
+		
+		if (v130CallCount <= 24 || (v130CallCount > 100 && v130CallCount <= 124) ||
+		    (v130CallCount > 1000 && v130CallCount % 100 == 0)) {
+			SYSLOG("ngreen", "V130[%d|init=%d|render=%d]: phase=%s q=%p acc=%p cmd=%p evt=%p count=%u mode=%d",
+			       v130CallCount, v130CallInitPhase, v130CallRenderPhase,
+			       isInitPhase ? "INIT" : "RENDER", queue, accelerator, cmdDesc, event,
+			       static_cast<unsigned>(count), v130Mode);
 		}
 
+		// Log the return path for first few calls to capture mode decision
+		uint8_t retVal = 0;
 		if (v130Mode == 2) {
-			return FunctionCast(barrierSubmission, callback->obarrierSubmission)(queue, accelerator,
+			if (v130CallCount <= 24) {
+				SYSLOG("ngreen", "V130[%d]: RETURNING ORIGINAL path (mode=2)", v130CallCount);
+			}
+			retVal = FunctionCast(barrierSubmission, callback->obarrierSubmission)(queue, accelerator,
 			                                                                     cmdDesc, event,
 			                                                                     count, list);
+			if (v130CallCount <= 24) {
+				SYSLOG("ngreen", "V130[%d]: ORIGINAL returned %u", v130CallCount, static_cast<unsigned>(retVal));
+			}
+			return retVal;
 		}
 
-		return static_cast<uint8_t>(v130Mode == 1 ? 1 : 0);
+		retVal = static_cast<uint8_t>(v130Mode == 1 ? 1 : 0);
+		if (v130CallCount <= 24) {
+			SYSLOG("ngreen", "V130[%d]: RETURNING BYPASS path (mode=%d, ret=%u)", v130CallCount, v130Mode, static_cast<unsigned>(retVal));
+		}
+		return retVal;
 	}
 	return FunctionCast(barrierSubmission, callback->obarrierSubmission)(queue, accelerator,
 	                                                                     cmdDesc, event,
@@ -6499,6 +6550,31 @@ unsigned long Gen11::resetGraphicsEngine(void *that,void *param_1)
 		}
 		NGreen::callback->writeReg32(RING_EMR(RENDER_RING_BASE), 0xFFFFFFFF);
 		NGreen::callback->writeReg32(RING_EMR(BLT_RING_BASE), 0xFFFFFFFF);
+	}
+
+	// V152: On RPL spoof, drain/disable the BCS ring before calling the original
+	// resetGraphicsEngine. The BCS ring gets initialized by IGHardwareCommandStreamer5
+	// during deviceStart, but RPL cannot execute those commands (BCS is incompatible).
+	// Result: BCS HEAD != TAIL permanently (HEAD=0x300, TAIL=0x388 — 0x88 stuck bytes),
+	// which causes Apple's original reset to return 1025 (failure) every single time.
+	// That failure triggers another reset → infinite loop of 115+ calls → watchdog fires.
+	// Fix: collapse TAIL back to HEAD (drop pending BCS commands) and then disable
+	// the ring (CTL=0) so the original reset sees a clean BCS state and can succeed.
+	if (!NGreen::callback->isRealTGL) {
+		uint32_t bcsTail = NGreen::callback->readReg32(RING_TAIL(BLT_RING_BASE));
+		uint32_t bcsHead = NGreen::callback->readReg32(RING_HEAD(BLT_RING_BASE));
+		uint32_t bcsCtl  = NGreen::callback->readReg32(RING_CTL(BLT_RING_BASE));
+		if (bcsCtl != 0 || bcsHead != bcsTail) {
+			// Drain: set TAIL to HEAD so software queue is considered empty.
+			if (bcsHead != bcsTail) {
+				NGreen::callback->writeReg32(RING_TAIL(BLT_RING_BASE), bcsHead);
+				SYSLOG("ngreen", "V152[%d]: BCS drain: TAIL 0x%x->0x%x (HEAD=0x%x CTL=0x%x)",
+				       v63ResetCount, bcsTail, bcsHead, bcsHead, bcsCtl);
+			}
+			// Disable BCS ring so original reset doesn't get confused by it
+			NGreen::callback->writeReg32(RING_CTL(BLT_RING_BASE), 0x0);
+			SYSLOG("ngreen", "V152[%d]: BCS disabled pre-reset (CTL was 0x%x)", v63ResetCount, bcsCtl);
+		}
 	}
 
 	// V53: Snapshot engine state BEFORE original resetGraphicsEngine
