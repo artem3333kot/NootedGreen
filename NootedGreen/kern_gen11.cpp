@@ -5463,64 +5463,71 @@ void * Gen11::getBlit3DContext(void *that,bool param_1)
 		return FunctionCast(getBlit3DContext, callback->ogetBlit3DContext)(that, param_1);
 	}
 
-	// Spoofed RPL path: avoid Apple's original by default because it can synchronously
-	// chain into Blit3D initialize and fault on memcpy (+0x4c) against a read-only page.
+	// V148: blit3d_initialize_scratch_space is now skipped in our initialize hook —
+	// the only crashing step was lockForCPUAccess returning a write-protected GPU VA
+	// followed by memcpy into it. Apple's getBlit3DContext is safe to call again because
+	// our initialize hook (V148) never touches the scratch buffer: it zeros the six
+	// header fields and calls oblit3d_init_ctx directly, which sets ctx+0xb8.
+
+	// Return cached context immediately if valid — avoids re-allocating on every barrier call.
 	if (callback->v131CachedBlit3DCtx && getMember<void *>(callback->v131CachedBlit3DCtx, 0xb8)) {
 		if (isExperimentalMonitorEnabled())
-			SYSLOG("ngreen", "V147: getBlit3DContext using cached ctx=%p", callback->v131CachedBlit3DCtx);
+			SYSLOG("ngreen", "V148: getBlit3DContext using cached ctx=%p", callback->v131CachedBlit3DCtx);
 		return callback->v131CachedBlit3DCtx;
 	}
 
-	// Try resolve fallbacks (depth/color resolve contexts share the same +0xb8 layout).
+	// Call Apple's original — it allocates, constructs, calls initWithOptions→initialize.
+	// Our initialize hook (V148) handles the RPL-safe init path.
+	if (callback->ogetBlit3DContext) {
+		void *ctx = FunctionCast(getBlit3DContext, callback->ogetBlit3DContext)(that, param_1);
+		if (ctx && getMember<void *>(ctx, 0xb8)) {
+			callback->v131CachedBlit3DCtx = ctx;
+			if (isExperimentalMonitorEnabled())
+				SYSLOG("ngreen", "V148: getBlit3DContext original succeeded ctx=%p ctx+0xb8=%p",
+				       ctx, getMember<void *>(ctx, 0xb8));
+			return ctx;
+		}
+		SYSLOG("ngreen", "V148: getBlit3DContext original returned invalid ctx=%p ctx+0xb8=%p",
+		       ctx, ctx ? getMember<void *>(ctx, 0xb8) : nullptr);
+	}
+
+	// Fallbacks: depth/color resolve contexts share the same +0xb8 layout.
 	void *depth = getDepthResolveContext(that, param_1);
 	if (depth && getMember<void *>(depth, 0xb8)) {
-		if (isExperimentalMonitorEnabled())
-			SYSLOG("ngreen", "V147: getBlit3DContext using depth-resolve fallback");
+		SYSLOG("ngreen", "V148: getBlit3DContext using depth-resolve fallback");
 		return depth;
 	}
 	void *color = getColorResolveContext(that, param_1);
 	if (color && getMember<void *>(color, 0xb8)) {
-		if (isExperimentalMonitorEnabled())
-			SYSLOG("ngreen", "V147: getBlit3DContext using color-resolve fallback");
+		SYSLOG("ngreen", "V148: getBlit3DContext using color-resolve fallback");
 		return color;
 	}
 
-	// Optional diagnostic escape hatch: explicitly try Apple's original only when requested.
-	if (checkKernelArgument("-ngreenV147TryOrig") && callback->ogetBlit3DContext) {
-		void *ctx = FunctionCast(getBlit3DContext, callback->ogetBlit3DContext)(that, param_1);
-		if (ctx && getMember<void *>(ctx, 0xb8)) {
-			callback->v131CachedBlit3DCtx = ctx;
-			SYSLOG("ngreen", "V147: getBlit3DContext original succeeded via explicit opt-in");
-			return ctx;
-		}
-		SYSLOG("ngreen", "V147: getBlit3DContext original opt-in returned invalid ctx=%p", ctx);
-	}
-
-	SYSLOG("ngreen", "V147: getBlit3DContext no valid fallback context available");
+	SYSLOG("ngreen", "V148: getBlit3DContext all paths exhausted");
 	return nullptr;
 }
 
 uint32_t Gen11::submitBlit(void *that, void *param_1, void *param_2, void *param_3, bool param_4) {
+	// V149: blit3D context is cached at task+0x298 per IGAccelTask::getBlit3DContext IDA.
+	// Previous code used 0xb8 — that overwrote an unrelated IGAccelTask member.
 	auto ensureTaskContext = [&](void *task, const char *origin) -> void * {
 		if (!task || NGreen::callback->isRealTGL)
-			return task ? getMember<void *>(task, 0xb8) : nullptr;
+			return task ? getMember<void *>(task, 0x298) : nullptr;
 
-		void *taskCtx = getMember<void *>(task, 0xb8);
+		void *taskCtx = getMember<void *>(task, 0x298);
 		if (taskCtx)
 			return taskCtx;
 
-		void *ctx = callback->getBlit3DContext(task, false);
+		// param_1=true triggers allocation; Apple then stores result at task+0x298 internally.
+		void *ctx = callback->getBlit3DContext(task, true);
 		if (!ctx)
 			return nullptr;
 
-		auto *ctxSlot = reinterpret_cast<void **>(reinterpret_cast<uint8_t *>(task) + 0xb8);
-		*ctxSlot = ctx;
-
 		if (isExperimentalMonitorEnabled()) {
-			static int v138Count = 0;
-			if (v138Count < 32) {
-				v138Count++;
-				SYSLOG("ngreen", "V138[%d]: %s task=%p initialized ctx=%p", v138Count, origin, task, ctx);
+			static int v149Count = 0;
+			if (v149Count < 32) {
+				v149Count++;
+				SYSLOG("ngreen", "V149[%d]: %s task=%p allocated ctx@298=%p", v149Count, origin, task, ctx);
 			}
 		}
 
@@ -5533,8 +5540,8 @@ uint32_t Gen11::submitBlit(void *that, void *param_1, void *param_2, void *param
 		if (v137SubmitEntryCount < 40) {
 			v137SubmitEntryCount++;
 			void *entryVtable = param_3 ? getMember<void *>(param_3, 0x0) : nullptr;
-			void *entryCtx = param_3 ? getMember<void *>(param_3, 0xb8) : nullptr;
-			SYSLOG("ngreen", "V137.submitBlit.entry[%d]: acc=%p p1=%p p2=%p task=%p vtbl=%p ctx=%p b=%u c3D=%p c2D=%p cTask=%p",
+			void *entryCtx = param_3 ? getMember<void *>(param_3, 0x298) : nullptr;
+			SYSLOG("ngreen", "V149.submitBlit.entry[%d]: acc=%p p1=%p p2=%p task=%p vtbl=%p ctx@298=%p b=%u c3D=%p c2D=%p cTask=%p",
 			       v137SubmitEntryCount, that, param_1, param_2, param_3, entryVtable, entryCtx,
 			       static_cast<unsigned>(param_4), callback->v131CachedBlit3DCtx,
 			       callback->v131CachedBlit2DCtx, callback->v132CachedTask);
@@ -5546,13 +5553,13 @@ uint32_t Gen11::submitBlit(void *that, void *param_1, void *param_2, void *param
 		// Validate minimal task invariants before calling through.
 		ensureTaskContext(param_3, "submitBlit-incoming");
 		void *taskVtable = getMember<void *>(param_3, 0x0);
-		void *taskCtx = getMember<void *>(param_3, 0xb8);
+		void *taskCtx = getMember<void *>(param_3, 0x298);
 		invalidTask = (taskVtable == nullptr) || (taskCtx == nullptr);
 		if (invalidTask) {
 			static int v135Count = 0;
 			if (v135Count < 16) {
 				v135Count++;
-				SYSLOG("ngreen", "V135[%d]: submitBlit invalid task=%p vtbl=%p ctx=%p", v135Count, param_3, taskVtable, taskCtx);
+				SYSLOG("ngreen", "V149[%d]: submitBlit invalid task=%p vtbl=%p ctx@298=%p", v135Count, param_3, taskVtable, taskCtx);
 			}
 		}
 	}
@@ -5903,16 +5910,52 @@ void Gen11::IGHardwareBlit3DContextinitialize(void *that)
 		}
 	}
 
-	// V146/V147: On spoofed RPL, never call original initialize from this fallback path.
-	// `shouldTryOriginal` above is the only allowed call-through and is already gated by
-	// explicit boot-arg opt-in plus safety checks. Falling through here used to re-enter
-	// Apple's memcpy(+0x4c) path and panic on write-protected mapped pages.
+	// V148: Replicate initialize() ourselves, skipping only blit3d_initialize_scratch_space.
+	//
+	// initWithOptions IDA (0x7CEBC) clarifies the full field layout when initialize() runs:
+	//   ctx+0xB8 — set by BASE CLASS IGHardwareContext::initWithOptions before we are called
+	//   ctx+0xD8 — IGSharedMappedBuffer* scratch buf, allocated by initWithOptions from params+0x10
+	//   ctx+0xE0 — optional extra IGMappedBuffer, only if params+0x18 != 0 (Blit3D: not used)
+	//   initialize() is called LAST (vtable[0x130]) after all fields are set.
+	//
+	// Original initialize() body (from disassembly at 0x7d8b8):
+	//   1. Zero ctx+0xe8, 0xf0, 0xf8, 0x100, 0x108, 0x110
+	//   2. ctx+0xd8 -> getMemory() -> blit3d_initialize_scratch_space()
+	//      ← CRASH on RPL: memcpy writes static GPU blit shader kernels to write-protected page
+	//      (allocation succeeds, GPU VA valid, but CPU-side lockForCPUAccess ptr is read-only)
+	//   3. tail-call blit3d_init_ctx(ctx)
+	//      ← reads ctx+0xD8 for getGPUVirtualAddress(), reads ctx+0xE0 for getBufferPtrNoInc()
+	//      ← writes GPU 3D state init commands into the command buffer (ctx+0xE0 pool slot)
+	//
+	// We zero the fields (step 1), skip scratch-space init (step 2), then call
+	// oblit3d_init_ctx directly (step 3). ctx+0xD8 must be non-null for blit3d_init_ctx
+	// to safely call getGPUVirtualAddress() — guard before calling.
+	auto *base = reinterpret_cast<uint8_t *>(that);
+	*reinterpret_cast<uint64_t *>(base + 0xe8)  = 0;
+	*reinterpret_cast<uint64_t *>(base + 0xf0)  = 0;
+	*reinterpret_cast<uint64_t *>(base + 0xf8)  = 0;
+	*reinterpret_cast<uint64_t *>(base + 0x100) = 0;
+	*reinterpret_cast<uint64_t *>(base + 0x108) = 0;
+	*reinterpret_cast<uint32_t *>(base + 0x110) = 0;
+
+	if (!callback->oblit3d_init_ctx) {
+		SYSLOG("ngreen", "V148: oblit3d_init_ctx is null, cannot init GPU command buffer");
+		return;
+	}
+	// ctx+0xD8 must be valid before calling blit3d_init_ctx (it reads it for GPU VA).
+	// In practice it is always set by initWithOptions from params+0x10; guard for safety.
+	if (!mappedBufPtr) {
+		SYSLOG("ngreen", "V148: ctx+0xD8 is null (scratch buf not allocated), skipping blit3d_init_ctx");
+		return;
+	}
+
+	uint8_t rc = FunctionCast(blit3d_init_ctx, callback->oblit3d_init_ctx)(that);
 	if (v69Verbose)
-		SYSLOG("ngreen", "V147: leaving Blit3D initialize without original call (allow=%d skip=%d safe=%d base=0x%llx size=0x%llx ctx+0xb8=0x%llx)",
-		       allowOriginal, skipOriginal, safeForOriginal,
-		       (unsigned long long)gpuBufBase, (unsigned long long)gpuBufSize,
-		       (unsigned long long)getMember<uint64_t>(that, 0xb8));
-	return;
+		SYSLOG("ngreen", "V148: blit3d_init_ctx returned %u, ctx+0xb8=0x%llx ctx+0xd8=%p ctx+0xe0=%p",
+		       static_cast<unsigned>(rc),
+		       (unsigned long long)getMember<uint64_t>(that, 0xb8),
+		       mappedBufPtr,
+		       getMember<void *>(that, 0xe0));
 
 }
 
