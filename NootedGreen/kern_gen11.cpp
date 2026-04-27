@@ -6495,6 +6495,7 @@ unsigned long Gen11::resetGraphicsEngine(void *that,void *param_1)
 {
 	static int v63ResetCount = 0;
 	static int v154ConsecQuiescentFails = 0;
+	static uint32_t v155SavedRcsCtl = 0;  // last non-zero RCS CTL seen before a reset
 	v63ResetCount++;
 	SYSLOG("ngreen", "V63: resetGraphicsEngine call #%d (consec_q=%d)", v63ResetCount, v154ConsecQuiescentFails);
 	
@@ -6567,8 +6568,15 @@ unsigned long Gen11::resetGraphicsEngine(void *that,void *param_1)
 		uint32_t bTail = NGreen::callback->readReg32(RING_TAIL(BLT_RING_BASE));
 		uint32_t err   = NGreen::callback->readReg32(ERROR_GEN6);
 		if (rCtl == 0 && rHead == rTail && bCtl == 0 && bHead == bTail && err == 0) {
-			SYSLOG("ngreen", "V154[%d]: circuit-open — skipping original reset (%d consec quiescent fails)",
-			       v63ResetCount, v154ConsecQuiescentFails);
+			// V155: re-enable the RCS ring before returning fake success.
+			// The original reset (run on earlier calls) disabled it (CTL→0x0).
+			// Apple's ring monitor sees CTL=0x0 and keeps requesting resets.
+			// Restoring CTL makes the ring look healthy: enabled + HEAD==TAIL == idle.
+			if (v155SavedRcsCtl != 0) {
+				NGreen::callback->writeReg32(RING_CTL(RENDER_RING_BASE), v155SavedRcsCtl);
+			}
+			SYSLOG("ngreen", "V154[%d]: circuit-open — skipping original reset (%d consec quiescent fails, restored CTL=0x%x)",
+			       v63ResetCount, v154ConsecQuiescentFails, v155SavedRcsCtl);
 			return 0;
 		}
 		// State changed — open circuit no longer valid, reset counter
@@ -6601,11 +6609,19 @@ unsigned long Gen11::resetGraphicsEngine(void *that,void *param_1)
 		}
 	}
 
+	// V155: Capture RCS CTL while the ring is still intact (before original disables it).
+	{
+		uint32_t ctlNow = NGreen::callback->readReg32(RING_CTL(RENDER_RING_BASE));
+		if (ctlNow != 0)
+			v155SavedRcsCtl = ctlNow;
+	}
+
 	// V53: Snapshot engine state BEFORE original resetGraphicsEngine
-	SYSLOG("ngreen", "V53 resetGfxEng PRE: RCS CTL=0x%x HEAD=0x%x TAIL=0x%x",
+	SYSLOG("ngreen", "V53 resetGfxEng PRE: RCS CTL=0x%x HEAD=0x%x TAIL=0x%x (V155 saved=0x%x)",
 		NGreen::callback->readReg32(RING_CTL(RENDER_RING_BASE)),
 		NGreen::callback->readReg32(RING_HEAD(RENDER_RING_BASE)),
-		NGreen::callback->readReg32(RING_TAIL(RENDER_RING_BASE)));
+		NGreen::callback->readReg32(RING_TAIL(RENDER_RING_BASE)),
+		v155SavedRcsCtl);
 	SYSLOG("ngreen", "V53 resetGfxEng PRE: BCS CTL=0x%x HEAD=0x%x TAIL=0x%x",
 		NGreen::callback->readReg32(RING_CTL(BLT_RING_BASE)),
 		NGreen::callback->readReg32(RING_HEAD(BLT_RING_BASE)),
@@ -6658,8 +6674,14 @@ unsigned long Gen11::resetGraphicsEngine(void *that,void *param_1)
 		const bool bcsQuiescent = (bcsCtl == 0 && bcsHead == bcsTail);
 		if (rcsQuiescent && bcsQuiescent && err == 0) {
 			v154ConsecQuiescentFails++;
-			SYSLOG("ngreen", "V153[%d]: coercing reset ret=1025 -> 0 (quiescent RCS/BCS, ERROR_GEN6=0, consec=%d)",
-			       v63ResetCount, v154ConsecQuiescentFails);
+			// V155: re-enable the RCS ring — original reset left it at CTL=0x0.
+			// Without this, Apple's ring monitor sees CTL=0 → keeps requesting resets.
+			// With CTL restored + HEAD==TAIL (idle), the ring looks healthy.
+			if (v155SavedRcsCtl != 0) {
+				NGreen::callback->writeReg32(RING_CTL(RENDER_RING_BASE), v155SavedRcsCtl);
+			}
+			SYSLOG("ngreen", "V153[%d]: coercing reset ret=1025 -> 0 (quiescent, consec=%d, restored CTL=0x%x)",
+			       v63ResetCount, v154ConsecQuiescentFails, v155SavedRcsCtl);
 			return 0;
 		}
 	}
