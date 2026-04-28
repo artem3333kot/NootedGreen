@@ -811,7 +811,15 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			
 			 {"__ZN16IntelAccelerator20_PAVPCommandCallbackEP8OSObject22PAVPSessionCommandID_tjPj", wrapPavpSessionCallback, this->orgPavpSessionCallback},
 			
-			 // resetGraphicsEngine: apply RPL GT workarounds (Wa_14011060649, Wa_14011059788, Wa_14015795083)
+// V163: Hook startGraphicsEngine to clear PERCTX_PREEMPT_CTRL (FF_SLICE_CS_CHICKEN1 bit 14)
+		 // immediately after the TGL kext enables it. The TGL kext writes 0x40004000 to reg 0x20E0
+		 // (mask=bit14, value=bit14=1). On RPL this causes the EU thread dispatcher to freeze on
+		 // first context switch because hardware snapshots the register into the context image DMA
+		 // buffer — clearing it here, before any execlist context is created, prevents the bad
+		 // value from ever reaching the DMA buffer.
+		 {"__ZN16IntelAccelerator19startGraphicsEngineEv", startGraphicsEngine, this->ostartGraphicsEngine},
+
+		 // resetGraphicsEngine: apply RPL GT workarounds (Wa_14011060649, Wa_14011059788, Wa_14015795083)
 			 // before the original TGL engine reset. Without these, GPU hangs on first 3D command.
 			 {"__ZN20IGHardwareRingBuffer19resetGraphicsEngineEP17IGHardwareContext", resetGraphicsEngine, this->oresetGraphicsEngine},
 			
@@ -6495,6 +6503,33 @@ void Gen11::IGScheduler5resume(void *that) {
 	
 	FunctionCast(IGScheduler5resume, callback->oIGScheduler5resume)(that);
 	
+}
+
+// V163: Hook startGraphicsEngine to clear PERCTX_PREEMPT_CTRL before first execlist context snapshot.
+//
+// Root cause: IntelAccelerator::startGraphicsEngine writes 0x40004000 to MMIO 0x20E0
+// (FF_SLICE_CS_CHICKEN1). That masked write enables bit 14 (PERCTX_PREEMPT_CTRL).
+// When the GPU loads its first execlist context it snapshots all GPU registers into
+// the context image DMA buffer in GGTT memory. From that point every context-switch
+// restore re-writes 0x4000 back to 0x20E0 from the DMA buffer — overriding any MMIO
+// clear we do after the fact.
+//
+// Fix: call the original (must keep its side-effects), then immediately clear bit 14
+// using a masked write (upper 16 = mask, lower 16 = 0). This fires before any context
+// is ever submitted, so the DMA buffer snapshot captures 0x0000 instead of 0x4000.
+bool Gen11::startGraphicsEngine(void *that)
+{
+	bool ret = FunctionCast(startGraphicsEngine, callback->ostartGraphicsEngine)(that);
+
+	if (!NGreen::callback->isRealTGL) {
+		// Masked clear: mask=bit14, value=0 → 0x40000000
+		NGreen::callback->writeReg32(GEN7_FF_SLICE_CS_CHICKEN1,
+			(GEN9_FFSC_PERCTX_PREEMPT_CTRL << 16) | 0);
+		SYSLOG("ngreen", "V163: startGraphicsEngine post-clear FF_SLICE_CS_CHICKEN1=0x%08x (ret=%d)",
+			NGreen::callback->readReg32(GEN7_FF_SLICE_CS_CHICKEN1), ret);
+	}
+
+	return ret;
 }
 
 unsigned long Gen11::resetGraphicsEngine(void *that,void *param_1)

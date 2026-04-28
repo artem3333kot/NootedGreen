@@ -1718,6 +1718,9 @@ private:
 	static unsigned long resetGraphicsEngine(void *that,void *param_1);  // GT engine reset
 	mach_vm_address_t oresetGraphicsEngine {};
 
+	static bool startGraphicsEngine(void *that);  // V163: clear PERCTX_PREEMPT_CTRL before first context snapshot
+	mach_vm_address_t ostartGraphicsEngine {};
+
 	static void  IGScheduler5resume(void *that);  // GPU command scheduler resume
 	mach_vm_address_t oIGScheduler5resume {};
 
