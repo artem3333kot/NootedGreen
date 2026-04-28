@@ -1,4 +1,4 @@
-# NootedGreen (tested on Sonoma and with RPL (!realTGL) machine..)
+# NootedGreen
 
 Lilu plugin for Intel iGPU acceleration on macOS — Haswell through Raptor Lake, via Tiger Lake driver spoofing.
 
@@ -22,24 +22,52 @@ Patches Apple's Tiger Lake (Gen12) graphics drivers to work with newer Intel iGP
 - `DisplayPipeSupported` native path is now the default. Use `-ngreendp0` only for forced fallback testing.
 - V77 display-pipe client termination is disabled by default (delay defaults to full monitor window).
 - **V88 scanout fill remains opt-in** (`-ngreenv88`). Default boots do not paint diagnostic bars over normal UI layout.
+- **GPU reset storm fully tamed (V157):** `resetGraphicsEngine` circuit-breaker (V153+V154) confirmed working — V153 fires from call #1 (coerces `ret=1025→0` when RCS ring head == tail), V154 opens at call #4 (skips original reset entirely after 3 consecutive quiescent coercions). Ring CTL is restored to `0x7001` (RING_ENABLE set) on every fake-success path via V155 saved-CTL restore.
+- **Execlist cleanup in progress (V158):** Root cause of remaining `userspace watchdog timeout` panics is identified — `EXEC=0x40018098` (execlist FIFO stalled, bit 30 set) and `CSB=0x1001` (15 unread context-status entries) persist post-fake-success, causing Apple's driver to keep scheduling resets. V158 addresses this by writing four null descriptors to `RING_ELSP` (cancelling pending EL0/EL1 contexts) and advancing the CSB read pointer to match the write pointer on every V153/V154 return-0 path.
 
 ### Recent Progress
 
+- **V158:** Cancel pending execlist contexts + drain CSB after every fake-success `resetGraphicsEngine` return. Writes 4×0 to `RING_ELSP` (two null 64-bit context descriptors = cancel EL0 + EL1), then reads `RING_CONTEXT_STATUS_PTR` and writes back with read_ptr set to write_ptr. Logs `EXEC` value after the null writes to confirm whether execlist FIFO cleared. Applied on both V153 and V154 return-0 paths. Build confirmed clean. Boot test pending.
+- **V157:** Removed `rcsCtl == 0` guard from V153 quiescent check — hardware restores CTL to `0x7001` before V153 reads it, so the condition was always false. Only `rcsHead == rcsTail && err == 0` is needed. Boot log confirmed: V153 now fires from call #1.
+- **V156:** Fixed `RING_ENABLE` bit (ORed `| 1` at all CTL write sites). Dropped `bCtl == 0` from V154 check. Stabilized ring-enabled state across all fake-success paths.
+- **V155:** Snapshot of RCS CTL (with `RING_ENABLE` forced) taken before the original `resetGraphicsEngine` call; restored on V153 and V154 return-0 paths to prevent the driver disabling the ring.
+- **V154:** RPL-only circuit-breaker — after 3 consecutive quiescent `ret=1025` coercions by V153, skip calling the original `resetGraphicsEngine` entirely. Prevents the health monitor (V60M, 2 s tick × 60 = 120 s budget) from burning the full watchdog window on redundant resets.
+- **V153:** Coerce `resetGraphicsEngine ret=1025 → 0` when RCS ring is quiescent (`rcsHead == rcsTail`, `ERROR_GEN6 == 0`) on non-real TGL. Increments consecutive-quiescent counter for V154 arming.
+- **V152:** BCS ring drain — force `RING_TAIL ← RING_HEAD` before BCS reset to stop repeated "ring not empty" resets on RPL where the BCS engine cannot execute under the TGL driver.
 - **DYLD compact baseline:** Assertion bypass remains baseline on Ventura+/Sonoma. Stage-3 safety stubs are conditional (non-real TGL default), with full-MTL override available via `-ngreenfullmtl`.
 - **DisplayPipe defaults updated:** Native `DisplayPipeSupported` is default. `-ngreendp0` is explicit fallback.
 - **V77 default policy updated:** kill delay default is full monitor window (no automatic client termination unless explicitly requested).
 - **V96 connector state update:** `getOnlineInfo` forces online + changed for stronger hotplug/state propagation.
-- **V98/V98T/V90L4:** Conservative eDP training and lane policy diagnostics for spoofed paths.
 - **V110:** V59 delayed checks + V74 EMR enforcer run unconditionally on non-real TGL; V60 monitor remains opt-in via `-ngreenexp`.
 - **V75:** **CRITICAL FIX** — Removed post-`awaitPublishing` property override race condition. Display output now stable and corruption-free.
 - **V74:** Permanent EMR enforcer — 50ms timer runs indefinitely, keeping ERROR_GEN6 masked.
-- **V73:** Fixed double-dereference crash in blit3D initialize hook.
-- **V72:** EMR write interception on all MMIO write paths.
 - **V111C:** For non-real TGL, original Blit3D initializer is no longer auto-selected in full-MTL mode; it is opt-in only via `-ngreenV69AllowOriginal`.
+
+### GPU Reset Storm — Root Cause Analysis (RPL / macOS 14.7.1)
+
+On RPL under the TGL driver spoof, Apple's `resetGraphicsEngine` returns `1025` (ETIMEDOUT) on every call because the TGL reset sequence issues commands the RPL hardware cannot execute. This triggers a `userspace watchdog timeout` panic as follows:
+
+1. The V60M health monitor fires every ~2 s for up to 120 s (60 ticks).
+2. Each tick calls `resetGraphicsEngine` — before V153/V154 this always returned `1025` and reset the watchdog counter.
+3. After 120 s of no successful reset, the kernel watchdog fires.
+
+V153/V154 break the storm by detecting a quiescent RCS ring and returning `0` (success) without touching the hardware. V154 then short-circuits all subsequent calls for the remainder of the boot session. V155/V156/V157 ensure the RCS ring stays enabled (`CTL=0x7001`) across all fake-success returns.
+
+The remaining issue post-V157 is that `RING_EXECLIST_STATUS` (`EXEC`) stays at `0x40018098` (bit 30 = execlist queue stalled) and `RING_CONTEXT_STATUS_PTR` shows write_ptr ahead of read_ptr across all V60M ticks — meaning Apple's driver still sees pending context work and continues scheduling resets even though V154 returns instantly. V158 targets this by nulling the execlist submission port and draining the CSB on every fake-success return.
+
+Key registers (all offsets from `RENDER_RING_BASE = 0x2000`):
+
+| Register | Offset | Role in fix |
+|----------|--------|-------------|
+| `RING_ELSP` | `+0x230` | Write 4×0 to cancel pending EL0+EL1 context descriptors |
+| `RING_EXECLIST_STATUS` | `+0x234` | Bit 30 = execlist FIFO stalled; cleared by ELSP null writes |
+| `RING_CONTEXT_STATUS_PTR` | `+0x3a0` | Bits[15:8]=write_ptr, [7:0]=read_ptr; advance read→write to drain CSB |
+| `RING_CTL` | `+0x3c` | Bit 0 = RING_ENABLE; V155 saves and restores this on every fake-success |
+| `ERROR_GEN6` | `0x40A0` | Must be 0 for V153 quiescent condition |
 
 ### Current Status
 
-System can boot to login on current RPL test baselines. Current baseline is compact DYLD + native display-pipe defaults with minimal boot-arg requirements and conservative Blit3D init defaults. V88 visual fill is opt-in only (`-ngreenv88`) so default boots preserve normal Apple UI layout.
+System boots to login on RPL macOS 14.7.1 (`23H222`). The GPU reset storm is tamed: V153+V154 prevent the health monitor from burning the watchdog budget on redundant reset calls. CTL is stable at `0x7001`. Active investigation targets execlist/CSB cleanup (V158) to let Apple's driver recognize the engine as truly idle after each fake-success return. V88 visual fill is opt-in only (`-ngreenv88`) so default boots preserve normal Apple UI layout.
 
 ## Requirements
 
@@ -252,7 +280,7 @@ NootedGreen (Gen11/Gen12 — TGL driver spoofing):
 | Platform | Status | Est. | Notes |
 |----------|--------|------|-------|
 | **Tiger Lake** | ~90% | V52 | RPL-specific patches auto-skipped via CPUID. GuC, topology, ForceWake, BCS all use native Apple paths. Remaining risk: SKU bypass hook + DYLD patches still in the path. No real TGL hardware tested yet. |
-| **Raptor Lake-P** | ~55% | V74+ | Primary dev platform (i7-13700H). Early IGPU identity selection now works with OpenCore DeviceProperties injection (`AAPL,ig-platform-id=9A490000` observed by Lilu). System is stable (no kernel panic), but display output is still visually corrupted/unstable after driver takeover. |
+| **Raptor Lake-P** | ~65% | V158 | Primary dev platform (i7-13700H). System boots to login on macOS 14.7.1 (`23H222`). GPU reset storm tamed: V153/V154 circuit-breaker confirmed working (V153 fires call #1, V154 opens call #4), CTL stable at `0x7001`. Active fix: V158 clears execlist/CSB to stop Apple's driver seeing stale pending-context state post-fake-success. `userspace watchdog timeout` panic still under investigation. |
 | **Alder Lake** | ~35% | — | Same Gen12 arch as RPL, should behave similarly. Untested. |
 | **Rocket Lake** | ~25% | — | Gen12 LP but different display engine. Untested. |
 | **Ice Lake** | ~50% | V52 | Dedicated ICL path exists (ICL FB + ICL HW kextInfos, ICL-specific object offsets in `getGPUInfoICL`, SKU gate×3, platform remap, PAVP hook, DYLD ICL Metal device-ID bypass). Topology hardcoded to ICL GT2 LP (1×8×8=64EU). IRQ init disabled (V37 boot hang). ICL path only activates when TGL kexts are absent. Untested on real ICL hardware. |
@@ -265,8 +293,7 @@ Open `NootedGreen.xcodeproj` and select the **NootedGreen** scheme to build the 
 
 - **Stefano Giammori** ([@sgiammori](https://github.com/sgiammori)) — reverse engineering, driver development, hardware testing
 - Thanks to [@shl628](https://github.com/shl628) and [@jalavoui](https://github.com/jalavoui), developers of NootedBlue
-- **Claude Sonnet** (Anthropic) — AI pair-programming, code generation, debug analysis
-- **Claude Opus 4.6** via GitHub Copilot — AI pair-programming, code generation, debug analysis
+- **GitHub Copilot** (Claude Sonnet 4.6) — AI pair-programming, code generation, debug analysis
 
 ## License
 
