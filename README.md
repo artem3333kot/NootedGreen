@@ -160,7 +160,7 @@ https://github.com/sgiammori/NootedGreen
 
 IOResources solving now is done like this for TGL kexts or IcL ketxts : first look at LE kexts and if any kexts is found than fallback to find in SLE kexts : * framebuffer for fb * + * graphics for gpu * + * bundle for metal *
 
-they (also Bookcase) need permissions fix so before move to /L/E do in some random folder (maybe better use our Lilu plugin forked for IOResources eventually problems...
+they (also Hookcase) need permissions fix so before move to /L/E do in some random folder, check below
 ```
 
 ## Workflow for kexts (fb+Graphics+Hookcase in LE)
@@ -178,8 +178,6 @@ they (also Bookcase) need permissions fix so before move to /L/E do in some rand
 
 sudo kmutil load -p /Library/Extensions/AppleIntelTGLGraphics.kext 2>&1
 sudo kextcache -i /
-
-- and - important - also set IOPCIPrimaryMatch in kexts to probe your device-id
 ```
 
 ## Compatibility-First Defaults
@@ -292,7 +290,7 @@ Open `NootedGreen.xcodeproj` and select the **NootedGreen** scheme to build the 
 ## Authors
 
 - **Stefano Giammori** ([@sgiammori](https://github.com/sgiammori)) — reverse engineering, driver development, hardware testing
-- Thanks to [@shl628](https://github.com/shl628) and [@jalavoui](https://github.com/jalavoui), developers of NootedBlue
+- Thanks to [@shl628](https://github.com/lshbluesky) and [@jalavoui](https://github.com/macintelk), developers of NootedBlue
 - **GitHub Copilot** (Claude Sonnet 4.6) — AI pair-programming, code generation, debug analysis
 
 ## License
