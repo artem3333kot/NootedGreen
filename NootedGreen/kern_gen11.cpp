@@ -397,12 +397,11 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			{"__ZN31AppleIntelRegisterAccessManager14ReadRegister32EPVvm",raReadRegister32b},*/
 			{"__ZN31AppleIntelRegisterAccessManager15WriteRegister32Emj",raWriteRegister32, this->oraWriteRegister32},
 			{"__ZN31AppleIntelRegisterAccessManager15WriteRegister32EPVvmj",raWriteRegister32b},
-			{"__ZN21AppleIntelFramebuffer17prepareToExitWakeEv",releaseDoorbell},
-			{"__ZN21AppleIntelFramebuffer18prepareToEnterWakeEv",releaseDoorbell},
-			{"__ZN21AppleIntelFramebuffer18prepareToExitSleepEv",releaseDoorbell},
-			{"__ZN21AppleIntelFramebuffer19prepareToEnterSleepEv",releaseDoorbell},
-			//******
-			{"__ZN24AppleIntelBaseController15enableVDDForAuxEP14AppleIntelPort", releaseDoorbell},
+			//{"__ZN21AppleIntelFramebuffer17prepareToExitWakeEv",releaseDoorbell},
+			//{"__ZN21AppleIntelFramebuffer18prepareToEnterWakeEv",releaseDoorbell},
+			//{"__ZN21AppleIntelFramebuffer18prepareToExitSleepEv",releaseDoorbell},
+			//{"__ZN21AppleIntelFramebuffer19prepareToEnterSleepEv",releaseDoorbell},
+			//{"__ZN24AppleIntelBaseController15enableVDDForAuxEP14AppleIntelPort", releaseDoorbell},
 			// Keep native SST timing setup; forcing custom clocks can break CoreDisplay validation.
 			//{"__ZN24AppleIntelBaseController17SetupDPSSTTimingsEP21AppleIntelFramebufferP21AppleIntelDisplayPathP10CRTCParams", SetupDPSSTTimings, this->oSetupDPSSTTimings},
 			//{"__ZN24AppleIntelBaseController12SetupTimingsEP21AppleIntelFramebufferP21AppleIntelDisplayPathPK29IODetailedTimingInformationV2P10CRTCParams", SetupTimings, this->oSetupTimings},
@@ -5483,37 +5482,48 @@ void * Gen11::getBlit3DContext(void *that,bool param_1)
 	// our initialize hook (V148) never touches the scratch buffer: it zeros the six
 	// header fields and calls oblit3d_init_ctx directly, which sets ctx+0xb8.
 
-	// Return cached context immediately if valid — avoids re-allocating on every barrier call.
-	if (callback->v131CachedBlit3DCtx && getMember<void *>(callback->v131CachedBlit3DCtx, 0xb8)) {
-		if (isExperimentalMonitorEnabled())
-			SYSLOG("ngreen", "V148: getBlit3DContext using cached ctx=%p", callback->v131CachedBlit3DCtx);
-		return callback->v131CachedBlit3DCtx;
+	// Return cached context immediately if valid.
+	// V165: On RPL, ctx+0xb8 is NULL (base-class IGHardwareContext::initWithOptions doesn't
+	// set it for RPL hardware). All callers that dereference ctx+0xb8 are already guarded
+	// with !isRealTGL returns (initBlitUsage V121, markBlitUsage V122, beginCoalescedSegment
+	// V124, barrierSubmission V130). Accept any non-null ctx on RPL.
+	if (callback->v131CachedBlit3DCtx) {
+		void *b8 = getMember<void *>(callback->v131CachedBlit3DCtx, 0xb8);
+		if (b8 || !NGreen::callback->isRealTGL) {
+			if (isExperimentalMonitorEnabled())
+				SYSLOG("ngreen", "V148: getBlit3DContext using cached ctx=%p ctx+0xb8=%p",
+				       callback->v131CachedBlit3DCtx, b8);
+			return callback->v131CachedBlit3DCtx;
+		}
 	}
 
 	// Call Apple's original — it allocates, constructs, calls initWithOptions→initialize.
 	// Our initialize hook (V148) handles the RPL-safe init path.
+	// V165: On RPL accept ctx even when ctx+0xb8=NULL (base class doesn't set it on RPL).
 	if (callback->ogetBlit3DContext) {
 		void *ctx = FunctionCast(getBlit3DContext, callback->ogetBlit3DContext)(that, param_1);
-		if (ctx && getMember<void *>(ctx, 0xb8)) {
+		void *b8 = ctx ? getMember<void *>(ctx, 0xb8) : nullptr;
+		if (ctx && (b8 || !NGreen::callback->isRealTGL)) {
 			callback->v131CachedBlit3DCtx = ctx;
-			if (isExperimentalMonitorEnabled())
-				SYSLOG("ngreen", "V148: getBlit3DContext original succeeded ctx=%p ctx+0xb8=%p",
-				       ctx, getMember<void *>(ctx, 0xb8));
+			SYSLOG("ngreen", "V148: getBlit3DContext original succeeded ctx=%p ctx+0xb8=%p", ctx, b8);
 			return ctx;
 		}
 		SYSLOG("ngreen", "V148: getBlit3DContext original returned invalid ctx=%p ctx+0xb8=%p",
-		       ctx, ctx ? getMember<void *>(ctx, 0xb8) : nullptr);
+		       ctx, b8);
 	}
 
 	// Fallbacks: depth/color resolve contexts share the same +0xb8 layout.
+	// V165: On RPL accept fallback ctx regardless of +0xb8.
 	void *depth = getDepthResolveContext(that, param_1);
-	if (depth && getMember<void *>(depth, 0xb8)) {
-		SYSLOG("ngreen", "V148: getBlit3DContext using depth-resolve fallback");
+	void *depthB8 = depth ? getMember<void *>(depth, 0xb8) : nullptr;
+	if (depth && (depthB8 || !NGreen::callback->isRealTGL)) {
+		SYSLOG("ngreen", "V148: getBlit3DContext using depth-resolve fallback ctx=%p ctx+0xb8=%p", depth, depthB8);
 		return depth;
 	}
 	void *color = getColorResolveContext(that, param_1);
-	if (color && getMember<void *>(color, 0xb8)) {
-		SYSLOG("ngreen", "V148: getBlit3DContext using color-resolve fallback");
+	void *colorB8 = color ? getMember<void *>(color, 0xb8) : nullptr;
+	if (color && (colorB8 || !NGreen::callback->isRealTGL)) {
+		SYSLOG("ngreen", "V148: getBlit3DContext using color-resolve fallback ctx=%p ctx+0xb8=%p", color, colorB8);
 		return color;
 	}
 
