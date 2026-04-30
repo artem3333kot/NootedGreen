@@ -180,9 +180,16 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 		};
 		DYLDPatch::applyAll(assertionPatch, const_cast<void *>(data), PAGE_SIZE);
 
+		// Always guard RunFullDisplayPipe against NULL DisplaySurface — can happen
+		// during startup even with full Metal path active.
+		const DYLDPatch fdpGuardPatch[] = {
+			{f_runfdp_guard_sonoma, r_runfdp_guard_sonoma, "RunFullDisplayPipe NULL vcall guard (Sonoma)"},
+		};
+		DYLDPatch::applyAll(fdpGuardPatch, const_cast<void *>(data), PAGE_SIZE);
+
 		if (!isRealTGL && !forceFullMTL) {
+			// Non-Metal path: stub out Metal calls so they return NULL safely.
 			const DYLDPatch safetyPatches[] = {
-				{f_runfdp_guard_sonoma, r_runfdp_guard_sonoma, "RunFullDisplayPipe NULL vcall guard (Sonoma)"},
 				{f_getmtltex_sonoma, r_getmtltex_sonoma, "GetMTLTexture return NULL (Sonoma)"},
 				{f_getmtlcq_sonoma, r_getmtlcq_sonoma, "GetMTLCommandQueue return NULL (Sonoma)"},
 			};
