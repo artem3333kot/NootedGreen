@@ -156,7 +156,13 @@ static int getV142SubmitBlitMode() {
 	if (checkKernelArgument("-ngreenV142unsupported"))
 		return 1;
 
-	return 3;
+	// V170: RPL (and any non-TGL spoof) cannot execute the TGL-format 3D blit commands that
+	// the original IGAccelBlit::submitBlit generates — the RCS EU stalls indefinitely
+	// (INSTDONE=0xfffffffe, bit-0 stuck) causing an infinite hangcheck→reset→retry loop
+	// that kills WindowServer within 120 s. Default to mode 1 (return 0 = success, no-op)
+	// so the compositor initialises without hanging. Real TGL hardware still uses mode 3.
+	// Override with -ngreenV142orig or ngreenV142=3 to restore original blit submission.
+	return 1;
 }
 
 static bool isV88ScanoutFillEnabled() {
@@ -790,6 +796,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		auto *activeKext = (kextG11HWTA.loadIndex == index) ? &kextG11HWTA : &kextG11HWT;
 		SYSLOG("ngreen", "init AppleIntelTGLGraphics (HW accelerator)");
 		NGreen::callback->setRMMIOIfNecessary();
+		SYSLOG("ngreen", "V165: setRMMIO done, starting symbol resolve");
 
 		// V144: Resolve the Blit3D context params struct and the ExtendedContext initWithOptions.
 		// Blit3DExtendedCtxParams is a static data symbol — address passed as param_2 to initWithOptions.
@@ -905,7 +912,9 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			 {"__ZN11IGAccelTask22getColorResolveContextEb", getColorResolveContext, this->ogetColorResolveContext},
 			 
 		 };
+		SYSLOG("ngreen", "V165: routing %zu HW accelerator symbols", sizeof(requests)/sizeof(requests[0]));
 		PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, requests, address, size), "ngreen","Failed to route symbols");
+		SYSLOG("ngreen", "V165: HW accelerator symbols routed OK");
 
 		{
 			// loadGuCBinary: always route — WEG's firmware path is Mojave-gated and dead on Sonoma.
@@ -5543,15 +5552,20 @@ uint32_t Gen11::submitBlit(void *that, void *param_1, void *param_2, void *param
 			return taskCtx;
 
 		// param_1=true triggers allocation; Apple then stores result at task+0x298 internally.
+		// V171: Our getBlit3DContext hook returns the global cached ctx but does NOT write
+		// task+0x298. Apple's original would store it per-task. Do it explicitly here so
+		// the invalidTask check (getMember<void*>(task,0x298) == nullptr) passes.
 		void *ctx = callback->getBlit3DContext(task, true);
 		if (!ctx)
 			return nullptr;
+
+		getMember<void *>(task, 0x298) = ctx;
 
 		if (isExperimentalMonitorEnabled()) {
 			static int v149Count = 0;
 			if (v149Count < 32) {
 				v149Count++;
-				SYSLOG("ngreen", "V149[%d]: %s task=%p allocated ctx@298=%p", v149Count, origin, task, ctx);
+				SYSLOG("ngreen", "V149[%d]: %s task=%p stored ctx@298=%p", v149Count, origin, task, ctx);
 			}
 		}
 
