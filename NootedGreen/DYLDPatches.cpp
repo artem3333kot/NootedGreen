@@ -280,17 +280,22 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 			};
 			DYLDPatch::applyAll(isRemovableGuardPatch, const_cast<void *>(data), PAGE_SIZE);
 
+			// V187: aggressive full-return on AccessComplete prologue — best known state:
+			// no KP, cursor visible, but display may show recycle/low-detail condition.
+			// Applied unconditionally for !isRealTGL. Use -ngreenV188htfind to test the
+			// narrower hash-find guard instead (caused black screen regression).
 			const DYLDPatch accessCompleteGuardPatch[] = {
-				{f_accesscomplete_guard_sonoma, r_accesscomplete_guard_sonoma, "DisplaySurface::AccessComplete crash guard (Sonoma)"},
+				{f_accesscomplete_guard_sonoma, r_accesscomplete_guard_sonoma, "DisplaySurface::AccessComplete crash guard V187 (Sonoma)"},
 			};
-			if (checkKernelArgument("-ngreenV187acstub")) {
-				DYLDPatch::applyAll(accessCompleteGuardPatch, const_cast<void *>(data), PAGE_SIZE);
-			}
+			DYLDPatch::applyAll(accessCompleteGuardPatch, const_cast<void *>(data), PAGE_SIZE);
 
-			const DYLDPatch hashFindGuardPatch[] = {
-				{f_hashfind_mtlps_guard_sonoma, r_hashfind_mtlps_guard_sonoma, "MTLRenderPipelineState hash::find crash guard (Sonoma)"},
-			};
-			DYLDPatch::applyAll(hashFindGuardPatch, const_cast<void *>(data), PAGE_SIZE);
+			// V188: narrower hash-find guard — caused black screen regression, debug only.
+			if (checkKernelArgument("-ngreenV188htfind")) {
+				const DYLDPatch hashFindGuardPatch[] = {
+					{f_hashfind_mtlps_guard_sonoma, r_hashfind_mtlps_guard_sonoma, "MTLRenderPipelineState hash::find crash guard V188 (Sonoma)"},
+				};
+				DYLDPatch::applyAll(hashFindGuardPatch, const_cast<void *>(data), PAGE_SIZE);
+			}
 		}
 	}
 }
