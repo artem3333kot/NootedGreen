@@ -5595,6 +5595,26 @@ void * Gen11::getBlit3DContext(void *that,bool param_1)
 }
 
 uint32_t Gen11::submitBlit(void *that, void *param_1, void *param_2, void *param_3, bool param_4) {
+	// V186: For spoofed non-TGL, if V142 is configured to bypass submitBlit,
+	// return before any task/context touching logic. The V149/V171 path writes
+	// task+0x298 and can poison task lifetime on some boots, later crashing in
+	// IGAccelTask::release from the garbage collector interrupt path.
+	if (!NGreen::callback->isRealTGL) {
+		static int v186Mode = -1;
+		if (v186Mode < 0) {
+			v186Mode = getV142SubmitBlitMode();
+			SYSLOG("ngreen", "V186: early submitBlit spoof mode=%d (0=unsupported,1=ret0,2=ret1,3=orig)", v186Mode);
+		}
+
+		if (v186Mode != 3) {
+			if (v186Mode == 2)
+				return 1;
+			if (v186Mode == 1)
+				return 0;
+			return static_cast<uint32_t>(kIOReturnUnsupported);
+		}
+	}
+
 	// V149: blit3D context is cached at task+0x298 per IGAccelTask::getBlit3DContext IDA.
 	// Previous code used 0xb8 — that overwrote an unrelated IGAccelTask member.
 	auto ensureTaskContext = [&](void *task, const char *origin) -> void * {
