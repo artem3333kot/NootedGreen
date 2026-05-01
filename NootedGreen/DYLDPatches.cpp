@@ -213,6 +213,26 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 		0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90
 	};
 
+	// V188: Narrow guard for the active Sonoma WindowServer crash site.
+	// Crash frame:
+	//   std::__hash_table<id<MTLRenderPipelineState>...>::find + 0x4
+	// with rdi=0x78/0x80-like garbage, causing mov r9,[rdi+8] fault.
+	// Strategy: short-circuit this specific hash-table find specialization to
+	// return a null/end iterator, letting AccessComplete continue through its
+	// existing fallback path instead of stubbing the whole function.
+	static const uint8_t f_hashfind_mtlps_guard_sonoma[] = {
+		0x55,0x48,0x89,0xe5,0x4c,0x8b,0x4f,0x08,
+		0x4d,0x85,0xc9,0x0f,0x84,0xcc,0x00,0x00,
+		0x00,0x4c,0x89,0xc8,0x48,0xd1,0xe8,0x48,
+		0xb9,0x55,0x55,0x55,0x55,0x55,0x55,0x55
+	};
+	static const uint8_t r_hashfind_mtlps_guard_sonoma[] = {
+		0x31,0xc0,0xc3,0x90,0x90,0x90,0x90,0x90,
+		0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90,
+		0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90,
+		0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90
+	};
+
 	if (getKernelVersion() >= KernelVersion::Ventura) {
 		const bool isRealTGL = NGreen::callback && NGreen::callback->isRealTGL;
 		const bool forceFullMTL = shouldForceFullMetalPath();
@@ -263,7 +283,14 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 			const DYLDPatch accessCompleteGuardPatch[] = {
 				{f_accesscomplete_guard_sonoma, r_accesscomplete_guard_sonoma, "DisplaySurface::AccessComplete crash guard (Sonoma)"},
 			};
-			DYLDPatch::applyAll(accessCompleteGuardPatch, const_cast<void *>(data), PAGE_SIZE);
+			if (checkKernelArgument("-ngreenV187acstub")) {
+				DYLDPatch::applyAll(accessCompleteGuardPatch, const_cast<void *>(data), PAGE_SIZE);
+			}
+
+			const DYLDPatch hashFindGuardPatch[] = {
+				{f_hashfind_mtlps_guard_sonoma, r_hashfind_mtlps_guard_sonoma, "MTLRenderPipelineState hash::find crash guard (Sonoma)"},
+			};
+			DYLDPatch::applyAll(hashFindGuardPatch, const_cast<void *>(data), PAGE_SIZE);
 		}
 	}
 }

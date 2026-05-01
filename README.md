@@ -128,8 +128,12 @@ Recommended debug order for `ngreenV142` on spoofed RPL/ADL:
 
 Sonoma 14.7.1 note: when WindowServer crashes with `EXC_BAD_ACCESS` at `0x80` in
 `CoreDisplay::DisplaySurface::AccessComplete()` / `std::__hash_table::find`, NootedGreen
-now applies a non-real-TGL-only DYLD guard (V187) that short-circuits `AccessComplete`
-to avoid the recycle loop. Real TGL behavior is unchanged.
+now applies a non-real-TGL-only DYLD guard (V188) that stubs the crashing
+`MTLRenderPipelineState` hash-table `find` specialization so CoreDisplay can take its
+fallback path. Real TGL behavior is unchanged.
+
+`-ngreenV187acstub` enables the older aggressive V187 debug path that short-circuits
+`DisplaySurface::AccessComplete()` entirely. Keep this disabled for normal testing.
 
 ## Hookcase
 
