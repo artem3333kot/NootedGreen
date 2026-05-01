@@ -175,9 +175,11 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 	// At RunFullDisplayPipe+2103, objc_msgSend is called as [device isRemovable].
 	// On spoofed RPL/ADL the receiver (from rbp-0x490) is an __NSCFNumber, not a real
 	// display device — causing NSInvalidArgumentException / WindowServer crash loop.
-	// Fix: replace the 6-byte call with xor eax,eax (returns 0 = not removable = built-in).
-	// The built-in eDP display IS non-removable, so this is semantically correct.
-	// Pattern is unique (1 match) at offset +0xC5F62 in CoreDisplay 14.7.1 __TEXT.
+	// Fix: replace the 6-byte call with mov al,1 (returns 1 = removable).
+	// The jne at +2110 jumps when al≠0 (isRemovable=true) to skip the Assert block.
+	// Returning 0 (xor eax,eax) caused the jne to NOT be taken → CoreDisplay::Assert fires.
+	// Returning 1 causes jne to be taken → Assert at fn+2156 (imgOff 0xC5FA6) is skipped.
+	// Pattern is unique (1 match) at offset +0xC5F5A in CoreDisplay 14.7.1 __TEXT.
 	static const uint8_t f_isrm_guard_sonoma[] = {
 		0x48,0x8b,0x35,0xc7,0xf3,0x07,0x3e,  // mov rsi,[rip+...] (isRemovable selector)
 		0x48,0x8b,0xbd,0x70,0xfb,0xff,0xff,  // mov rdi,[rbp-0x490] (receiver = NSNumber)
@@ -187,7 +189,7 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 	static const uint8_t r_isrm_guard_sonoma[] = {
 		0x48,0x8b,0x35,0xc7,0xf3,0x07,0x3e,  // (keep: selector load)
 		0x48,0x8b,0xbd,0x70,0xfb,0xff,0xff,  // (keep: receiver load)
-		0x31,0xc0,0x90,0x90,0x90,0x90,       // xor eax,eax; nop×4 (return 0, no msgSend)
+		0xb0,0x01,0x90,0x90,0x90,0x90,       // mov al,1; nop×4 (return 1 → jne taken → skip Assert)
 		0x84,0xc0                             // (keep: test al,al)
 	};
 
