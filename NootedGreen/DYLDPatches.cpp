@@ -193,21 +193,25 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 				{f_runfdp_guard_sonoma, r_runfdp_guard_sonoma, "RunFullDisplayPipe NULL vcall guard (Sonoma)"},
 			};
 			DYLDPatch::applyAll(fdpGuardPatch, const_cast<void *>(data), PAGE_SIZE);
+		}
 
-			if (!isRealTGL && !forceFullMTL) {
-				// Non-Metal path: stub both Metal object accessors to NULL.
-				// Do NOT apply when forceFullMTL=true — CoreDisplay needs real
-				// Metal textures/command queues for the full compositor path.
-				const DYLDPatch getMtlTextureSafetyPatch[] = {
-					{f_getmtltex_sonoma, r_getmtltex_sonoma, "GetMTLTexture return NULL (Sonoma)"},
-				};
-				DYLDPatch::applyAll(getMtlTextureSafetyPatch, const_cast<void *>(data), PAGE_SIZE);
+		if (!isRealTGL) {
+			// For spoofed (non-TGL) hardware the CoreDisplay MetalDevice is never
+			// validly constructed — its internal mtlDevice field holds an
+			// NSTaggedPointerString rather than a real MTLDevice object.
+			// Stubbing both accessors to NULL prevents objc_msgSend from
+			// dispatching Metal methods onto the garbage pointer.
+			// This applies regardless of forceFullMTL: the Metal device simply
+			// does not exist for RPL/ADL under the spoofed TGL driver.
+			const DYLDPatch getMtlTextureSafetyPatch[] = {
+				{f_getmtltex_sonoma, r_getmtltex_sonoma, "GetMTLTexture return NULL (Sonoma)"},
+			};
+			DYLDPatch::applyAll(getMtlTextureSafetyPatch, const_cast<void *>(data), PAGE_SIZE);
 
-				const DYLDPatch getMtlCommandQueueSafetyPatch[] = {
-					{f_getmtlcq_sonoma, r_getmtlcq_sonoma, "GetMTLCommandQueue return NULL (Sonoma)"},
-				};
-				DYLDPatch::applyAll(getMtlCommandQueueSafetyPatch, const_cast<void *>(data), PAGE_SIZE);
-			}
+			const DYLDPatch getMtlCommandQueueSafetyPatch[] = {
+				{f_getmtlcq_sonoma, r_getmtlcq_sonoma, "GetMTLCommandQueue return NULL (Sonoma)"},
+			};
+			DYLDPatch::applyAll(getMtlCommandQueueSafetyPatch, const_cast<void *>(data), PAGE_SIZE);
 		}
 	}
 }
