@@ -166,10 +166,30 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 	static const uint8_t f_getmtlcq_sonoma[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x48, 0x81, 0xec, 0x88, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x05, 0xe9, 0x29, 0x88, 0x3f, 0x48, 0x8b, 0x00};
 	static const uint8_t r_getmtlcq_sonoma[] = {0x31, 0xc0, 0xc3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
 
-	//CoreDisplay::DisplayPipe::RunFullDisplayPipe - NULL vcall guard (Sonoma 14.7.1)
+	//CoreDisplay::DisplayPipe::RunFullDisplayPipe - NULL vcall guard at entry (Sonoma 14.7.1)
 	//test rdi,rdi; jz +6 instead of mov rax,[rdi]; call [rax+0x28] — skips crash when rdi==NULL.
 	static const uint8_t f_runfdp_guard_sonoma[] = {0x49, 0x8b, 0xbe, 0x88, 0x08, 0x00, 0x00, 0x48, 0x8b, 0x07, 0xff, 0x50, 0x28};
 	static const uint8_t r_runfdp_guard_sonoma[] = {0x49, 0x8b, 0xbe, 0x88, 0x08, 0x00, 0x00, 0x48, 0x85, 0xff, 0x74, 0x06, 0x90};
+
+	// V60: RunFullDisplayPipe isRemovable crash guard (Sonoma 14.7.1)
+	// At RunFullDisplayPipe+2103, objc_msgSend is called as [device isRemovable].
+	// On spoofed RPL/ADL the receiver (from rbp-0x490) is an __NSCFNumber, not a real
+	// display device — causing NSInvalidArgumentException / WindowServer crash loop.
+	// Fix: replace the 6-byte call with xor eax,eax (returns 0 = not removable = built-in).
+	// The built-in eDP display IS non-removable, so this is semantically correct.
+	// Pattern is unique (1 match) at offset +0xC5F62 in CoreDisplay 14.7.1 __TEXT.
+	static const uint8_t f_isrm_guard_sonoma[] = {
+		0x48,0x8b,0x35,0xc7,0xf3,0x07,0x3e,  // mov rsi,[rip+...] (isRemovable selector)
+		0x48,0x8b,0xbd,0x70,0xfb,0xff,0xff,  // mov rdi,[rbp-0x490] (receiver = NSNumber)
+		0xff,0x15,0xa2,0xa8,0x8d,0x3f,       // call [rip+...] (objc_msgSend)
+		0x84,0xc0                             // test al, al
+	};
+	static const uint8_t r_isrm_guard_sonoma[] = {
+		0x48,0x8b,0x35,0xc7,0xf3,0x07,0x3e,  // (keep: selector load)
+		0x48,0x8b,0xbd,0x70,0xfb,0xff,0xff,  // (keep: receiver load)
+		0x31,0xc0,0x90,0x90,0x90,0x90,       // xor eax,eax; nop×4 (return 0, no msgSend)
+		0x84,0xc0                             // (keep: test al,al)
+	};
 
 	if (getKernelVersion() >= KernelVersion::Ventura) {
 		const bool isRealTGL = NGreen::callback && NGreen::callback->isRealTGL;
@@ -212,6 +232,11 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 				{f_getmtlcq_sonoma, r_getmtlcq_sonoma, "GetMTLCommandQueue return NULL (Sonoma)"},
 			};
 			DYLDPatch::applyAll(getMtlCommandQueueSafetyPatch, const_cast<void *>(data), PAGE_SIZE);
+
+			const DYLDPatch isRemovableGuardPatch[] = {
+				{f_isrm_guard_sonoma, r_isrm_guard_sonoma, "RunFullDisplayPipe isRemovable crash guard (Sonoma)"},
+			};
+			DYLDPatch::applyAll(isRemovableGuardPatch, const_cast<void *>(data), PAGE_SIZE);
 		}
 	}
 }
