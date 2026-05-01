@@ -925,6 +925,19 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		SYSLOG("ngreen", "V165: HW accelerator symbols routed OK");
 
 		{
+			// Route IntelAccelerator::start when available so Gen11::start diagnostics run.
+			// Keep this non-fatal because symbol names vary between Sonoma builds.
+			RouteRequestPlus startRoute[] = {
+				{"__ZN16IntelAccelerator5startEP9IOService", start, this->ostart},
+			};
+			if (RouteRequestPlus::routeAll(patcher, index, startRoute, address, size)) {
+				SYSLOG("ngreen", "V44: Hooked IntelAccelerator::start");
+			} else {
+				SYSLOG("ngreen", "V44: IntelAccelerator::start symbol not found; Gen11::start logs unavailable on this build");
+			}
+		}
+
+		{
 			// loadGuCBinary: always route — WEG's firmware path is Mojave-gated and dead on Sonoma.
 			// Without this hook, no GuC binary loads at all in coexist mode → ring dead.
 			RouteRequestPlus firmwareRoute[] = {
@@ -3126,7 +3139,6 @@ void Gen11::v54IrqWatchdog(thread_call_param_t param0, thread_call_param_t) {
 }
 
 // V44: Bundle/property logging disabled — commented out to reduce boot-time overhead.
-// Uncomment to re-enable delayed bundle property diagnostics.
 #if 0
 static const char *v44SafeCString(OSString *str) {
     if (!str) {
