@@ -202,6 +202,8 @@ static int getV142SubmitBlitMode() {
 	return 1;
 }
 
+// Allow the risky original submitBlit path on spoofed CPUs only when the user
+// explicitly asks for mode 3, either through ngreenV142=3 or the legacy force flags.
 static bool isUnsafeV142OrigAllowedOnSpoof() {
 	int parsed = 0;
 	if (PE_parse_boot_argn("ngreenV142", &parsed, sizeof(parsed))) {
@@ -218,6 +220,42 @@ static bool isUnsafeV142OrigAllowedOnSpoof() {
 	}
 
 	return checkKernelArgument("-ngreenV142forceorig");
+}
+
+static int getResolvedV142SubmitBlitMode(const char *tag, bool isEarlyPhase) {
+	int mode = getV142SubmitBlitMode();
+
+	switch (mode) {
+		case 3:
+			if (!isUnsafeV142OrigAllowedOnSpoof()) {
+				static bool clampLogged = false;
+				if (!clampLogged) {
+					clampLogged = true;
+					SYSLOG("ngreen", "%s: clamped unsafe submitBlit mode=3 to mode=1 on spoofed CPU (use -ngreenV142forceorig to allow)", tag);
+				}
+				mode = 1;
+			}
+			break;
+		case 2:
+		case 1:
+		case 0:
+			break;
+		default:
+			mode = 1;
+			break;
+	}
+
+	static int lastLoggedMode = -99;
+	if (lastLoggedMode != mode) {
+		lastLoggedMode = mode;
+		if (isEarlyPhase) {
+			SYSLOG("ngreen", "V186: early submitBlit spoof mode=%d (0=unsupported,1=ret0,2=ret1,3=orig)", mode);
+		} else {
+			SYSLOG("ngreen", "V142: submitBlit spoof mode=%d (0=hard-unsupported,1=ret0,2=ret1,3=orig)", mode);
+		}
+	}
+
+	return mode;
 }
 
 static bool isV88ScanoutFillEnabled() {
@@ -5842,22 +5880,15 @@ uint32_t Gen11::submitBlit(void *that, void *param_1, void *param_2, void *param
 	// task+0x298 and can poison task lifetime on some boots, later crashing in
 	// IGAccelTask::release from the garbage collector interrupt path.
 	if (!NGreen::callback->isRealTGL) {
-		static int v186Mode = -1;
-		if (v186Mode < 0) {
-			v186Mode = getV142SubmitBlitMode();
-			if (v186Mode == 3 && !isUnsafeV142OrigAllowedOnSpoof()) {
-				v186Mode = 1;
-				SYSLOG("ngreen", "V186: clamped unsafe submitBlit mode=3 to mode=1 on spoofed CPU (use -ngreenV142forceorig to allow)");
-			}
-			SYSLOG("ngreen", "V186: early submitBlit spoof mode=%d (0=unsupported,1=ret0,2=ret1,3=orig)", v186Mode);
-		}
-
-		if (v186Mode != 3) {
-			if (v186Mode == 2)
+		switch (getResolvedV142SubmitBlitMode("V186", true)) {
+			case 3:
+				break;
+			case 2:
 				return 1;
-			if (v186Mode == 1)
+			case 1:
 				return 0;
-			return static_cast<uint32_t>(kIOReturnUnsupported);
+			default:
+				return static_cast<uint32_t>(kIOReturnUnsupported);
 		}
 	}
 
@@ -5994,16 +6025,7 @@ uint32_t Gen11::submitBlit(void *that, void *param_1, void *param_2, void *param
 		// Apple's original blit submit path wedging BCS. Keep original behavior by default
 		// to avoid breaking the renderer, but provide an explicit no-log test switch for
 		// spoofed RPL boots when we need to prove the hang is inside submitBlit itself.
-		static int v142Mode = -1;
-		if (v142Mode < 0) {
-			v142Mode = getV142SubmitBlitMode();
-			if (v142Mode == 3 && !isUnsafeV142OrigAllowedOnSpoof()) {
-				v142Mode = 1;
-				SYSLOG("ngreen", "V142: clamped unsafe submitBlit mode=3 to mode=1 on spoofed CPU (use -ngreenV142forceorig to allow)");
-			}
-			SYSLOG("ngreen", "V142: submitBlit spoof mode=%d (0=hard-unsupported,1=ret0,2=ret1,3=orig)", v142Mode);
-		}
-
+		int v142Mode = getResolvedV142SubmitBlitMode("V142", false);
 		if (v142Mode != 3) {
 			static int v142Count = 0;
 			if (v142Count < 24) {
