@@ -202,15 +202,6 @@ static int getV142SubmitBlitMode() {
 	return 1;
 }
 
-static bool isUnsafeV142OrigAllowedOnSpoof() {
-	int enabled = 0;
-	if (PE_parse_boot_argn("ngreenV142forceorig", &enabled, sizeof(enabled))) {
-		return enabled != 0;
-	}
-
-	return checkKernelArgument("-ngreenV142forceorig");
-}
-
 static bool isV88ScanoutFillEnabled() {
 	int enabled = 0;
 	if (PE_parse_boot_argn("ngreenv88", &enabled, sizeof(enabled))) {
@@ -5836,10 +5827,6 @@ uint32_t Gen11::submitBlit(void *that, void *param_1, void *param_2, void *param
 		static int v186Mode = -1;
 		if (v186Mode < 0) {
 			v186Mode = getV142SubmitBlitMode();
-			if (v186Mode == 3 && !isUnsafeV142OrigAllowedOnSpoof()) {
-				v186Mode = 1;
-				SYSLOG("ngreen", "V186: clamped unsafe submitBlit mode=3 to mode=1 on spoofed CPU (use -ngreenV142forceorig to allow)");
-			}
 			SYSLOG("ngreen", "V186: early submitBlit spoof mode=%d (0=unsupported,1=ret0,2=ret1,3=orig)", v186Mode);
 		}
 
@@ -5988,10 +5975,6 @@ uint32_t Gen11::submitBlit(void *that, void *param_1, void *param_2, void *param
 		static int v142Mode = -1;
 		if (v142Mode < 0) {
 			v142Mode = getV142SubmitBlitMode();
-			if (v142Mode == 3 && !isUnsafeV142OrigAllowedOnSpoof()) {
-				v142Mode = 1;
-				SYSLOG("ngreen", "V142: clamped unsafe submitBlit mode=3 to mode=1 on spoofed CPU (use -ngreenV142forceorig to allow)");
-			}
 			SYSLOG("ngreen", "V142: submitBlit spoof mode=%d (0=hard-unsupported,1=ret0,2=ret1,3=orig)", v142Mode);
 		}
 
