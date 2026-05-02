@@ -202,6 +202,15 @@ static int getV142SubmitBlitMode() {
 	return 1;
 }
 
+static bool isV142Diag2DBypassEnabled() {
+	int enabled = 0;
+	if (PE_parse_boot_argn("ngreenV142diag2d", &enabled, sizeof(enabled))) {
+		return enabled != 0;
+	}
+
+	return checkKernelArgument("-ngreenV142diag2d");
+}
+
 static bool isV88ScanoutFillEnabled() {
 	int enabled = 0;
 	if (PE_parse_boot_argn("ngreenv88", &enabled, sizeof(enabled))) {
@@ -5818,6 +5827,12 @@ void * Gen11::getBlit3DContext(void *that,bool param_1)
 	return nullptr;
 }
 
+// submitBlit controls early screen bring-up and compositor blits.
+// On spoofed non-TGL we use the decompiled control split encoded in blit[0xA2] bits[4:3]:
+//   routeSel 0..2 -> 2D leg (unsafe on RPL due unchecked ctx+0xB8 deref in Apple's path), so bypass.
+//   routeSel 3    -> 3D leg, pass through to Apple's original submitBlit.
+// This policy is active only when mode=3 (orig). Modes 0/1/2 keep explicit diagnostic bypass behavior.
+// Real TGL must remain untouched.
 uint32_t Gen11::submitBlit(void *that, void *param_1, void *param_2, void *param_3, bool param_4) {
 	// V186: For spoofed non-TGL, if V142 is configured to bypass submitBlit,
 	// return before any task/context touching logic. The V149/V171 path writes
@@ -5831,6 +5846,21 @@ uint32_t Gen11::submitBlit(void *that, void *param_1, void *param_2, void *param
 		}
 
 		if (v186Mode != 3) {
+			if (isV142Diag2DBypassEnabled() && param_1) {
+				auto *blit = reinterpret_cast<uint8_t *>(param_1);
+				const bool has3DFlags =
+					((blit[0x3C] & 1U) != 0) ||
+					((blit[0x84] & 1U) != 0) ||
+					(*reinterpret_cast<uint64_t *>(blit + 0x20) != 0) ||
+					(*reinterpret_cast<uint64_t *>(blit + 0x68) != 0);
+				const uint32_t routeSel = (blit[0xA2] >> 3U) & 0x3U;
+				static int v186DiagCount = 0;
+				if (v186DiagCount < 64) {
+					v186DiagCount++;
+					SYSLOG("ngreen", "V186D[%d]: mode=%d routeSel=%u has3D=%d task=%p",
+					       v186DiagCount, v186Mode, routeSel, (int)has3DFlags, param_3);
+				}
+			}
 			if (v186Mode == 2)
 				return 1;
 			if (v186Mode == 1)
@@ -5923,19 +5953,17 @@ uint32_t Gen11::submitBlit(void *that, void *param_1, void *param_2, void *param
 			int parsed = 0;
 			if (!NGreen::callback->isRealTGL) {
 				// V120 modes for spoofed path:
-				//   ngreenV120=0 or -ngreenV120ok   -> return success (legacy behavior)
+				//   else -> return success (legacy behavior) 
 				//   ngreenV120=1 or -ngreenV120fail -> return unsupported (default)
 				//   ngreenV120=2 or -ngreenV120pass -> return 1
 				if (PE_parse_boot_argn("ngreenV120", &parsed, sizeof(parsed))) {
 					v120Mode = parsed;
 				} else if (checkKernelArgument("-ngreenV120pass")) {
 					v120Mode = 2;
-				} else if (checkKernelArgument("-ngreenV120ok")) {
-					v120Mode = 0;
 				} else if (checkKernelArgument("-ngreenV120fail")) {
 					v120Mode = 1;
 				} else {
-					v120Mode = 1;
+					v120Mode = 0;
 				}
 			} else {
 				v120Mode = 0;
@@ -5978,9 +6006,26 @@ uint32_t Gen11::submitBlit(void *that, void *param_1, void *param_2, void *param
 			SYSLOG("ngreen", "V142: submitBlit spoof mode=%d (0=hard-unsupported,1=ret0,2=ret1,3=orig)", v142Mode);
 		}
 
+		if (isV142Diag2DBypassEnabled() && param_1) {
+			auto *blit = reinterpret_cast<uint8_t *>(param_1);
+			const bool has3DFlags =
+				((blit[0x3C] & 1U) != 0) ||
+				((blit[0x84] & 1U) != 0) ||
+				(*reinterpret_cast<uint64_t *>(blit + 0x20) != 0) ||
+				(*reinterpret_cast<uint64_t *>(blit + 0x68) != 0);
+
+			const uint32_t routeSel = (blit[0xA2] >> 3U) & 0x3U;
+			static int v142Diag2DCount = 0;
+			if (v142Diag2DCount < 64) {
+				v142Diag2DCount++;
+				SYSLOG("ngreen", "V142D[%d]: mode=%d routeSel=%u has3D=%d task=%p",
+				       v142Diag2DCount, v142Mode, routeSel, (int)has3DFlags, param_3);
+			}
+		}
+
 		if (v142Mode != 3) {
 			static int v142Count = 0;
-			if (v142Count < 24) {
+			if (v142Count > 2 && v142Count < 24) {
 				v142Count++;
 				SYSLOG("ngreen", "V142[%d]: bypass submitBlit acc=%p p1=%p p2=%p task=%p b=%u mode=%d",
 				       v142Count, that, param_1, param_2, param_3, static_cast<unsigned>(param_4), v142Mode);
