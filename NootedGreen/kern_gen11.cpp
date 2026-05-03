@@ -5890,6 +5890,26 @@ uint32_t Gen11::submitBlit(void *that, void *param_1, void *param_2, void *param
 		}
 	}
 
+	// V193: On !isRealTGL (RPL spoof), block routeSel=3 before calling Apple's submitBlit.
+	// routeSel=3 routes to blit3d_submit_commands which executes TGL-compiled EU shaders
+	// from the scratch buffer. RPL has a different EU topology — the shader unit stalls
+	// (INSTDONE_1 bit clear), RCS hangs inside the batch at BB_ADDR, BCS then deadlocks
+	// on a MI_SEMAPHORE_WAIT for the value RCS never writes → Sig 803 GPU reset loop.
+	// Side effect: cursor sprite (which uses routeSel=3) becomes invisible — acceptable
+	// vs. a hard GPU hang every ~15s.
+	if (!NGreen::callback->isRealTGL && param_1) {
+		auto *blit193 = reinterpret_cast<uint8_t *>(param_1);
+		const uint32_t routeSel193 = (blit193[0xA2] >> 3U) & 0x3U;
+		if (routeSel193 == 3) {
+			static int v193Count = 0;
+			if (v193Count < 32) {
+				v193Count++;
+				SYSLOG("ngreen", "V193[%d]: blocked routeSel=3 on RPL (TGL EU shader → RCS hang)", v193Count);
+			}
+			return 1;
+		}
+	}
+
 	// Safety guard: avoid null indirect call if route capture failed.
 	if (!callback->osubmitBlit) {
 		static bool v134Logged = false;
