@@ -142,7 +142,7 @@ static bool isDisplayPipeForceDisabled() {
 		return true;
 	}
 
-	SYSLOG("ngreen", "V78A: default native DisplayPipeSupported (dp1 default ON)");
+	SYSLOG("ngreen", "V78A: default native DisplayPipeSupported ON (GPU display pipe active — use -ngreendp0 to fall back to CPU path)");
 	return false;
 }
 
@@ -724,9 +724,12 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				// f13b: mandatory. Without this bypass AppleIntelPort::probePortStateEv hits
 				// a pure-virtual call and panics in WindowServer during enableController.
 				{activeKext, f13b, r13b, arrsize(f13b),	1},
-				// f15: optional. Left disabled to preserve the minimum patch set until a boot with
-				// valid AAPL,ig-platform-id proves that this extra probe-path bypass is needed.
-				//{activeKext, f15, r15, arrsize(f15),	1},
+				// f15: suppress getPathByPipe log flood at IGLogLevel=8.
+				// On platform 0x9a490000 all paths are on pipe 0; every scan cycle logs
+				// "pipe = 0" many times per second, flooding the log unreadably.
+				// The je→jmp makes the branch unconditionally skip the IGFB log emit.
+				// Purely cosmetic: no behavioral change, no display-pipe impact.
+				{activeKext, f15, r15, arrsize(f15),	1},
 				//{activeKext, f16, r16, arrsize(f16),	1},
 				//{activeKext, f19, r19, arrsize(f19),	1},
 			//	{activeKext, f20, r20, arrsize(f20),	1},
@@ -5618,15 +5621,15 @@ void Gen11::hwInitializeCState(void *that)
 		// We write 0 to leave transport in idle; Apple driver will set this during link train.
 		// (Do NOT force-set TP_CTL here — Apple's link training sequence owns this register.)
 
-// Panel power sequencer.
-                // TGL/ADL-P both have PCH_SPLIT (ICP/TGP PCH) → intel_pps_setup sets
-                // mmio_base = PCH_PPS_BASE = 0xC7200 (not 0x61200 which is BXT/APL).
-                // PPS register layout: PP_STATUS=+0, PP_CONTROL=+4, PP_ON_DELAYS=+8, PP_OFF_DELAYS=+C
-                // Values from Linux intel_reg dump on this hardware (reg_dump.txt):
-                //   0xC7204 (PP_CONTROL)   = 0x00000067 (panel on, VDD on, power-on target)
-                //   0xC7208 (PP_ON_DELAYS) = 0x07D00001 (T1=1, T3=2000ms power-on delays)
-                NGreen::callback->writeReg32(0xC7204, 0x00000067); // PP_CONTROL
-                NGreen::callback->writeReg32(0xC7208, 0x07D00001); // PP_ON_DELAYS
+		// Panel power sequencer.
+		// TGL/ADL-P both have PCH_SPLIT (ICP/TGP PCH) → intel_pps_setup sets
+		// mmio_base = PCH_PPS_BASE = 0xC7200 (not 0x61200 which is BXT/APL).
+		// PPS register layout: PP_STATUS=+0, PP_CONTROL=+4, PP_ON_DELAYS=+8, PP_OFF_DELAYS=+C
+		// Values from Linux intel_reg dump on this hardware (reg_dump.txt):
+		//   0xC7204 (PP_CONTROL)   = 0x00000067 (panel on, VDD on, power-on target)
+		//   0xC7208 (PP_ON_DELAYS) = 0x07D00001 (T1=1, T3=2000ms power-on delays)
+		NGreen::callback->writeReg32(0xC7204, 0x00000067); // PP_CONTROL
+		NGreen::callback->writeReg32(0xC7208, 0x07D00001); // PP_ON_DELAYS
 
 		// PIPE_CLK_SEL_A (0x46140) = 0x10000000: no explicit clock source (eDP uses internal)
 		NGreen::callback->writeReg32(0x46140, 0x10000000); // PIPE_CLK_SEL_A
@@ -5635,13 +5638,13 @@ void Gen11::hwInitializeCState(void *that)
 		NGreen::callback->writeReg32(0x45520, 2); // DC_STATE_DEBUG
 		SYSLOG("ngreen", "hwInitCState: ADL-P DMC loaded");
 		// Program ADL-P combo PHY signal levels — PHY_A (eDP) + PHY_B (DP-B).
-                // Uses ADL-P specific translation tables (adlp_combo_phy_trans_dp_hbr/hbr2).
-                // TC ports C-F are DKL PHY — not programmed here.
-                {
-                        uint8_t swing[4]   = {0, 0, 0, 0};
-                        uint8_t preEmph[4] = {0, 0, 0, 0};
-                        IntelDPLinkTraining::setSignalLevelsADLP(/*phy=*/0, /*lanes=*/4, /*isHBR2=*/false, /*isEDP=*/true,  swing, preEmph);
-                        IntelDPLinkTraining::setSignalLevelsADLP(/*phy=*/1, /*lanes=*/4, /*isHBR2=*/false, /*isEDP=*/false, swing, preEmph);
+		// Uses ADL-P specific translation tables (adlp_combo_phy_trans_dp_hbr/hbr2).
+		// TC ports C-F are DKL PHY — not programmed here.
+		{
+				uint8_t swing[4]   = {0, 0, 0, 0};
+				uint8_t preEmph[4] = {0, 0, 0, 0};
+				IntelDPLinkTraining::setSignalLevelsADLP(/*phy=*/0, /*lanes=*/4, /*isHBR2=*/false, /*isEDP=*/true,  swing, preEmph);
+				IntelDPLinkTraining::setSignalLevelsADLP(/*phy=*/1, /*lanes=*/4, /*isHBR2=*/false, /*isEDP=*/false, swing, preEmph);
 		}
 
 	} else if (dmcArg[0] == 'i' || dmcArg[0] == 'I') {
