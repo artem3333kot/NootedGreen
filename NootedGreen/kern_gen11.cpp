@@ -4,6 +4,7 @@
 #include <Headers/kern_api.hpp>
 #include "kern_genx.hpp"
 #include "kern_green.hpp"
+#include "IntelDPLinkTraining.hpp"
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOCatalogue.h>
 #include <kern/thread_call.h>
@@ -5467,7 +5468,10 @@ void Gen11::hwInitializeCState(void *that)
 	// Boot-arg "ngreen-dmc":
 	//   not set or "skip" → safe fallback: passthrough original + AUX only (proven working)
 	//   "tgl"             → load TGL DMC v2.12 blob + TGL display engine registers
+	//                       + ICL/TGL combo PHY signal levels (PHY_A eDP, PHY_B DP)
 	//   "adlp"            → load ADL-P DMC v2.16 blob + ADL-P display engine registers
+	//                       + combo PHY signal levels (PHY_A eDP)
+	//   "icl"             → passthrough original ICL DMC load + ICL combo PHY signal levels
 	char dmcArg[16] = {};
 	PE_parse_boot_argn("ngreen-dmc", dmcArg, sizeof(dmcArg));
 
@@ -5481,13 +5485,34 @@ void Gen11::hwInitializeCState(void *that)
 		for (unsigned long off = 0; off < tgl_dmc_ver2_12_bin_s; off += 4)
 			FastWriteRegister32(ccont, off + 0x80000,
 				*(const uint32_t *)((const char *)tgl_dmc_ver2_12_bin + off));
-		// TGL display engine registers
+
+		// Disable DC states before touching display engine registers (same as ADL-P path).
+		// DC_STATE_EN = 0x45504
+		NGreen::callback->writeReg32(DC_STATE_EN, 0);
+
+		// Power wells — ICL-style DDI/AUX enable for TGL (same register layout)
+		NGreen::callback->writeReg32(0x45400, 0x00000401); // HSW_PWR_WELL_CTL1
+		NGreen::callback->writeReg32(0x45404, 0x00000C03); // HSW_PWR_WELL_CTL2
+		NGreen::callback->writeReg32(0x45440, 0x00000003); // ICL_PWR_WELL_CTL_AUX1 — AUX A
+		NGreen::callback->writeReg32(0x45444, 0x00000003); // ICL_PWR_WELL_CTL_AUX2 — AUX B
+		NGreen::callback->writeReg32(0x45450, 0x00000003); // ICL_PWR_WELL_CTL_DDI1 — DDI A
+		NGreen::callback->writeReg32(0x45454, 0x00000003); // ICL_PWR_WELL_CTL_DDI2 — DDI B
+
+		// TGL display engine registers (DMC trigger/context regs in 0x8Fxxx range)
 		NGreen::callback->writeReg32(0x8F074, 0x00006FC0);
 		NGreen::callback->writeReg32(0x8F004, 0x00A40088);
 		NGreen::callback->writeReg32(0x8F034, 0xC003B400);
-		// Enable DMC
-		NGreen::callback->writeReg32(0x45520, 2);
+
+		// Enable DMC — DC_STATE_DEBUG (0x45520) = 2
+		NGreen::callback->writeReg32(0x45520, 2); // DC_STATE_DEBUG
 		SYSLOG("ngreen", "hwInitCState: TGL DMC loaded");
+		// Program combo PHY signal levels — PHY_A (eDP, 4 lanes, HBR) + PHY_B (DP-B, 4 lanes, HBR)
+		{
+			uint8_t swing[4]   = {0, 0, 0, 0};
+			uint8_t preEmph[4] = {0, 0, 0, 0};
+			IntelDPLinkTraining::setSignalLevels(/*phy=*/0, /*lanes=*/4, /*isHBR2=*/false, /*isDP=*/true, swing, preEmph);
+			IntelDPLinkTraining::setSignalLevels(/*phy=*/1, /*lanes=*/4, /*isHBR2=*/false, /*isDP=*/true, swing, preEmph);
+		}
 
 	} else if (dmcArg[0] == 'a' || dmcArg[0] == 'A') {
 		// ── ADL-P DMC ──
@@ -5499,15 +5524,38 @@ void Gen11::hwInitializeCState(void *that)
 		for (unsigned long off = 0; off < adlp_dmc_ver2_16_bin_s; off += 4)
 			FastWriteRegister32(ccont, off + 0x80000,
 				*(const uint32_t *)((const char *)adlp_dmc_ver2_16_bin + off));
+
+		// Disable DC states before touching display engine registers.
+		// If DC5/DC6 is active when we write, the clock-gated blocks won't latch the writes.
+		// DC_STATE_EN = 0x45504 (confirmed: Archive HIGH, linux display/intel_display_regs.h)
+		NGreen::callback->writeReg32(DC_STATE_EN, 0);
+
+		// Power wells — Gen12 ICL-style DDI + AUX power well enable.
+		// HSW_PWR_WELL_CTL1/2 (0x45400/45404): PG1/PG2 enable+state — values read from
+		// Linux intel_reg dump on same hardware (reg_dump.txt):
+		//   CTL1=0x00000401 (PG1 req+enabled), CTL2=0x00000C03 (PG1+PG2 req+enabled)
+		//   CTL3=0x40000000 (PG3 state only), CTL4=0x00000401
+		NGreen::callback->writeReg32(0x45400, 0x00000401); // HSW_PWR_WELL_CTL1
+		NGreen::callback->writeReg32(0x45404, 0x00000C03); // HSW_PWR_WELL_CTL2
+		NGreen::callback->writeReg32(0x45408, 0x40000000); // HSW_PWR_WELL_CTL3
+		NGreen::callback->writeReg32(0x4540C, 0x00000401); // HSW_PWR_WELL_CTL4
+		// ICL_PWR_WELL_CTL_AUX1/2 (0x45440/45444): enable AUX power wells A+B
+		// bit1=req, bit0=enabled per ICL DDI power well HW spec (intel_display_regs.h)
+		NGreen::callback->writeReg32(0x45440, 0x00000003); // ICL_PWR_WELL_CTL_AUX1 — AUX A enabled
+		NGreen::callback->writeReg32(0x45444, 0x00000003); // ICL_PWR_WELL_CTL_AUX2 — AUX B enabled
+		// ICL_PWR_WELL_CTL_DDI1/2 (0x45450/45454): enable DDI power wells A+B
+		NGreen::callback->writeReg32(0x45450, 0x00000003); // ICL_PWR_WELL_CTL_DDI1 — DDI A enabled
+		NGreen::callback->writeReg32(0x45454, 0x00000003); // ICL_PWR_WELL_CTL_DDI2 — DDI B enabled
+
 		// ADL-P / RPL-P display engine registers
-		// DDI A+B (Gen12 / Gen13 shared combo PHY)
+		// DDI A+B (Gen12 / Gen13 shared combo PHY — 0x8Fxxx range)
 		NGreen::callback->writeReg32(0x8F074, 0x00086FC0);
 		NGreen::callback->writeReg32(0x8F034, 0xC003B400);
 		NGreen::callback->writeReg32(0x8F004, 0x01240108);
 		NGreen::callback->writeReg32(0x8F008, 0x512050D4);
 		NGreen::callback->writeReg32(0x8F03C, 0xC003B300);
 		NGreen::callback->writeReg32(0x8F00C, 0x584C57FC);
-		// DDI C-F (ADL-P TC port registers)
+		// DDI C-F (ADL-P TC port registers — DKL PHY, 0x5Fxxx range)
 		NGreen::callback->writeReg32(0x5F074, 0x00096FC0);
 		NGreen::callback->writeReg32(0x5F034, 0xC003DF00);
 		NGreen::callback->writeReg32(0x5F004, 0x214C2114);
@@ -5535,31 +5583,81 @@ void Gen11::hwInitializeCState(void *that)
 		NGreen::callback->writeReg32(0x5FC0C, 0x95209408);
 		NGreen::callback->writeReg32(0x5FC40, 0xC0033100);
 		NGreen::callback->writeReg32(0x5FC10, 0x980497D8);
-		// CDClk / DPLL PLL coefficients
-		NGreen::callback->writeReg32(0x60400, 0x8A000006);
-		NGreen::callback->writeReg32(0x60000, 0x0A9F09FF);
-		NGreen::callback->writeReg32(0x60004, 0x0A9F09FF);
-		NGreen::callback->writeReg32(0x60008, 0x0A4F0A2F);
-		NGreen::callback->writeReg32(0x6000C, 0x06D5063F);
-		NGreen::callback->writeReg32(0x60010, 0x06D50000);
-		NGreen::callback->writeReg32(0x60014, 0x06480642);
-		NGreen::callback->writeReg32(0x60028, 0x00000000);
-		NGreen::callback->writeReg32(0x60030, 0x7E5D159E);
-		NGreen::callback->writeReg32(0x60034, 0x00800000);
-		NGreen::callback->writeReg32(0x60040, 0x0007C1CD);
-		NGreen::callback->writeReg32(0x60044, 0x00080000);
-		// Panel power sequencer
-		NGreen::callback->writeReg32(0x61204, 0x00000067);
-		NGreen::callback->writeReg32(0x61208, 0x07D00001);
-		// South display engine / PCH
-		NGreen::callback->writeReg32(0x46140, 0x10000000);
-		NGreen::callback->writeReg32(0x45400, 0x00000401);
-		NGreen::callback->writeReg32(0x45404, 0x00000C03);
-		NGreen::callback->writeReg32(0x45408, 0x40000000);
-		NGreen::callback->writeReg32(0x4540C, 0x00000401);
-		// Enable DMC
-		NGreen::callback->writeReg32(0x45520, 2);
+
+		// Transcoder A DDI function + timing registers.
+		// These are TRANSCODER registers (Archive confirmed HIGH confidence):
+		//   0x60400 = TRANS_DDI_FUNC_CTL_A  — DDI A enabled, DP SST, 8bpc, x4
+		//   0x60000 = TRANS_HTOTAL_A        — 2560 active, 2720 total (from reg_dump.txt)
+		//   0x60004 = TRANS_HBLANK_A        — same as HTOTAL on eDP
+		//   0x60008 = TRANS_HSYNC_A         — sync positions
+		//   0x6000C = TRANS_VTOTAL_A        — 1600 active, 1750 total
+		//   0x60010 = TRANS_VBLANK_A
+		//   0x60014 = TRANS_VSYNC_A
+		//   0x60028 = TRANS_VSYNCSHIFT_A
+		//   0x60030 = TRANS_DATA_M1_A       — DP M/N values (TU 64, link rate)
+		//   0x60034 = TRANS_DATA_N1_A
+		//   0x60040 = TRANS_LINK_M1_A
+		//   0x60044 = TRANS_LINK_N1_A
+		// Values sourced from Linux intel_reg dump on the same hardware.
+		NGreen::callback->writeReg32(0x60400, 0x8A000006); // TRANS_DDI_FUNC_CTL_A
+		NGreen::callback->writeReg32(0x60000, 0x0A9F09FF); // TRANS_HTOTAL_A
+		NGreen::callback->writeReg32(0x60004, 0x0A9F09FF); // TRANS_HBLANK_A
+		NGreen::callback->writeReg32(0x60008, 0x0A4F0A2F); // TRANS_HSYNC_A
+		NGreen::callback->writeReg32(0x6000C, 0x06D5063F); // TRANS_VTOTAL_A
+		NGreen::callback->writeReg32(0x60010, 0x06D50000); // TRANS_VBLANK_A
+		NGreen::callback->writeReg32(0x60014, 0x06480642); // TRANS_VSYNC_A
+		NGreen::callback->writeReg32(0x60028, 0x00000000); // TRANS_VSYNCSHIFT_A
+		NGreen::callback->writeReg32(0x60030, 0x7E5D159E); // TRANS_DATA_M1_A  (TU 64, M=0x5d159e)
+		NGreen::callback->writeReg32(0x60034, 0x00800000); // TRANS_DATA_N1_A  (N=0x800000)
+		NGreen::callback->writeReg32(0x60040, 0x0007C1CD); // TRANS_LINK_M1_A  (M=0x7c1cd)
+		NGreen::callback->writeReg32(0x60044, 0x00080000); // TRANS_LINK_N1_A  (N=0x80000)
+
+		// TGL_DP_TP_CTL_A (0x60540) — enable DP transport, normal mode, SST
+		// Linux: intel_ddi_enable_dp sets TP_CTL before link training. Value from i915 for
+		// a 4-lane HBR DP SST link in TPS1: bit31=TX_START, bit10=TP1, bit8=SST
+		// We write 0 to leave transport in idle; Apple driver will set this during link train.
+		// (Do NOT force-set TP_CTL here — Apple's link training sequence owns this register.)
+
+// Panel power sequencer.
+                // TGL/ADL-P both have PCH_SPLIT (ICP/TGP PCH) → intel_pps_setup sets
+                // mmio_base = PCH_PPS_BASE = 0xC7200 (not 0x61200 which is BXT/APL).
+                // PPS register layout: PP_STATUS=+0, PP_CONTROL=+4, PP_ON_DELAYS=+8, PP_OFF_DELAYS=+C
+                // Values from Linux intel_reg dump on this hardware (reg_dump.txt):
+                //   0xC7204 (PP_CONTROL)   = 0x00000067 (panel on, VDD on, power-on target)
+                //   0xC7208 (PP_ON_DELAYS) = 0x07D00001 (T1=1, T3=2000ms power-on delays)
+                NGreen::callback->writeReg32(0xC7204, 0x00000067); // PP_CONTROL
+                NGreen::callback->writeReg32(0xC7208, 0x07D00001); // PP_ON_DELAYS
+
+		// PIPE_CLK_SEL_A (0x46140) = 0x10000000: no explicit clock source (eDP uses internal)
+		NGreen::callback->writeReg32(0x46140, 0x10000000); // PIPE_CLK_SEL_A
+
+		// Enable DMC — DC_STATE_DEBUG (0x45520) = 2
+		NGreen::callback->writeReg32(0x45520, 2); // DC_STATE_DEBUG
 		SYSLOG("ngreen", "hwInitCState: ADL-P DMC loaded");
+		// Program ADL-P combo PHY signal levels — PHY_A (eDP) + PHY_B (DP-B).
+                // Uses ADL-P specific translation tables (adlp_combo_phy_trans_dp_hbr/hbr2).
+                // TC ports C-F are DKL PHY — not programmed here.
+                {
+                        uint8_t swing[4]   = {0, 0, 0, 0};
+                        uint8_t preEmph[4] = {0, 0, 0, 0};
+                        IntelDPLinkTraining::setSignalLevelsADLP(/*phy=*/0, /*lanes=*/4, /*isHBR2=*/false, /*isEDP=*/true,  swing, preEmph);
+                        IntelDPLinkTraining::setSignalLevelsADLP(/*phy=*/1, /*lanes=*/4, /*isHBR2=*/false, /*isEDP=*/false, swing, preEmph);
+		}
+
+	} else if (dmcArg[0] == 'i' || dmcArg[0] == 'I') {
+		// ── ICL ──
+		// ICL is the native target: let original hwInitializeCState load the ICL DMC blob,
+		// then program ICL combo PHY signal levels (same DW2/4/5/7 layout as TGL).
+		SYSLOG("ngreen", "hwInitCState: ngreen-dmc=icl, passthrough + ICL combo PHY signal levels");
+		FunctionCast(hwInitializeCState, callback->ohwInitializeCState)(that);
+		// Program combo PHY signal levels — PHY_A (eDP, 4 lanes, HBR) + PHY_B (DP-B, 4 lanes, HBR)
+		{
+			uint8_t swing[4]   = {0, 0, 0, 0};
+			uint8_t preEmph[4] = {0, 0, 0, 0};
+			IntelDPLinkTraining::setSignalLevels(/*phy=*/0, /*lanes=*/4, /*isHBR2=*/false, /*isDP=*/true, swing, preEmph);
+			IntelDPLinkTraining::setSignalLevels(/*phy=*/1, /*lanes=*/4, /*isHBR2=*/false, /*isDP=*/true, swing, preEmph);
+		}
+		SYSLOG("ngreen", "hwInitCState: ICL done");
 
 	} else {
 		// ── skip (default, safe fallback) ──
@@ -7110,105 +7208,126 @@ uint8_t Gen11::connectionChanged(void *that)
 unsigned long  Gen11::allocateDisplayResources(void *that)
 {
 	auto ret=FunctionCast(allocateDisplayResources, callback->oallocateDisplayResources)(that);
-	
-	//icl_display_core_init
-	NGreen::callback->writeReg32(DC_STATE_EN,0);
-	
-	/* Wa_14011294188:ehl,jsl,tgl,rkl,adl-s */
-	/*if (INTEL_PCH_TYPE(dev_priv) >= PCH_TGP &&
-		INTEL_PCH_TYPE(dev_priv) < PCH_DG1)*/
-	NGreen::callback->intel_de_rmw( SOUTH_DSPCLK_GATE_D, 0,
-				 PCH_DPMGUNIT_CLOCK_GATE_DISABLE);
-	
-	uint32_t reg,reset_bits;
-	reg = HSW_NDE_RSTWRN_OPT;
-	reset_bits = RESET_PCH_HANDSHAKE_ENABLE;
-	NGreen::callback->intel_de_rmw( reg, reset_bits, reset_bits);
-	
-	//intel_cdclk_init_hw(dev_priv);
-	//gen12_dbuf_slices_config
-	NGreen::callback->intel_de_rmw(_DBUF_CTL_S1,
-				 DBUF_TRACKER_STATE_SERVICE_MASK,
-				 DBUF_TRACKER_STATE_SERVICE(8));
-	
-	NGreen::callback->intel_de_rmw(_DBUF_CTL_S2,
-				 DBUF_TRACKER_STATE_SERVICE_MASK,
-				 DBUF_TRACKER_STATE_SERVICE(8));
-	
-	//gen9_dbuf_enable(dev_priv);
-	reg = _DBUF_CTL_S1;
-	NGreen::callback->intel_de_rmw(reg, DBUF_POWER_REQUEST,
-			  DBUF_POWER_REQUEST);
-	NGreen::callback->readReg32(reg);
-	//intel_de_posting_read(dev_priv, reg);
-	IODelay(10);
-	//state = intel_de_read(dev_priv, reg) & DBUF_POWER_STATE;
-	reg = _DBUF_CTL_S2;
-	NGreen::callback->intel_de_rmw(reg, DBUF_POWER_REQUEST,
-			  DBUF_POWER_REQUEST);
-	NGreen::callback->readReg32(reg);
-	IODelay(10);
-	
-	
-	//icl_mbus_init
-	unsigned long abox_mask = GENMASK(2, 1);//DISPLAY_INFO(dev_priv)->abox_mask;
-	int config, i;
-	
-	unsigned long abox_regs=abox_mask;
-	uint32_t mask = MBUS_ABOX_BT_CREDIT_POOL1_MASK |
-		MBUS_ABOX_BT_CREDIT_POOL2_MASK |
-		MBUS_ABOX_B_CREDIT_MASK |
-		MBUS_ABOX_BW_CREDIT_MASK;
-	uint32_t val = MBUS_ABOX_BT_CREDIT_POOL1(16) |
-		MBUS_ABOX_BT_CREDIT_POOL2(16) |
-		MBUS_ABOX_B_CREDIT(1) |
-		MBUS_ABOX_BW_CREDIT(1);
 
-	//if (DISPLAY_VER(dev_priv) == 12)
-	//	abox_regs |= BIT(0);
+	if (!NGreen::callback->isRealTGL) {
+		// ADL-P / RPL-P / RPL-U (XE_LPD, Display v13).
+		// ADL-P IS XE_LPD — same display engine, same register layout.
+		// Apple's TGL driver (AppleIntelTGLGraphicsFramebuffer) does not program this
+		// hardware correctly when spoofed, so we replicate icl_display_core_init here.
 
-	for_each_set_bit(i, &abox_regs, sizeof(abox_regs))
-	NGreen::callback->intel_de_rmw( MBUS_ABOX_CTL(i), mask, val);
-	
+		//icl_display_core_init
+		NGreen::callback->writeReg32(DC_STATE_EN,0);
 
-	//tgl_bw_buddy_init
-	enum intel_dram_type type = INTEL_DRAM_DDR4;
-	uint8_t num_channels = 2; //INTEL_DRAM_DDR4
-	const struct buddy_page_mask *table=tgl_buddy_page_masks;
-	
-	
-	for (config = 0; table[config].page_mask != 0; config++)
-		if (table[config].num_channels == num_channels &&
-			table[config].type == type)
-			break;
-	
+		/* Wa_14011294188:ehl,jsl,tgl,rkl,adl-s */
+		NGreen::callback->intel_de_rmw( SOUTH_DSPCLK_GATE_D, 0,
+					 PCH_DPMGUNIT_CLOCK_GATE_DISABLE);
+
+		uint32_t reg,reset_bits;
+		reg = HSW_NDE_RSTWRN_OPT;
+		reset_bits = RESET_PCH_HANDSHAKE_ENABLE;
+		NGreen::callback->intel_de_rmw( reg, reset_bits, reset_bits);
+
+		//intel_cdclk_init_hw(dev_priv);
+		//gen12_dbuf_slices_config — XE_LPD: 4 slices (Linux syslog: dbuf slices=0xf)
+		NGreen::callback->intel_de_rmw(_DBUF_CTL_S0,
+					 DBUF_TRACKER_STATE_SERVICE_MASK,
+					 DBUF_TRACKER_STATE_SERVICE(8));
+		NGreen::callback->intel_de_rmw(_DBUF_CTL_S1,
+					 DBUF_TRACKER_STATE_SERVICE_MASK,
+					 DBUF_TRACKER_STATE_SERVICE(8));
+		NGreen::callback->intel_de_rmw(_DBUF_CTL_S2,
+					 DBUF_TRACKER_STATE_SERVICE_MASK,
+					 DBUF_TRACKER_STATE_SERVICE(8));
+		NGreen::callback->intel_de_rmw(_DBUF_CTL_S3,
+					 DBUF_TRACKER_STATE_SERVICE_MASK,
+					 DBUF_TRACKER_STATE_SERVICE(8));
+
+		//gen9_dbuf_enable(dev_priv); — enable all 4 slices
+		reg = _DBUF_CTL_S0;
+		NGreen::callback->intel_de_rmw(reg, DBUF_POWER_REQUEST,
+				  DBUF_POWER_REQUEST);
+		NGreen::callback->readReg32(reg);
+		IODelay(10);
+		reg = _DBUF_CTL_S1;
+		NGreen::callback->intel_de_rmw(reg, DBUF_POWER_REQUEST,
+				  DBUF_POWER_REQUEST);
+		NGreen::callback->readReg32(reg);
+		IODelay(10);
+		reg = _DBUF_CTL_S2;
+		NGreen::callback->intel_de_rmw(reg, DBUF_POWER_REQUEST,
+				  DBUF_POWER_REQUEST);
+		NGreen::callback->readReg32(reg);
+		IODelay(10);
+		reg = _DBUF_CTL_S3;
+		NGreen::callback->intel_de_rmw(reg, DBUF_POWER_REQUEST,
+				  DBUF_POWER_REQUEST);
+		NGreen::callback->readReg32(reg);
+		IODelay(10);
+
+
+		//icl_mbus_init
+		// XE_LPD_FEATURES (Linux intel_display_device.c): .abox_mask = GENMASK(1, 0)
+		// = ABOX0 (0x45038) + ABOX1 (0x45048)
+		unsigned long abox_mask = GENMASK(1, 0);//DISPLAY_INFO(dev_priv)->abox_mask;
+		int config, i;
+
+		unsigned long abox_regs=abox_mask;
+		uint32_t mask = MBUS_ABOX_BT_CREDIT_POOL1_MASK |
+			MBUS_ABOX_BT_CREDIT_POOL2_MASK |
+			MBUS_ABOX_B_CREDIT_MASK |
+			MBUS_ABOX_BW_CREDIT_MASK;
+		uint32_t val = MBUS_ABOX_BT_CREDIT_POOL1(16) |
+			MBUS_ABOX_BT_CREDIT_POOL2(16) |
+			MBUS_ABOX_B_CREDIT(1) |
+			MBUS_ABOX_BW_CREDIT(1);
+
+		for_each_set_bit(i, &abox_regs, sizeof(abox_regs))
+		NGreen::callback->intel_de_rmw( MBUS_ABOX_CTL(i), mask, val);
+
+
+		//tgl_bw_buddy_init
+		// Linux syslog: DRAM channels=4, memory type 0x23=LPDDR5
+		// tgl_buddy_page_masks: {4ch, LPDDR4, 0x38} and {4ch, LPDDR5, 0x38} — same page_mask
+		// Use LPDDR4 bucket (LPDDR5 maps identically in the table)
+		enum intel_dram_type type = INTEL_DRAM_LPDDR4;
+		uint8_t num_channels = 4; //4ch LPDDR — tgl_buddy_page_masks → page_mask=0x38
+		const struct buddy_page_mask *table=tgl_buddy_page_masks;
+
+		for (config = 0; table[config].page_mask != 0; config++)
+			if (table[config].num_channels == num_channels &&
+				table[config].type == type)
+				break;
+
 		for_each_set_bit(i, &abox_mask, sizeof(abox_mask)) {
-		NGreen::callback->writeReg32( BW_BUDDY_PAGE_MASK(i),
-					   table[config].page_mask);
+			NGreen::callback->writeReg32( BW_BUDDY_PAGE_MASK(i),
+						   table[config].page_mask);
 
 			/* Wa_22010178259:tgl,dg1,rkl,adl-s */
-		NGreen::callback->intel_de_rmw( BW_BUDDY_CTL(i),
-						 BW_BUDDY_TLB_REQ_TIMER_MASK,
-						 BW_BUDDY_TLB_REQ_TIMER(0x8));
+			NGreen::callback->intel_de_rmw( BW_BUDDY_CTL(i),
+							 BW_BUDDY_TLB_REQ_TIMER_MASK,
+							 BW_BUDDY_TLB_REQ_TIMER(0x8));
 		}
 
-	
-	/* Wa_14011508470:tgl,dg1,rkl,adl-s,adl-p,dg2 */
-	//if (IS_DISPLAY_VER_FULL(dev_priv, IP_VER(12, 0), IP_VER(13, 0)))
-	/*NGreen::callback->intel_de_rmw( GEN11_CHICKEN_DCPR_2, 0,
-				 DCPR_CLEAR_MEMSTAT_DIS | DCPR_SEND_RESP_IMM |
-				 DCPR_MASK_LPMODE | DCPR_MASK_MAXLATENCY_MEMUP_CLR);*/
-	
-	/* * Display WA #1185 WaDisableDARBFClkGating:glk,icl,ehl,tgl
-	 * Also known as Wa_14010480278.
-	 */
-	//if (IS_DISPLAY_VER(i915, 10, 12))
-	//NGreen::callback->intel_de_rmw( GEN9_CLKGATE_DIS_0, 0, DARBF_GATING_DIS);
-	
-	/* Wa_14013723622 */
-	NGreen::callback->intel_de_rmw( CLKREQ_POLICY, CLKREQ_POLICY_MEM_UP_OVRD, 0);
-	
-	
+		/* Wa_14011508470:tgl,dg1,rkl,adl-s,adl-p,dg2 */
+		//if (IS_DISPLAY_VER_FULL(dev_priv, IP_VER(12, 0), IP_VER(13, 0)))
+		/*NGreen::callback->intel_de_rmw( GEN11_CHICKEN_DCPR_2, 0,
+					 DCPR_CLEAR_MEMSTAT_DIS | DCPR_SEND_RESP_IMM |
+					 DCPR_MASK_LPMODE | DCPR_MASK_MAXLATENCY_MEMUP_CLR);*/
+
+		/* * Display WA #1185 WaDisableDARBFClkGating:glk,icl,ehl,tgl
+		 * Also known as Wa_14010480278.
+		 */
+		//if (IS_DISPLAY_VER(i915, 10, 12))
+		//NGreen::callback->intel_de_rmw( GEN9_CLKGATE_DIS_0, 0, DARBF_GATING_DIS);
+
+		/* Wa_14013723622 */
+		NGreen::callback->intel_de_rmw( CLKREQ_POLICY, CLKREQ_POLICY_MEM_UP_OVRD, 0);
+
+	}
+	// isRealTGL: Apple's AppleIntelTGLGraphicsFramebuffer handles all of the above
+	// natively (2 DBUF slices, XE_D abox_mask=GENMASK(2,1), correct DRAM config).
+	// No additional writes needed.
+
 	return ret;
 }
 

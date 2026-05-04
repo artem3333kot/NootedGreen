@@ -20,8 +20,8 @@
 		2EA343FF2C93C07700160F43 /* kern_genx.hpp in Headers */ = {isa = PBXBuildFile; fileRef = 2EA343FD2C93C07700160F43 /* kern_genx.hpp */; };
 		2EE18C1A2CE558A300E96D38 /* Firmware.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 2EE18C182CE558A300E96D38 /* Firmware.cpp */; };
 		2EF1AD002CE558A400000001 /* FirmwareADLP.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 2EF1AD012CE558A400000001 /* FirmwareADLP.cpp */; };
-		2EE18C1B2CE558A300E96D38 /* Firmware.hpp in Headers */ = {isa = PBXBuildFile; fileRef = 2EE18C192CE558A300E96D38 /* Firmware.hpp */; };
-		CE405ED91E4A080700AA0B3D /* plugin_start.cpp in Sources */ = {isa = PBXBuildFile; fileRef = CE405ED81E4A080700AA0B3D /* plugin_start.cpp */; };
+		2EE18C1B2CE558A300E96D38 /* Firmware.hpp in Headers */ = {isa = PBXBuildFile; fileRef = 2EE18C192CE558A300E96D38 /* Firmware.hpp */; };			A1B2C3D4E5F601020304A001 /* IntelDPLinkTraining.cpp in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F601020304B001 /* IntelDPLinkTraining.cpp */; };
+			A1B2C3D4E5F601020304A002 /* IntelDPLinkTraining.hpp in Headers */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F601020304B002 /* IntelDPLinkTraining.hpp */; };		CE405ED91E4A080700AA0B3D /* plugin_start.cpp in Sources */ = {isa = PBXBuildFile; fileRef = CE405ED81E4A080700AA0B3D /* plugin_start.cpp */; };
 		F009B7A129E4EE3C00786AFF /* kern_start.cpp in Sources */ = {isa = PBXBuildFile; fileRef = F009B7A029E4EE3C00786AFF /* kern_start.cpp */; };
 		F009B7A329E4EEBA00786AFF /* kern_green.cpp in Sources */ = {isa = PBXBuildFile; fileRef = F009B7A229E4EEBA00786AFF /* kern_green.cpp */; };
 		F067C22629D84710004BB52E /* (null) in Sources */ = {isa = PBXBuildFile; };
@@ -63,8 +63,8 @@
 		2EA343FD2C93C07700160F43 /* kern_genx.hpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.h; path = kern_genx.hpp; sourceTree = "<group>"; };
 		2EE18C182CE558A300E96D38 /* Firmware.cpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.cpp; path = Firmware.cpp; sourceTree = "<group>"; };
 		2EF1AD012CE558A400000001 /* FirmwareADLP.cpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.cpp; path = FirmwareADLP.cpp; sourceTree = "<group>"; };
-		2EE18C192CE558A300E96D38 /* Firmware.hpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.h; path = Firmware.hpp; sourceTree = "<group>"; };
-		CE405EBA1E49DD7100AA0B3D /* kern_compression.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = kern_compression.hpp; sourceTree = "<group>"; };
+		2EE18C192CE558A300E96D38 /* Firmware.hpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.h; path = Firmware.hpp; sourceTree = "<group>"; };			A1B2C3D4E5F601020304B001 /* IntelDPLinkTraining.cpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.cpp; path = IntelDPLinkTraining.cpp; sourceTree = "<group>"; };
+			A1B2C3D4E5F601020304B002 /* IntelDPLinkTraining.hpp */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.h; path = IntelDPLinkTraining.hpp; sourceTree = "<group>"; };		CE405EBA1E49DD7100AA0B3D /* kern_compression.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = kern_compression.hpp; sourceTree = "<group>"; };
 		CE405EBB1E49DD7100AA0B3D /* kern_disasm.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = kern_disasm.hpp; sourceTree = "<group>"; };
 		CE405EBC1E49DD7100AA0B3D /* kern_file.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = kern_file.hpp; sourceTree = "<group>"; };
 		CE405EBD1E49DD7100AA0B3D /* kern_iokit.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = kern_iokit.hpp; sourceTree = "<group>"; };
@@ -124,8 +124,8 @@
 				1C748C2E1C21952C0024EED2 /* Info.plist */,
 				2EE18C182CE558A300E96D38 /* Firmware.cpp */,
 				2EF1AD012CE558A400000001 /* FirmwareADLP.cpp */,
-				2EE18C192CE558A300E96D38 /* Firmware.hpp */,
-				2E7C04D52C8A51F000B07113 /* IGGucBinary.h */,
+				2EE18C192CE558A300E96D38 /* Firmware.hpp */,					A1B2C3D4E5F601020304B001 /* IntelDPLinkTraining.cpp */,
+					A1B2C3D4E5F601020304B002 /* IntelDPLinkTraining.hpp */,				2E7C04D52C8A51F000B07113 /* IGGucBinary.h */,
 				2E7C04D62C8A51F000B07113 /* IGHucBinary.h */,
 				2E5BF5812BCC212F0095BDCF /* HDMI.cpp */,
 				2E5BF5822BCC212F0095BDCF /* HDMI.hpp */,
@@ -210,8 +210,7 @@
 				2EA343FF2C93C07700160F43 /* kern_genx.hpp in Headers */,
 				F0B49E9529D93A600067BE5B /* (null) in Headers */,
 				F0BB9E562A57A0340081F5FA /* kern_patcherplus.hpp in Headers */,
-				2EE18C1B2CE558A300E96D38 /* Firmware.hpp in Headers */,
-			);
+				2EE18C1B2CE558A300E96D38 /* Firmware.hpp in Headers */,					A1B2C3D4E5F601020304A002 /* IntelDPLinkTraining.hpp in Headers */,			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXHeadersBuildPhase section */
@@ -322,8 +321,7 @@
 				CE405ED91E4A080700AA0B3D /* plugin_start.cpp in Sources */,
 				2E1CC3E32BA5DBD9004EC8F6 /* DisplayMergeNub.cpp in Sources */,
 				2EE18C1A2CE558A300E96D38 /* Firmware.cpp in Sources */,
-				2EF1AD002CE558A400000001 /* FirmwareADLP.cpp in Sources */,
-				2E315A622BC6EA4D008411AA /* DYLDPatches.cpp in Sources */,
+				2EF1AD002CE558A400000001 /* FirmwareADLP.cpp in Sources */,					A1B2C3D4E5F601020304A001 /* IntelDPLinkTraining.cpp in Sources */,				2E315A622BC6EA4D008411AA /* DYLDPatches.cpp in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
