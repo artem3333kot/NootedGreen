@@ -2193,14 +2193,20 @@ uint32_t Gen11::wrapProbeCDClockFrequency(void *that) {
 		NGreen::callback->writeReg32(BXT_DE_PLL_ENABLE, squash | BXT_DE_PLL_PLL_ENABLE);
 	}
 
-	// Sonoma also panics if cdclk is not 0x50E (648 MHz) or 0x518 (652.8 MHz).
-	// Frequencies 0x264, 0x26E, 0x44E, 0x458 trigger "Wrong CD clock frequency set by EFI".
-	// sanitizeCDClockFrequency raises cdclk to 648/652.8 MHz to satisfy the original.
+	// Always sanitize (disable + reprogram PLL) regardless of current CDCLK value.
+	//
+	// When BIOS leaves CDCLK already at >= 648 MHz (threshold), skipping sanitize causes
+	// orgProbeCDClockFrequency to take the "cdclk already at target" path, which reads PCU
+	// mailbox command 0x6 (PCODE_CDCLK_CONFIG verify). On ADL-P this returns 0x9b9b9b9b
+	// (PCU not responding / command not supported), causing initCDClock to return an error.
+	// start() then skips port allocation and boot display setup entirely — no hwUpdateCursorMemory,
+	// no cursor GGTT entries → full black screen even when the display link is trained.
+	//
+	// Always calling sanitize takes the "frequency changed" success path in initCDClock,
+	// which writes mailbox(7,2) ACK and skips the failing PCU 0x6 verify read.
 	auto cdclk = NGreen::callback->readReg32(ICL_REG_CDCLK_CTL) & CDCLK_FREQ_DECIMAL_MASK;  // byte addr OK
-	if (cdclk < ICL_CDCLK_DEC_FREQ_THRESHOLD) {
-		DBGLOG("ngreen", "wrapProbeCDClockFrequency: cdclk 0x%x below threshold, sanitizing", cdclk);
-		sanitizeCDClockFrequency(that);
-	}
+	SYSLOG("ngreen", "wrapProbeCDClockFrequency: cdclk=0x%x, force-sanitizing to bypass PCU mailbox failure", cdclk);
+	sanitizeCDClockFrequency(that);
 
 	auto retVal = callback->orgProbeCDClockFrequency(that);
 	return retVal;
