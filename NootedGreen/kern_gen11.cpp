@@ -5942,6 +5942,20 @@ void Gen11::hwInitializeCState(void *that)
 				SYSLOG("ngreen", "V102: restore PWR_WELL CTL1 0x%x->0x%x", postCtl1, fixCtl1);
 			}
 		}
+		// V105: disable PSR1+PSR2 — the ICL DMC initializer (original hwInitializeCState)
+		// enables PSR2 (EDP_PSR2_CTL bit 0 = 1) for the eDP panel. On ADL-P hardware with
+		// the ICL driver the PSR2 selective-update path is non-functional: the panel locks
+		// into self-refresh showing the initial black frame; only the cursor plane (separate
+		// SU path) updates. Clearing both registers before the first frame is displayed
+		// restores normal scanout. Confirmed root cause via V76: PSR2_CTL=0x4811, V88
+		// direct physical writes to SURF invisible despite valid GGTT PTEs.
+		{
+			uint32_t psr2ctl = NGreen::callback->readReg32(0x60900);
+			uint32_t psr1ctl = NGreen::callback->readReg32(0x64800);
+			NGreen::callback->writeReg32(0x60900, 0);   // EDP_PSR2_CTL — disable PSR2
+			NGreen::callback->writeReg32(0x64800, 0);   // EDP_PSR_CTL  — disable PSR1
+			SYSLOG("ngreen", "V105: PSR1+PSR2 disabled (was PSR2=0x%x PSR1=0x%x)", psr2ctl, psr1ctl);
+		}
 
 	} else if (dmcArg[0] == 'i' || dmcArg[0] == 'I') {
 		// ── ICL ──
