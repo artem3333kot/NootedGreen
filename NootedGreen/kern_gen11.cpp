@@ -5911,77 +5911,11 @@ void Gen11::hwInitializeCState(void *that)
 		NGreen::callback->writeReg32(0x5FC40, 0xC0033100);
 		NGreen::callback->writeReg32(0x5FC10, 0x980497D8);
 
-		// Transcoder A DDI function + timing registers.
-		// These are TRANSCODER registers (Archive confirmed HIGH confidence):
-		//   0x60400 = TRANS_DDI_FUNC_CTL_A  — DDI A enabled, DP SST, 8bpc, x4
-		//   0x60000 = TRANS_HTOTAL_A        — 2560 active, 2720 total (from reg_dump.txt)
-		//   0x60004 = TRANS_HBLANK_A        — same as HTOTAL on eDP
-		//   0x60008 = TRANS_HSYNC_A         — sync positions
-		//   0x6000C = TRANS_VTOTAL_A        — 1600 active, 1750 total
-		//   0x60010 = TRANS_VBLANK_A
-		//   0x60014 = TRANS_VSYNC_A
-		//   0x60028 = TRANS_VSYNCSHIFT_A
-		//   0x60030 = TRANS_DATA_M1_A       — DP M/N values (TU 64, link rate)
-		//   0x60034 = TRANS_DATA_N1_A
-		//   0x60040 = TRANS_LINK_M1_A
-		//   0x60044 = TRANS_LINK_N1_A
-		// Values sourced from Linux intel_reg dump on the same hardware.
-		// 0x8A010102: bit31=enable, [27:24]=DDI_A, [19:16]=2lanes, [3:1]=DP_SST(0x01)
-		// Matches Apple's programmed value so paramsFbCompare sees no lane-count change
-		// 0x8A010102: bit31=enable, [27:24]=DDI_A, [19:16]=2lanes, [3:1]=DP_SST(0x01)
-		// Matches Apple's target so paramsFbCompare sees no lane-count change.
-		// Changing lane count in TRANS_DDI_FUNC_CTL while transcoder is live resets DDI
-		// buffer and drops the trained link. Always write 2-lane DP SST to pre-match Apple.
-		NGreen::callback->writeReg32(0x60400, 0x8A000106); // TRANS_DDI_FUNC_CTL_A
-		NGreen::callback->writeReg32(0x60000, 0x0A9F09FF); // TRANS_HTOTAL_A
-		NGreen::callback->writeReg32(0x60004, 0x0A9F09FF); // TRANS_HBLANK_A
-		NGreen::callback->writeReg32(0x60008, 0x0A4F0A2F); // TRANS_HSYNC_A
-		NGreen::callback->writeReg32(0x6000C, 0x06D5063F); // TRANS_VTOTAL_A
-		NGreen::callback->writeReg32(0x60010, 0x06D50000); // TRANS_VBLANK_A
-		NGreen::callback->writeReg32(0x60014, 0x06480642); // TRANS_VSYNC_A
-		NGreen::callback->writeReg32(0x60028, 0x00000000); // TRANS_VSYNCSHIFT_A
-		NGreen::callback->writeReg32(0x60030, 0x7E5D159E); // TRANS_DATA_M1_A  (TU 64, M=0x5d159e)
-		NGreen::callback->writeReg32(0x60034, 0x00800000); // TRANS_DATA_N1_A  (N=0x800000)
-		NGreen::callback->writeReg32(0x60040, 0x0007C1CD); // TRANS_LINK_M1_A  (M=0x7c1cd)
-		NGreen::callback->writeReg32(0x60044, 0x00080000); // TRANS_LINK_N1_A  (N=0x80000)
-
-		// TGL_DP_TP_CTL_A (0x60540) — enable DP transport, normal mode, SST
-		// Linux: intel_ddi_enable_dp sets TP_CTL before link training. Value from i915 for
-		// a 4-lane HBR DP SST link in TPS1: bit31=TX_START, bit10=TP1, bit8=SST
-		// We write 0 to leave transport in idle; Apple driver will set this during link train.
-		// (Do NOT force-set TP_CTL here — Apple's link training sequence owns this register.)
-
-		// Panel power sequencer.
-		// TGL/ADL-P both have PCH_SPLIT (ICP/TGP PCH) → intel_pps_setup sets
-		// mmio_base = PCH_PPS_BASE = 0xC7200 (not 0x61200 which is BXT/APL).
-		// PPS register layout: PP_STATUS=+0, PP_CONTROL=+4, PP_ON_DELAYS=+8, PP_OFF_DELAYS=+C
-		// Values from Linux intel_reg dump on this hardware (reg_dump.txt):
-		//   0xC7204 (PP_CONTROL)   = 0x00000067 (panel on, VDD on, power-on target)
-		//   0xC7208 (PP_ON_DELAYS) = 0x07D00001 (T1=1, T3=2000ms power-on delays)
-		NGreen::callback->writeReg32(0xC7204, 0x00000067); // PP_CONTROL
-		NGreen::callback->writeReg32(0xC7208, 0x07D00001); // PP_ON_DELAYS
-
-		// PIPE_CLK_SEL_A (0x46140) = 0x10000000: no explicit clock source (eDP uses internal)
-		NGreen::callback->writeReg32(0x46140, 0x10000000); // PIPE_CLK_SEL_A
-
 		// Enable DMC — DC_STATE_DEBUG (0x45520) = 2
 		NGreen::callback->writeReg32(0x45520, 2); // DC_STATE_DEBUG
 		NGreen::callback->dmcIsAdlp = true;
 		NGreen::callback->uefiCtl1  = uefiCtl1;  // save for V60 re-enforcement
 		SYSLOG("ngreen", "hwInitCState: ADL-P DMC loaded");
-		// Program ADL-P combo PHY signal levels — PHY_A (eDP) + PHY_B (DP-B).
-		// Uses ADL-P specific translation tables (adlp_combo_phy_trans_dp_hbr/hbr2).
-		// TC ports C-F are DKL PHY — not programmed here.
-		{
-				uint8_t swing[4]   = {0, 0, 0, 0};
-				uint8_t preEmph[4] = {0, 0, 0, 0};
-				// eDP runs at HBR3 (8.1 Gbps, linkSymbolClock=810MHz) for 2560x1600.
-				// isHBR2=true was WRONG — it programs HBR2 signal tables → setPortMode trains
-				// at reduced amplitude → link falls back to 2 lanes (DDI_FUNC_EDP=0x8a010102).
-				// With isHBR2=false (HBR/HBR3 tables), bitRate matches UEFI-trained levels → 4 lanes.
-				IntelDPLinkTraining::setSignalLevelsADLP(/*phy=*/0, /*lanes=*/4, /*isHBR2=*/false, /*isEDP=*/true,  swing, preEmph);
-				IntelDPLinkTraining::setSignalLevelsADLP(/*phy=*/1, /*lanes=*/4, /*isHBR2=*/false, /*isEDP=*/false, swing, preEmph);
-		}
 		// Let original run with B48=1 so the ICL CSR blob is loaded to SRAM.
 		// The ADL-P DMC firmware (even correct binary) autonomously drops all eDP lanes
 		// at ~10s because its DC state management code runs on ADL-P hardware and performs
