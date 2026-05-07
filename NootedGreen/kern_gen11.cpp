@@ -418,7 +418,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			
 			SolveRequestPlus solveRequests[] = {
 				{"__ZN31AppleIntelFramebufferController19setCDClockFrequencyEy", this->orgSetCDClockFrequency},
-				
+				{"_gPlatformInformationList", this->gPlatformInformationList},
 			};
 			PANIC_COND(!SolveRequestPlus::solveAll(patcher, index, solveRequests, address, size), "ngreen",	"Failed to resolve symbols");
 		}
@@ -426,7 +426,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		{
 			SolveRequestPlus solveRequests[] = {
 				{"__ZN24AppleIntelBaseController19setCDClockFrequencyEy", this->orgSetCDClockFrequency},
-				
+				{"_gPlatformInformationList", this->gPlatformInformationList},
 			};
 			PANIC_COND(!SolveRequestPlus::solveAll(patcher, index, solveRequests, address, size), "ngreen",	"Failed to resolve symbols");
 			
@@ -458,6 +458,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			{"__ZN19AppleIntelPowerWell19enableDisplayEngineEv",enableDisplayEngine, this->oenableDisplayEngine},
 			// V35: Removed ComboPhyEv hook — causes MCE on RPL/ADL. Firmware calibration sufficient.
 			{"__ZN14AppleIntelPort16computeLaneCountEPK29IODetailedTimingInformationV2jjPj",computeLaneCount, this->ocomputeLaneCount},
+			{"__ZN14AppleIntelPort21setupOptimalLaneCountEPK29IODetailedTimingInformationV2j",setupOptimalLaneCount, this->osetupOptimalLaneCount},
 			// V97: Log AUX transactions to diagnose eDP link training failures on RPL
 			{"__ZN14AppleIntelPort7readAUXEjPvj", Genx::wrapICLReadAUX, Genx::callback->orgICLReadAUX},
 			// V96: Force display online — WEG's getDisplayStatus hook (FOD) fails with
@@ -500,6 +501,8 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		if (isprod) {
 			RouteRequestPlus requests[] = {
 				{"__ZN21AppleIntelFramebuffer4initEP31AppleIntelFramebufferControllerj",AppleIntelFramebufferinit, this->oAppleIntelFramebufferinit},
+				{"__ZN31AppleIntelFramebufferController23initPlatformWorkaroundsEv", initPlatformWorkarounds, this->oinitPlatformWorkarounds},
+				{"__ZN31AppleIntelFramebufferController16getOSInformationEv", getOSInformation, this->ogetOSInformation},
 				{"__ZN31AppleIntelFramebufferController10hwShutdownEP21AppleIntelFramebuffer",handleLinkIntegrityCheck},
 				{"__ZN31AppleIntelFramebufferController18hwInitializeCStateEv",hwInitializeCState, this->ohwInitializeCState},
 				{"__ZN31AppleIntelFramebufferController20hwConfigureCustomAUXEb",hwConfigureCustomAUX, this->ohwConfigureCustomAUX},
@@ -517,6 +520,8 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		{
 			RouteRequestPlus requests[] = {
 				{"__ZN21AppleIntelFramebuffer4initEP24AppleIntelBaseControllerj",AppleIntelFramebufferinit, this->oAppleIntelFramebufferinit},
+				{"__ZN24AppleIntelBaseController23initPlatformWorkaroundsEv", initPlatformWorkarounds, this->oinitPlatformWorkarounds},
+				{"__ZN24AppleIntelBaseController16getOSInformationEv", getOSInformation, this->ogetOSInformation},
 				{"__ZN24AppleIntelBaseController10hwShutdownEP21AppleIntelFramebuffer",handleLinkIntegrityCheck},
 				{"__ZN24AppleIntelBaseController18hwInitializeCStateEv",hwInitializeCState, this->ohwInitializeCState},
 				{"__ZN24AppleIntelBaseController20hwConfigureCustomAUXEb",hwConfigureCustomAUX, this->ohwConfigureCustomAUX},
@@ -678,9 +683,32 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
         static const uint8_t r22[]= {0x48, 0xc7, 0xc0, 0xc0, 0x40, 0xd0, 0x2e, 0x49, 0x89, 0x47, 0x28, 0xbf, 0x08, 0x00, 0x00, 0x00, 0xbe, 0x06, 0x00, 0x00, 0x00, 0xe8, 0x9e, 0x81, 0x01, 0x00, 0x84, 0xc0, 0x90, 0x90};
 		
 
+		// force eDP panel detection regardless of pipe number (from NootedBlue)
+		// NOPs two JE and one JNE that would skip eDP init when pipe != 1.
+		// Required because our pinfo sets eDP on pipe=0, not pipe=1.
+		static const uint8_t f6nb[]= {0x74, 0x2a, 0x83, 0xf8, 0x01, 0x74, 0x43, 0x85, 0xc0, 0x75, 0x60};
+		static const uint8_t r6nb[]= {0x90, 0x90, 0x83, 0xf8, 0x01, 0x90, 0x90, 0x85, 0xc0, 0x90, 0x90};
+
+		// fix register addresses if pipe=0 (jne→jmp to always use pipe-0 register offsets)
+		static const uint8_t f24bp[]= {0x83, 0x78, 0x08, 0x00, 0x75, 0x0c};
+		static const uint8_t r24bp[]= {0x83, 0x78, 0x08, 0x00, 0xeb, 0x0c};
+		static const uint8_t f24cp[]= {0x00, 0x4c, 0x89, 0xea, 0x75, 0x12};
+		static const uint8_t r24cp[]= {0x00, 0x4c, 0x89, 0xea, 0xeb, 0x12};
+		static const uint8_t f24dp[]= {0x83, 0x78, 0x08, 0x00, 0x75, 0x0d};
+		static const uint8_t r24dp[]= {0x83, 0x78, 0x08, 0x00, 0xeb, 0x0d};
+		static const uint8_t f24b[]= {0x83, 0x78, 0x08, 0x00, 0x75, 0x0c};
+		static const uint8_t r24b[]= {0x83, 0x78, 0x08, 0x00, 0xeb, 0x0c};
+		static const uint8_t f24c[]= {0x48, 0x8b, 0x55, 0xd0, 0x75, 0x13};
+		static const uint8_t r24c[]= {0x48, 0x8b, 0x55, 0xd0, 0xeb, 0x13};
+		static const uint8_t f24d[]= {0x83, 0x78, 0x08, 0x00, 0x75, 0x0d};
+		static const uint8_t r24d[]= {0x83, 0x78, 0x08, 0x00, 0xeb, 0x0d};
+		// link training speed constant fix
+		static const uint8_t f25[]= {0x77, 0x77, 0x00, 0x00};
+		static const uint8_t r25[]= {0x33, 0x00, 0x00, 0x00};
+
 		if (isprod){
 			LookupPatchPlus const patchesp[] = {// tgl production kext
-				
+
 				{activeKext, f1p, r1p, arrsize(f1p),	1},
 				{activeKext, f2p, r2p, arrsize(f2p),	1},
 				{activeKext, f2dp, r2dp, arrsize(f2dp),	1},
@@ -695,11 +723,17 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				//{activeKext, f13p, r13p, arrsize(f13p),	1},
 				//{activeKext, f13pb, r13pb, arrsize(f13pb),	1},
 				//{activeKext, f16p, r16p, arrsize(f16p),	1},
+				{activeKext, f6nb, r6nb, arrsize(f6nb),	1},
+				{activeKext, f13p, r13p, arrsize(f13p),	1},
+				{activeKext, f13pb, r13pb, arrsize(f13pb),	1},
 				{activeKext, f19, r19, arrsize(f19),	1},
-							{activeKext, f20p, r20p, arrsize(f20p),	1},
-				
+				{activeKext, f20p, r20p, arrsize(f20p),	1},
+				{activeKext, f24bp, r24bp, arrsize(f24bp),	14},
+				{activeKext, f24cp, r24cp, arrsize(f24cp),	1},
+				{activeKext, f24dp, r24dp, arrsize(f24dp),	4},
+				{activeKext, f25,  r25,  arrsize(f25),	6},
 			};
-			
+
 			PANIC_COND(!LookupPatchPlus::applyAll(patcher, patchesp , address, size), "ngreen", "kextG11FBT Failed to apply production patches!");
 		}
 		else {
@@ -733,14 +767,17 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				//{activeKext, f16, r16, arrsize(f16),	1},
 				//{activeKext, f19, r19, arrsize(f19),	1},
 			//	{activeKext, f20, r20, arrsize(f20),	1},
-				// f21: optional. Left disabled to avoid unnecessary SafeForceWake-path changes
-				// until a valid-platform-id boot shows it is actually required.
 				//{activeKext, f21, r21, arrsize(f21),	1},
-				// Avoid forcing pixel/timing constants in hw CRTC path.
 				//{activeKext, f22, r22, arrsize(f22),    1},
-				
+				{activeKext, f6nb, r6nb, arrsize(f6nb),	1},
+				{activeKext, f19, r19, arrsize(f19),	1},
+				{activeKext, f20, r20, arrsize(f20),	1},
+				{activeKext, f24b, r24b, arrsize(f24b),	11},
+				{activeKext, f24c, r24c, arrsize(f24c),	1},
+				{activeKext, f24d, r24d, arrsize(f24d),	6},
+				{activeKext, f25,  r25,  arrsize(f25),	6},
 			};
-			
+
 			PANIC_COND(!LookupPatchPlus::applyAll(patcher, patches , address, size), "ngreen", "kextG11FBT Failed to apply dbg patches!");
 
 				// Reference probe: enable only old f2 topology/osinfo bypass on demand.
@@ -1865,6 +1902,7 @@ void Gen11::checkWOPCMSettings(void *that,unsigned long param_1,void *param_2)
 }
 
 void *ccont;
+void *ccont2;  // AppleIntelBaseController pointer (captured in FBMemMgr_Init)
 
 IOReturn Gen11::wrapPavpSessionCallback( void *intelAccelerator, int32_t sessionCommand, uint32_t sessionAppId, uint32_t *a4, bool flag) {
 	
@@ -2777,23 +2815,28 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		if (v60Count <= 5 || v60Count == 10 || v60Count == 20 || v60Count == 30) {
 			uint32_t planCtl  = NGreen::callback->readReg32(0x70180); // PLANE_CTL
 			uint32_t planStrd = NGreen::callback->readReg32(0x70188); // PLANE_STRIDE
+			uint32_t planSurf = NGreen::callback->readReg32(0x7019C);
 			uint32_t tiling = (planCtl >> 10) & 0x7; // bits[12:10]
-			if (tiling != 0) {
-				uint32_t newCtl = planCtl & ~(0x7u << 10); // clear tiling -> linear
-				uint32_t newStrd = planStrd;
-				if (tiling == 1) {
-					newStrd = planStrd * 8;
-				} else if (tiling == 4) {
-					newStrd = planStrd * 16;
-				}
-				NGreen::callback->writeReg32(0x70180, newCtl);
-				NGreen::callback->writeReg32(0x70188, newStrd);
-				uint32_t planSurf = NGreen::callback->readReg32(0x7019C);
-				NGreen::callback->writeReg32(0x7019C, planSurf);
-				SYSLOG("ngreen", "V79[%d]: tiling %d->linear CTL 0x%x->0x%x STRIDE 0x%x->0x%x SURF=0x%x",
-					   v60Count, tiling, planCtl, newCtl, planStrd, newStrd, planSurf);
+			// V99S already ensures STRIDE=0xa0 and CTL=Y-tiled before every SURF arm.
+			// Do NOT re-convert tiling or recalculate stride (those are now correct).
+			// Just enforce correct values and re-arm SURF to keep the display engine live.
+			// Skip if SURF=0 (plane disabled — arming a null surface causes garbage).
+			if (planSurf != 0) {
+				uint32_t neededStrd = 0xa0;
+				uint32_t neededCtl  = (planCtl & ~(0x7u << 10)) | (0x4u << 10); // Y-tiled
+				bool strdWrong  = (planStrd != neededStrd);
+				bool tilingWrong = (tiling != 4);
+				if (strdWrong)   NGreen::callback->writeReg32(0x70188, neededStrd);
+				if (tilingWrong) NGreen::callback->writeReg32(0x70180, neededCtl);
+				NGreen::callback->writeReg32(0x7019C, planSurf); // re-arm
+				SYSLOG("ngreen", "V79RW[%d]: CTL=0x%x->0x%x STRIDE=0x%x->0x%x SURF=0x%x",
+					   v60Count,
+					   planCtl,  (tilingWrong ? neededCtl  : planCtl),
+					   planStrd, (strdWrong   ? neededStrd : planStrd),
+					   planSurf);
 			} else {
-				SYSLOG("ngreen", "V79[%d]: already linear CTL=0x%x STRIDE=0x%x", v60Count, planCtl, planStrd);
+				SYSLOG("ngreen", "V79RW[%d]: SURF=0 skip. CTL=0x%x STRIDE=0x%x tiling=%d",
+					   v60Count, planCtl, planStrd, tiling);
 			}
 		}
 	} else {
@@ -2806,6 +2849,25 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		uint32_t tiling = (planCtl >> 10) & 0x7; // bits[12:10]
 		SYSLOG("ngreen", "V79[%d]: PIPE=0x%x CTL=0x%x STRIDE=0x%x SURF=0x%x SIZE=0x%x POS=0x%x tiling=%d",
 			   v60Count, pipeConf, planCtl, planStrd, planSurf, planSize, planPos, tiling);
+
+		// V105 (here): gamma check uses planSurf already read above — avoids race with hwSetMode.
+		// The periodic-section V105 reads SURF before hwSetMode fires; V79 reads AFTER.
+		if (planSurf != 0) {
+			NGreen::callback->writeReg32(0x4A400, 128); // PAL_PREC_INDEX = 128
+			uint32_t g128 = NGreen::callback->readReg32(0x4A404);
+			if (g128 == 0) {
+				static int v105bCount = 0;
+				if (v105bCount < 10) {
+					v105bCount++;
+					SYSLOG("ngreen", "V105B[%d]: Gamma zero (iter %d, SURF=0x%x) — linear LUT", v105bCount, v60Count, planSurf);
+				}
+				NGreen::callback->writeReg32(0x4A400, 0x8000); // index=0, auto-increment
+				for (int i = 0; i < 256; i++) {
+					uint32_t v10 = (uint32_t)i * 4;
+					NGreen::callback->writeReg32(0x4A404, (v10 << 20) | (v10 << 10) | v10);
+				}
+			}
+		}
 	}
 
 	// ── V75: Display pipeline register dump — diagnose black screen ──
@@ -2848,6 +2910,52 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 			   v60Count, blcPwm, blcDuty, sblcPwm);
 		SYSLOG("ngreen", "V75[%d]: PWR_WELL=0x%x DC_STATE=0x%x",
 			   v60Count, pwrWell, dcState);
+
+		// V103P: DC_STATE_EN enforcement — re-zero every V60 tick when ADL-P DMC is active.
+		// Belt-and-suspenders against any write path that bypasses raWriteRegister32/FastWrite.
+		if (NGreen::callback->dmcIsAdlp && dcState != 0) {
+			NGreen::callback->writeReg32(0x45504, 0);
+			SYSLOG("ngreen", "V103P[%d]: DC_STATE_EN was 0x%x, forced to 0", v60Count, dcState);
+		}
+		// V105: Pipe-A gamma LUT enforcement — write linear pass-through when LUT is zero.
+		// The Apple driver enables precision gamma mode before WindowServer writes the actual
+		// LUT, so every pixel maps to 0 (black) until WindowServer initialises it.
+		// We check on every tick (while display is active) and write linear 8→10-bit LUT
+		// so the display output equals framebuffer content until WindowServer takes over.
+		// PAL_PREC_DATA (0x4A404) format: bits[29:20]=red, [19:10]=green, [9:0]=blue (10-bit).
+		{
+			uint32_t planSurf = NGreen::callback->readReg32(0x7019C); // PLANE_SURF_A
+			if (planSurf != 0) {
+				// Sample entry 128 to detect if gamma is zero
+				NGreen::callback->writeReg32(0x4A400, 128);  // PAL_PREC_INDEX = 128
+				uint32_t g128 = NGreen::callback->readReg32(0x4A404); // PAL_PREC_DATA
+				if (g128 == 0) {
+					static int v105Count = 0;
+					if (v105Count < 10) {
+						v105Count++;
+						SYSLOG("ngreen", "V105[%d]: Gamma LUT zero at iter %d — writing linear pass-through", v105Count, v60Count);
+					}
+					// Write linear LUT: set index=0 + AUTO_INCREMENT (bit 15 = 0x8000)
+					NGreen::callback->writeReg32(0x4A400, 0x8000);
+					for (int i = 0; i < 256; i++) {
+						uint32_t v10 = (uint32_t)i * 4;
+						NGreen::callback->writeReg32(0x4A404, (v10 << 20) | (v10 << 10) | v10);
+					}
+				}
+			}
+		}
+
+		// V104P: PWR_WELL CTL1 enforcement — restore UEFI bits [14,12] every V60 tick.
+		// ICL DMC's MMIO save/restore table writes CTL1=0x401 during init/DC-exit, clearing
+		// bits [14,12] needed for vsync interrupt delivery. Without vsync, WindowServer never
+		// gets display-ready events → GPU ring stays idle → black screen (CSB=0x0).
+		if (NGreen::callback->dmcIsAdlp && NGreen::callback->uefiCtl1 != 0) {
+			uint32_t targetCtl1 = NGreen::callback->uefiCtl1 | 0x00000401u;
+			if (pwrWell != targetCtl1) {
+				NGreen::callback->writeReg32(0x45400, targetCtl1);
+				SYSLOG("ngreen", "V104P[%d]: PWR_WELL CTL1 0x%x -> 0x%x (restored)", v60Count, pwrWell, targetCtl1);
+			}
+		}
 	}
 
 	// ── V76: Deep display diagnostic + framebuffer physical write test ──
@@ -2916,6 +3024,8 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		}
 		SYSLOG("ngreen", "V76[%d]: GAMMA idx_was=0x%x g[0]=0x%x g[128]=0x%x g[255]=0x%x",
 			   v60Count, gammaIdx, gamma0, gamma128, gamma255);
+
+		// (V105 now runs every tick in the periodic section above)
 
 		// 6. Framebuffer physical read test — read pixels from the display surface
 		// to check current content. V83 handles filling; V76 only reads now.
@@ -4760,8 +4870,9 @@ bool  Gen11::tgstart(void *that,void *param_1)
 
 void Gen11::FBMemMgr_Init(void *that)
 {
-	ccont = getMember<void *>(that, 0xc40);
-	
+	ccont  = getMember<void *>(that, 0xc40);  // MMIO register access manager
+	ccont2 = that;                             // AppleIntelBaseController itself
+
 	FunctionCast(FBMemMgr_Init, callback->oFBMemMgr_Init)(that);
 	
 	
@@ -4915,15 +5026,97 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 		}
 	}
 
-	// PLANE_STRIDE and PLANE_CTL fixups disabled: driver already programs correct
-	// linear stride without GPU accel. The * 8 multiplier produced 8× too wide
-	// stride → horizontal bars, TV noise, quadruplicate cursor. Let driver values pass.
-	// Keeping the log so we can observe what the driver actually writes.
-	if ((param_1 & 0xFFFFF) == 0x70188) { // PLANE_STRIDE Pipe A Plane 1 (log only)
-		DBGLOG("ngreen", "PLANE_STRIDE passthrough: 0x%lx val=0x%x", param_1, param_2);
+	// V99: PLANE_STRIDE — convert X-tiled stride (512-byte tile units) to Y-tiled/linear
+	// stride (64-byte cacheline units) by multiplying by 8.
+	// TGL kext writes 0x14 (X-tiled, 20×512=10240 bytes=2560px BGRA8); correct is 0xa0
+	// (160×64=10240 bytes). Matches EFI GOP Y-tiled state that produced working display.
+	// Horizontal-bars issue from prior FastWriteRegister32 attempt was because PLANE_CTL
+	// tiling was NOT changed to Y-tiled, leaving X-tiled CTL + wrong stride → 8× too wide.
+	// Both registers are now fixed consistently here (during hwSetMode), not in FastWrite.
+	if ((param_1 & 0xFFFFF) == 0x70188) { // PLANE_STRIDE Pipe A Plane 1
+		uint32_t strideFixed = param_2 * 8; // X-tiled(512B) → 64B cacheline units
+		static int v99SCount = 0;
+		if (v99SCount < 5)
+			SYSLOG("ngreen", "V99R[S%d]: PLANE_STRIDE 0x%x -> 0x%x (x-tile->64B units)",
+				   ++v99SCount, param_2, strideFixed);
+		else
+			DBGLOG("ngreen", "V99R: PLANE_STRIDE 0x%x -> 0x%x", param_2, strideFixed);
+		param_2 = strideFixed;
 	}
-	if ((param_1 & 0xFFFFF) == 0x70180) { // PLANE_CTL Pipe A Plane 1 (log only)
-		DBGLOG("ngreen", "PLANE_CTL passthrough: 0x%lx val=0x%x tiling_bits=0x%x", param_1, param_2, (param_2 >> 10) & 0x7);
+	// V99: PLANE_CTL — when driver sets X-tiled (bits[12:10]=001), change to Y-tiled
+	// legacy (bits[12:10]=100) to match EFI GOP state and IntelAccelerator IOSurface format.
+	if ((param_1 & 0xFFFFF) == 0x70180) { // PLANE_CTL Pipe A Plane 1
+		uint32_t tiling = (param_2 >> 10) & 0x7;
+		if (tiling == 0x1) { // X-tiled (001) → Y-tiled legacy (100)
+			uint32_t ctlFixed = (param_2 & ~(0x7u << 10)) | (0x4u << 10);
+			static int v99CCount = 0;
+			if (v99CCount < 5)
+				SYSLOG("ngreen", "V99R[C%d]: PLANE_CTL 0x%x -> 0x%x (tiling X->Y)",
+					   ++v99CCount, param_2, ctlFixed);
+			else
+				DBGLOG("ngreen", "V99R: PLANE_CTL 0x%x -> 0x%x", param_2, ctlFixed);
+			param_2 = ctlFixed;
+		} else {
+			DBGLOG("ngreen", "PLANE_CTL passthrough: 0x%lx val=0x%x tiling=0x%x",
+				   param_1, param_2, tiling);
+		}
+	}
+
+	// V97: TRANS_DDI_FUNC_CTL_A (0x60400): clear bit[16] on !isRealTGL.
+	// Apple's SetupParams always sets bit[16] (PORT_SYNC_MODE_MASTER_SELECT[0]) which
+	// UEFI GOP did not set. Writing it to an active transcoder disrupts the trained
+	// 4-lane eDP link, leading to "InterLane Alignment is lost" ~10s later.
+	if ((param_1 & 0xFFFFF) == 0x60400 && NGreen::callback && !NGreen::callback->isRealTGL) {
+		static int v97RCount = 0;
+		if (v97RCount < 10) {
+			v97RCount++;
+			SYSLOG("ngreen", "V97R[%d]: TRANS_DDI_FUNC_CTL_A write 0x%x -> 0x%x (cleared bit16)",
+				   v97RCount, param_2, param_2 & ~(1u << 16));
+		}
+		param_2 &= ~(1u << 16);
+	}
+
+	// V103: DC_STATE_EN (0x45504) — block all non-zero writes when ADL-P DMC is loaded.
+	// Apple's runtime power management (setAggressiveness type=3) re-enables DC3/DC5/DC6
+	// by writing DC_STATE_EN after hwInitializeCState. The ADL-P DMC then enters the
+	// requested DC state, cutting PHY clocks → all eDP lanes drop simultaneously at ~70s.
+	// Apple's ICL-targeted driver has no ADL-P DC exit recovery → display stays dead.
+	// Fix: keep DC_STATE_EN=0 at all times so the DMC never enters DC5/DC6.
+	if ((param_1 & 0xFFFFF) == 0x45504 && NGreen::callback && NGreen::callback->dmcIsAdlp) {
+		if (param_2 != 0) {
+			static int v103Count = 0;
+			if (v103Count < 20) {
+				v103Count++;
+				SYSLOG("ngreen", "V103[%d]: DC_STATE_EN write 0x%x -> 0 (blocked to prevent ADL-P DMC DC exit)",
+					   v103Count, param_2);
+			}
+			param_2 = 0;
+		}
+	}
+
+	// V99S: PLANE_SURF arm — force correct STRIDE immediately before latching.
+	// raWriteRegister32/WriteRegister32 is a CACHE-ONLY update; hardware MMIO for
+	// double-buffered PLANE_STRIDE is written via a volatile* path not caught by
+	// FastWriteRegister32. Forcing writeReg32 here ensures the pending shadow
+	// holds 0xa0 (160 × 64B = 10240B = 2560px BGRA8 Y-tiled) right before SURF arm.
+	if ((param_1 & 0xFFFFF) == 0x7019C && NGreen::callback) {
+		uint32_t hwStride = NGreen::callback->readReg32(0x70188);
+		uint32_t hwCtl    = NGreen::callback->readReg32(0x70180);
+		static int v99SCount = 0;
+		if (v99SCount < 5) {
+			SYSLOG("ngreen", "V99S[%d]: SURF arm 0x%x: pre-arm STRIDE=0x%x CTL=0x%x",
+				   ++v99SCount, (uint32_t)param_2, hwStride, hwCtl);
+		}
+		// Force STRIDE to 0xa0 (Y-tiled/linear units: 160 × 64B = 10240B = 2560px × 4bpp)
+		if (hwStride != 0xa0) {
+			NGreen::callback->writeReg32(0x70188, 0xa0);
+		}
+		// Force CTL to Y-tiled legacy if currently X-tiled (001→100)
+		uint32_t hwTiling = (hwCtl >> 10) & 0x7;
+		if (hwTiling == 0x1) {
+			uint32_t newCtl = (hwCtl & ~(0x7u << 10)) | (0x4u << 10);
+			NGreen::callback->writeReg32(0x70180, newCtl);
+		}
 	}
 
 	if (reinterpret_cast<volatile uint64_t*>(that)==nullptr) return NGreen::callback->writeReg32(param_1,param_2);
@@ -4933,6 +5126,19 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 
 void Gen11::raWriteRegister32f(void *that,unsigned long param_1, UInt32 param_2)
 {
+	// V99f: also intercept the "f" (fast/direct) variant in case STRIDE uses this path.
+	if ((param_1 & 0xFFFFF) == 0x70188) {
+		uint32_t strideFixed = param_2 * 8;
+		DBGLOG("ngreen", "V99f: PLANE_STRIDE(f) 0x%x -> 0x%x", param_2, strideFixed);
+		param_2 = strideFixed;
+	}
+	if ((param_1 & 0xFFFFF) == 0x70180) {
+		uint32_t tiling = (param_2 >> 10) & 0x7;
+		if (tiling == 0x1) {
+			param_2 = (param_2 & ~(0x7u << 10)) | (0x4u << 10);
+			DBGLOG("ngreen", "V99f: PLANE_CTL(f) X->Y 0x%x", param_2);
+		}
+	}
 	FunctionCast(raWriteRegister32f, callback->oraWriteRegister32f)( that,param_1,param_2);
 };
 
@@ -5165,7 +5371,7 @@ bool Gen11::AppleIntelBaseControllerstart(void *that,void *param_1)
 	NGreen::callback->intel_de_rmw(CLKREQ_POLICY, CLKREQ_POLICY_MEM_UP_OVRD, 0);
 	
 	SYSLOG("ngreen", "AppleIntelBaseControllerstart: display workarounds applied");
-	
+
 	SYSLOG("ngreen", "FBController::start() entering...");
 	auto ret=FunctionCast(AppleIntelBaseControllerstart, callback->oAppleIntelBaseControllerstart)(that,param_1 );
 	SYSLOG("ngreen", "FBController::start() returned %d", ret);
@@ -5341,28 +5547,101 @@ void Gen11::disableCDClock(void *that)
 
 bool Gen11::AppleIntelFramebufferinit(void *frame,void *cont,uint32_t param_2)
 {
-	// Framebuffer live-cont fix disabled for boot-blocker isolation.
-	// getMember<void *>(frame, 0x4a40) = cont;
-	// getMember<void *>(frame, 0xc40) = cont;
+	getMember<void *>(frame, 0x4a40) = ccont;
+	getMember<void *>(frame, 0xc40)  = ccont;
 	auto ret=FunctionCast(AppleIntelFramebufferinit, callback->oAppleIntelFramebufferinit)(frame,cont,param_2 );
 	getMember<void *>(frame, 0x4a40) = ccont;
+	getMember<void *>(frame, 0xc40)  = ccont;
 	return ret;
 }
 
 uint8_t  Gen11::AppleIntelPlaneinit(void *that,uint8_t param_1)
 {
-	return FunctionCast(AppleIntelPlaneinit, callback->oAppleIntelPlaneinit)(that,param_1 );
+	auto ret = FunctionCast(AppleIntelPlaneinit, callback->oAppleIntelPlaneinit)(that,param_1 );
+	getMember<void *>(that, 0x90) = ccont;
+	return ret;
 }
 
 unsigned long Gen11::AppleIntelScalerinit(void *that,uint8_t param_1)
 {
-	return FunctionCast(AppleIntelScalerinit, callback->oAppleIntelScalerinit)(that,param_1 );
+	auto ret = FunctionCast(AppleIntelScalerinit, callback->oAppleIntelScalerinit)(that,param_1 );
+	getMember<void *>(that, 0x28) = ccont;
+	getMember<void *>(that, 0x10) = ccont2;
+	return ret;
 }
 
 void  Gen11::disableScaler(void *that,bool param_1)
 {
 	getMember<void *>(that, 0x28) = ccont;
 	FunctionCast(disableScaler, callback->odisableScaler)(that,param_1 );
+}
+
+void Gen11::initPlatformWorkarounds(void *that)
+{
+	// Platform workaround flags for ADL-P (RPL-P) running under TGL driver.
+	// 0xC5C = fInfoFlags2: display feature flags
+	// ADL-P uses PCH PWM for backlight (cnp_setup_backlight confirmed in Linux syslog).
+	// Do NOT set FB_FLAG_ENABLE_BACKLIGHT_REG_CONTROL (that forces CPU-register backlight).
+	getMember<volatile uint32_t>(that, 0xC5C) =
+		FB_FLAG_ALTERNATE_PWM_INCREMENT1 |
+		FB_FLAG_ALTERNATE_PWM_INCREMENT2 |
+		FB_FLAG_ENABLE_SLICE_FEATURES    |
+		FB_FLAG_FORCE_POWER_ALWAYS_CONNECTED |
+		FB_FLAG_AVOID_FAST_LINK_TRAINING;
+	// 0xC58 = fInfoFlags (boot flags)
+	getMember<volatile uint32_t>(that, 0xC58) = FB_FLAG_BOOST_PIXEL_FREQUENCY_LIMIT;
+
+	FunctionCast(initPlatformWorkarounds, callback->oinitPlatformWorkarounds)(that);
+}
+
+uint64_t Gen11::getOSInformation(void *that)
+{
+	auto *pinfo = reinterpret_cast<PlatformInfo *>(callback->gPlatformInformationList);
+	if (pinfo) {
+		// Index 1 = the mobile TGL/ADL-P platform entry (0x9A490000 and variants).
+		pinfo[1].fInfoFlags =
+			FB_FLAG_DISABLE_PIPE_SCRAMBLE      |
+			FB_FLAG_FRAMEBUFFER_COMPRESSION    |
+			FB_FLAG_ALLOW_CONNECTOR_RECOVER    |
+			FB_FLAG_FORCE_POWER_ALWAYS_CONNECTED |
+			FB_FLAG_AVOID_FAST_LINK_TRAINING;
+
+		pinfo[1].cameliav = 0;  // no TCON (Camellia/Banksia disabled)
+		pinfo[1].fMobile  = 1;
+		// Use Apple TGL native counts for 0x9a490000 (3/3/3 from original IGFB binary).
+		// NootedBlue used 4/4/2 for a different machine; our platform needs 3/3/3 to allow
+		// IOAccelDisplayPipeUserClient2 to reach state=0x1e (fully matched, driver started).
+		pinfo[1].fPipeCount            = 3;
+		pinfo[1].fInfoPortCount        = 3;
+		pinfo[1].fInfoFramebufferCount = 3;
+		pinfo[1].fSliceCount  = 1;
+		pinfo[1].fmaxEuCount  = 8;
+		pinfo[1].fsubslices   = 10;
+
+		// Connector 0: built-in eDP (LVDS), DDI-A, pipe 0
+		pinfo[1].connectors[0].index = 0;
+		pinfo[1].connectors[0].busId = 0;
+		pinfo[1].connectors[0].pipe  = 0;
+		pinfo[1].connectors[0].pad   = 0;
+		pinfo[1].connectors[0].type  = ConnectorLVDS;
+		pinfo[1].connectors[0].flags = 0x8 | 0x10;  // AlwaysConnected + Support32BPP
+
+		// Connector 1: external USB-C/Thunderbolt DP (TC1/DDI-D), pipe 2
+		// Linux syslog confirms: no HDMI on DDI-B; external ports are TC1/TC2 (USB-C/TBT)
+		pinfo[1].connectors[1].index = 1;
+		pinfo[1].connectors[1].busId = 1;
+		pinfo[1].connectors[1].pipe  = 2;
+		pinfo[1].connectors[1].pad   = 0;
+		pinfo[1].connectors[1].type  = ConnectorDP;
+		pinfo[1].connectors[1].flags = 0x1 | 0x400;  // CNAlterAppertureRequirements + CNFlagDP
+
+		// Connectors 2-3: unused (Dummy)
+		pinfo[1].connectors[2] = { 2, 2, 2, 0, ConnectorDummy, 0 };
+		pinfo[1].connectors[3] = { 3, 3, 3, 0, ConnectorDummy, 0 };
+
+		SYSLOG("ngreen", "getOSInformation: patched pinfo[1] for ADL-P (LVDS+HDMI, mobile)");
+	}
+	return FunctionCast(getOSInformation, callback->ogetOSInformation)(that);
 }
 
 void Gen11::programPipeScaler(void *that,void *param_1)
@@ -5480,10 +5759,7 @@ void Gen11::hwInitializeCState(void *that)
 
 	if (dmcArg[0] == 't' || dmcArg[0] == 'T') {
 		// ── TGL DMC ──
-		SYSLOG("ngreen", "hwInitCState: ngreen-dmc=tgl, loading TGL DMC v2.12 (%u bytes)", tgl_dmc_ver2_12_bin_s);
-		getMember<int>(that, 0xB48) = 0; // suppress original CSR load
-		FunctionCast(hwInitializeCState, callback->ohwInitializeCState)(that);
-		getMember<int>(that, 0xB48) = origB48;
+		SYSLOG("ngreen", "hwInitCState: ngreen-dmc=tgl, loading TGL DMC v2.12 (%u dwords)", tgl_dmc_ver2_12_bin_s / 4);
 		// Write TGL DMC blob to MMIO 0x80000+
 		for (unsigned long off = 0; off < tgl_dmc_ver2_12_bin_s; off += 4)
 			FastWriteRegister32(ccont, off + 0x80000,
@@ -5493,21 +5769,31 @@ void Gen11::hwInitializeCState(void *that)
 		// DC_STATE_EN = 0x45504
 		NGreen::callback->writeReg32(DC_STATE_EN, 0);
 
-		// Power wells — ICL-style DDI/AUX enable for TGL (same register layout)
-		NGreen::callback->writeReg32(0x45400, 0x00000401); // HSW_PWR_WELL_CTL1
-		NGreen::callback->writeReg32(0x45404, 0x00000C03); // HSW_PWR_WELL_CTL2
+		// Use UEFI CTL1 as base (same pattern as ADL-P path).
+		uint32_t tglUefiCtl1 = NGreen::callback->readReg32(0x45400);
+		{
+			uint32_t newCtl1 = tglUefiCtl1 | 0x00000401u;
+			NGreen::callback->writeReg32(0x45400, newCtl1); // HSW_PWR_WELL_CTL1
+			NGreen::callback->writeReg32(0x45404, 0x00000C03); // HSW_PWR_WELL_CTL2
+			SYSLOG("ngreen", "V101T: PWR_WELL CTL1 uefi=0x%x->0x%x CTL2=0xc03", tglUefiCtl1, newCtl1);
+		}
+		NGreen::callback->writeReg32(0x45408, 0x40000000); // HSW_PWR_WELL_CTL3
+		NGreen::callback->writeReg32(0x4540C, 0x00000401); // HSW_PWR_WELL_CTL4
 		NGreen::callback->writeReg32(0x45440, 0x00000003); // ICL_PWR_WELL_CTL_AUX1 — AUX A
 		NGreen::callback->writeReg32(0x45444, 0x00000003); // ICL_PWR_WELL_CTL_AUX2 — AUX B
 		NGreen::callback->writeReg32(0x45450, 0x00000003); // ICL_PWR_WELL_CTL_DDI1 — DDI A
 		NGreen::callback->writeReg32(0x45454, 0x00000003); // ICL_PWR_WELL_CTL_DDI2 — DDI B
 
 		// TGL display engine registers (DMC trigger/context regs in 0x8Fxxx range)
+		// Values from IDA of original hwInitializeCState (TGL-native values)
 		NGreen::callback->writeReg32(0x8F074, 0x00006FC0);
 		NGreen::callback->writeReg32(0x8F004, 0x00A40088);
 		NGreen::callback->writeReg32(0x8F034, 0xC003B400);
 
 		// Enable DMC — DC_STATE_DEBUG (0x45520) = 2
 		NGreen::callback->writeReg32(0x45520, 2); // DC_STATE_DEBUG
+		NGreen::callback->dmcIsAdlp = true;        // reuse flag: also protects TGL path via V103/V104P
+		NGreen::callback->uefiCtl1  = tglUefiCtl1;
 		SYSLOG("ngreen", "hwInitCState: TGL DMC loaded");
 		// Program combo PHY signal levels — PHY_A (eDP, 4 lanes, HBR) + PHY_B (DP-B, 4 lanes, HBR)
 		{
@@ -5516,14 +5802,32 @@ void Gen11::hwInitializeCState(void *that)
 			IntelDPLinkTraining::setSignalLevels(/*phy=*/0, /*lanes=*/4, /*isHBR2=*/false, /*isDP=*/true, swing, preEmph);
 			IntelDPLinkTraining::setSignalLevels(/*phy=*/1, /*lanes=*/4, /*isHBR2=*/false, /*isDP=*/true, swing, preEmph);
 		}
+		// Let original run with B48=1 (ICL CSR blob loads to SRAM).
+		// Same rationale as ADL-P: the TGL DMC firmware also causes lane drops because its
+		// DC state management runs on ADL-P hardware; the ICL DMC is safer on this silicon.
+		// TGL context regs (8Fxxx) are re-applied after so the display engine sees TGL values.
+		FunctionCast(hwInitializeCState, callback->ohwInitializeCState)(that);
+		// Re-apply TGL context regs overwritten by original's ICL blob load.
+		NGreen::callback->writeReg32(0x8F074, 0x00006FC0);
+		NGreen::callback->writeReg32(0x8F004, 0x00A40088);
+		NGreen::callback->writeReg32(0x8F034, 0xC003B400);
+		SYSLOG("ngreen", "V104T: TGL context regs re-applied after ICL blob load");
+		// V102T: restore CTL1 after original (ICL DMC save/restore table may write 0x401).
+		{
+			uint32_t postCtl1 = NGreen::callback->readReg32(0x45400);
+			uint32_t fixCtl1  = tglUefiCtl1 | 0x00000401u;
+			if (postCtl1 != fixCtl1) {
+				NGreen::callback->writeReg32(0x45400, fixCtl1);
+				SYSLOG("ngreen", "V102T: restore PWR_WELL CTL1 0x%x->0x%x", postCtl1, fixCtl1);
+			}
+		}
 
 	} else if (dmcArg[0] == 'a' || dmcArg[0] == 'A') {
 		// ── ADL-P DMC ──
-		SYSLOG("ngreen", "hwInitCState: ngreen-dmc=adlp, loading ADL-P DMC v2.16 (%u bytes)", adlp_dmc_ver2_16_bin_s);
-		getMember<int>(that, 0xB48) = 0; // suppress original CSR load
-		FunctionCast(hwInitializeCState, callback->ohwInitializeCState)(that);
-		getMember<int>(that, 0xB48) = origB48;
-		// Write ADL-P DMC blob to MMIO 0x80000+
+		SYSLOG("ngreen", "hwInitCState: ngreen-dmc=adlp, loading ADL-P DMC v2.16 (%u dwords)", adlp_dmc_ver2_16_bin_s / 4);
+		// adlp_dmc_ver2_16_bin is the raw firmware payload extracted from the v3 blob
+		// (adlp_dmc_ver2_16.bin: CSS+package header stripped, pipe-A payload at file offset 0x310).
+		// Write directly to SRAM starting at 0x80000.
 		for (unsigned long off = 0; off < adlp_dmc_ver2_16_bin_s; off += 4)
 			FastWriteRegister32(ccont, off + 0x80000,
 				*(const uint32_t *)((const char *)adlp_dmc_ver2_16_bin + off));
@@ -5538,8 +5842,21 @@ void Gen11::hwInitializeCState(void *that)
 		// Linux intel_reg dump on same hardware (reg_dump.txt):
 		//   CTL1=0x00000401 (PG1 req+enabled), CTL2=0x00000C03 (PG1+PG2 req+enabled)
 		//   CTL3=0x40000000 (PG3 state only), CTL4=0x00000401
-		NGreen::callback->writeReg32(0x45400, 0x00000401); // HSW_PWR_WELL_CTL1
-		NGreen::callback->writeReg32(0x45404, 0x00000C03); // HSW_PWR_WELL_CTL2
+		// V100: preserve UEFI CTL1 state bits (bits 12,14 = display power wells enabled).
+		// Writing the hardcoded 0x401 clears those bits, breaking vsync interrupt delivery
+		// → WindowServer crash at ~60s ("Display not ready").
+		// Fix: read UEFI CTL1 and OR in our minimum bits; keep CTL2 hardcoded at 0x0C03.
+		// DO NOT OR CTL2 with UEFI: UEFI leaves 0xfc00 (TC port "state" bits) set in CTL2.
+		// Asserting TC bits without IOM handshake disrupts the display domain during mode
+		// change, preventing the WSA un-blank (stays at 0x1, no cursor, no desktop).
+		uint32_t uefiCtl1 = NGreen::callback->readReg32(0x45400);
+		{
+			uint32_t newCtl1  = uefiCtl1 | 0x00000401u;  // ensure PG1 req+state bits set
+			NGreen::callback->writeReg32(0x45400, newCtl1); // HSW_PWR_WELL_CTL1
+			NGreen::callback->writeReg32(0x45404, 0x00000C03); // HSW_PWR_WELL_CTL2 — hardcoded, no TC bits
+			SYSLOG("ngreen", "V101: PWR_WELL CTL1 uefi=0x%x->0x%x CTL2=0xc03",
+			       uefiCtl1, newCtl1);
+		}
 		NGreen::callback->writeReg32(0x45408, 0x40000000); // HSW_PWR_WELL_CTL3
 		NGreen::callback->writeReg32(0x4540C, 0x00000401); // HSW_PWR_WELL_CTL4
 		// ICL_PWR_WELL_CTL_AUX1/2 (0x45440/45444): enable AUX power wells A+B
@@ -5550,14 +5867,15 @@ void Gen11::hwInitializeCState(void *that)
 		NGreen::callback->writeReg32(0x45450, 0x00000003); // ICL_PWR_WELL_CTL_DDI1 — DDI A enabled
 		NGreen::callback->writeReg32(0x45454, 0x00000003); // ICL_PWR_WELL_CTL_DDI2 — DDI B enabled
 
-		// ADL-P / RPL-P display engine registers
-		// DDI A+B (Gen12 / Gen13 shared combo PHY — 0x8Fxxx range)
+		// ADL-P / RPL-P display engine registers — exact MMIO init pairs from v3 blob header
+		// (adlp_dmc_ver2_16.bin header @ 0x0210, MMIO[0..6], stepping='A' variant)
 		NGreen::callback->writeReg32(0x8F074, 0x00086FC0);
 		NGreen::callback->writeReg32(0x8F034, 0xC003B400);
 		NGreen::callback->writeReg32(0x8F004, 0x01240108);
-		NGreen::callback->writeReg32(0x8F008, 0x512050D4);
+		NGreen::callback->writeReg32(0x8F038, 0xC003B200); // was missing
+		NGreen::callback->writeReg32(0x8F008, 0x4FE44F98); // corrected from 0x512050D4
 		NGreen::callback->writeReg32(0x8F03C, 0xC003B300);
-		NGreen::callback->writeReg32(0x8F00C, 0x584C57FC);
+		NGreen::callback->writeReg32(0x8F00C, 0x571056C0); // corrected from 0x584C57FC
 		// DDI C-F (ADL-P TC port registers — DKL PHY, 0x5Fxxx range)
 		NGreen::callback->writeReg32(0x5F074, 0x00096FC0);
 		NGreen::callback->writeReg32(0x5F034, 0xC003DF00);
@@ -5602,7 +5920,13 @@ void Gen11::hwInitializeCState(void *that)
 		//   0x60040 = TRANS_LINK_M1_A
 		//   0x60044 = TRANS_LINK_N1_A
 		// Values sourced from Linux intel_reg dump on the same hardware.
-		NGreen::callback->writeReg32(0x60400, 0x8A000006); // TRANS_DDI_FUNC_CTL_A
+		// 0x8A010102: bit31=enable, [27:24]=DDI_A, [19:16]=2lanes, [3:1]=DP_SST(0x01)
+		// Matches Apple's programmed value so paramsFbCompare sees no lane-count change
+		// 0x8A010102: bit31=enable, [27:24]=DDI_A, [19:16]=2lanes, [3:1]=DP_SST(0x01)
+		// Matches Apple's target so paramsFbCompare sees no lane-count change.
+		// Changing lane count in TRANS_DDI_FUNC_CTL while transcoder is live resets DDI
+		// buffer and drops the trained link. Always write 2-lane DP SST to pre-match Apple.
+		NGreen::callback->writeReg32(0x60400, 0x8A000106); // TRANS_DDI_FUNC_CTL_A
 		NGreen::callback->writeReg32(0x60000, 0x0A9F09FF); // TRANS_HTOTAL_A
 		NGreen::callback->writeReg32(0x60004, 0x0A9F09FF); // TRANS_HBLANK_A
 		NGreen::callback->writeReg32(0x60008, 0x0A4F0A2F); // TRANS_HSYNC_A
@@ -5636,6 +5960,8 @@ void Gen11::hwInitializeCState(void *that)
 
 		// Enable DMC — DC_STATE_DEBUG (0x45520) = 2
 		NGreen::callback->writeReg32(0x45520, 2); // DC_STATE_DEBUG
+		NGreen::callback->dmcIsAdlp = true;
+		NGreen::callback->uefiCtl1  = uefiCtl1;  // save for V60 re-enforcement
 		SYSLOG("ngreen", "hwInitCState: ADL-P DMC loaded");
 		// Program ADL-P combo PHY signal levels — PHY_A (eDP) + PHY_B (DP-B).
 		// Uses ADL-P specific translation tables (adlp_combo_phy_trans_dp_hbr/hbr2).
@@ -5643,8 +5969,38 @@ void Gen11::hwInitializeCState(void *that)
 		{
 				uint8_t swing[4]   = {0, 0, 0, 0};
 				uint8_t preEmph[4] = {0, 0, 0, 0};
+				// eDP runs at HBR3 (8.1 Gbps, linkSymbolClock=810MHz) for 2560x1600.
+				// isHBR2=true was WRONG — it programs HBR2 signal tables → setPortMode trains
+				// at reduced amplitude → link falls back to 2 lanes (DDI_FUNC_EDP=0x8a010102).
+				// With isHBR2=false (HBR/HBR3 tables), bitRate matches UEFI-trained levels → 4 lanes.
 				IntelDPLinkTraining::setSignalLevelsADLP(/*phy=*/0, /*lanes=*/4, /*isHBR2=*/false, /*isEDP=*/true,  swing, preEmph);
 				IntelDPLinkTraining::setSignalLevelsADLP(/*phy=*/1, /*lanes=*/4, /*isHBR2=*/false, /*isEDP=*/false, swing, preEmph);
+		}
+		// Let original run with B48=1 so the ICL CSR blob is loaded to SRAM.
+		// The ADL-P DMC firmware (even correct binary) autonomously drops all eDP lanes
+		// at ~10s because its DC state management code runs on ADL-P hardware and performs
+		// link maintenance that the ICL driver can't recover from. The ICL DMC running on
+		// ADL-P hardware does NOT cause lane drops (it doesn't know ADL-P DC3CO/PSR2).
+		// Our ADL-P display engine context regs (8Fxxx) are re-applied after the original
+		// so the display engine still sees ADL-P-correct values despite ICL SRAM content.
+		FunctionCast(hwInitializeCState, callback->ohwInitializeCState)(that);
+		// Re-apply ADL-P context regs overwritten by original's ICL blob load.
+		NGreen::callback->writeReg32(0x8F074, 0x00086FC0);
+		NGreen::callback->writeReg32(0x8F034, 0xC003B400);
+		NGreen::callback->writeReg32(0x8F004, 0x01240108);
+		NGreen::callback->writeReg32(0x8F038, 0xC003B200);
+		NGreen::callback->writeReg32(0x8F008, 0x4FE44F98);
+		NGreen::callback->writeReg32(0x8F03C, 0xC003B300);
+		NGreen::callback->writeReg32(0x8F00C, 0x571056C0);
+		SYSLOG("ngreen", "V104: ADL-P context regs re-applied after ICL blob load");
+		// V102: CTL1 restore — ICL DMC save/restore table writes CTL1=0x401, clearing
+		{
+			uint32_t postCtl1 = NGreen::callback->readReg32(0x45400);
+			uint32_t fixCtl1  = uefiCtl1 | 0x00000401u;
+			if (postCtl1 != fixCtl1) {
+				NGreen::callback->writeReg32(0x45400, fixCtl1);
+				SYSLOG("ngreen", "V102: restore PWR_WELL CTL1 0x%x->0x%x", postCtl1, fixCtl1);
+			}
 		}
 
 	} else if (dmcArg[0] == 'i' || dmcArg[0] == 'I') {
@@ -5779,6 +6135,17 @@ void Gen11::hwConfigureCustomAUX(void *that,bool param_1)
 
 void Gen11::FastWriteRegister32(void *that,unsigned long param_1,uint32_t param_2)
 {
+	// V99D: Diagnose — log all FastWrite calls near display engine range on first boot
+	// to understand what addresses/values flow through this path.
+	{
+		static int v99DCount = 0;
+		if (v99DCount < 30) {
+			v99DCount++;
+			SYSLOG("ngreen", "V99D[%d]: FastWrite addr=0x%lx val=0x%x",
+				   v99DCount, param_1, param_2);
+		}
+	}
+
 	// ── V72: EMR write intercept — force all errors masked ──
 	if (param_1 == 0x20b4 || param_1 == 0x220b4) {
 		if (param_2 != 0xFFFFFFFF) {
@@ -5792,15 +6159,61 @@ void Gen11::FastWriteRegister32(void *that,unsigned long param_1,uint32_t param_
 		}
 	}
 
-	if (param_1 == 0x70188) { // PLANE_STRIDE Pipe A Plane 1
-		UInt32 linear = param_2 * 8;
-		DBGLOG("ngreen", "FastWrite PLANE_STRIDE fixup: 0x%x -> 0x%x (linear)", param_2, linear);
-		param_2 = linear;
+	// V99F: PLANE_STRIDE — use & 0xFFFFF mask in case param_1 is a full MMIO address.
+	if ((param_1 & 0xFFFFF) == 0x70188) { // PLANE_STRIDE Pipe A Plane 1
+		uint32_t strideFixed = param_2 * 8; // X-tiled(512B) → 64B cacheline units
+		static int v99FSCount = 0;
+		if (v99FSCount < 5)
+			SYSLOG("ngreen", "V99F[S%d]: PLANE_STRIDE addr=0x%lx 0x%x -> 0x%x",
+				   ++v99FSCount, param_1, param_2, strideFixed);
+		else
+			DBGLOG("ngreen", "V99F: PLANE_STRIDE 0x%x -> 0x%x", param_2, strideFixed);
+		param_2 = strideFixed;
 	}
-	if (param_1 == 0x70180) { // PLANE_CTL Pipe A Plane 1
-		param_2 &= ~(0x7u << 10); // clear tiling bits[12:10] → linear (V80 fix: was <<12)
-		DBGLOG("ngreen", "FastWrite PLANE_CTL fixup: forced linear tiling 0x%x", param_2);
+	// V99F: PLANE_CTL
+	if ((param_1 & 0xFFFFF) == 0x70180) { // PLANE_CTL Pipe A Plane 1
+		uint32_t tiling = (param_2 >> 10) & 0x7;
+		if (tiling == 0x1) { // X-tiled (001) → Y-tiled legacy (100)
+			uint32_t ctlFixed = (param_2 & ~(0x7u << 10)) | (0x4u << 10);
+			static int v99FCCount = 0;
+			if (v99FCCount < 5)
+				SYSLOG("ngreen", "V99F[C%d]: PLANE_CTL addr=0x%lx 0x%x -> 0x%x (tiling X->Y)",
+					   ++v99FCCount, param_1, param_2, ctlFixed);
+			else
+				DBGLOG("ngreen", "V99F: PLANE_CTL 0x%x -> 0x%x", param_2, ctlFixed);
+			param_2 = ctlFixed;
+		} else {
+			DBGLOG("ngreen", "FastWrite PLANE_CTL passthrough: 0x%x tiling=0x%x",
+				   param_2, tiling);
+		}
 	}
+	// V103: DC_STATE_EN (0x45504) — same block as raWriteRegister32.
+	// FastWriteRegister32 is used for high-frequency register paths; intercept here too.
+	if ((param_1 & 0xFFFFF) == 0x45504 && NGreen::callback && NGreen::callback->dmcIsAdlp) {
+		if (param_2 != 0) {
+			static int v103FCount = 0;
+			if (v103FCount < 20) {
+				v103FCount++;
+				SYSLOG("ngreen", "V103F[%d]: DC_STATE_EN FastWrite 0x%x -> 0 (blocked)",
+					   v103FCount, param_2);
+			}
+			param_2 = 0;
+		}
+	}
+
+	// V99F: PLANE_SURF arm — same belt-and-suspenders fix as raWriteRegister32 V99S
+	if ((param_1 & 0xFFFFF) == 0x7019C && NGreen::callback) {
+		uint32_t hwStride = NGreen::callback->readReg32(0x70188);
+		static int v99FSurfCount = 0;
+		if (v99FSurfCount < 3) {
+			SYSLOG("ngreen", "V99F[SURF%d]: arm 0x%x pre-arm STRIDE=0x%x",
+				   ++v99FSurfCount, param_2, hwStride);
+		}
+		if (hwStride != 0xa0) {
+			NGreen::callback->writeReg32(0x70188, 0xa0);
+		}
+	}
+
 	return FunctionCast(FastWriteRegister32, callback->oFastWriteRegister32)(that,param_1,param_2 );
 }
 
@@ -5815,6 +6228,51 @@ uint8_t Gen11::hwRegsNeedUpdate
 		   void *param_2,void *param_3,void *param_4,
 		   void *param_5)
 {
+	// IDA (hwSetMode + hwRegsNeedUpdate) confirms param_3 is the pending CRTCParams
+	// built by SetupParams. CRTCParams+0x04 is TRANS_DDI_FUNC_CTL. On spoofed !TGL,
+	// clear bit[16] before compare/apply so the full modeset path does not request
+	// 0x8a010106 against an already-trained 0x8a000106 link.
+	if (!NGreen::callback->isRealTGL && param_3) {
+		auto *pending = reinterpret_cast<uint32_t *>(param_3);
+
+		// V97P: clear bit[16] in TRANS_DDI_FUNC_CTL (offset +0x04).
+		// Apple's SetupParams sets bit16 as a port-type flag; UEFI/HW never sets it.
+		// Without this the DDI FUNC_CTL compare fires and triggers a full modeset
+		// that disrupts the already-trained 4-lane eDP link → black screen.
+		uint32_t &transDdi = pending[1]; // offset +0x04
+		if (transDdi & (1u << 16)) {
+			static int v97PCount = 0;
+			if (v97PCount < 12) {
+				v97PCount++;
+				SYSLOG("ngreen", "V97P[%d]: CRTCParams TRANS_DDI_FUNC_CTL 0x%x -> 0x%x",
+				       v97PCount, transDdi, transDdi & ~(1u << 16));
+			}
+			transDdi &= ~(1u << 16);
+		}
+
+		// V97C: align pending TRANS_CONF (offset +0x2C) with the live HW value.
+		// paramsFbCompare logs "TRANS_CONF 0xc0000000->0xc0000024": HW has bits[5,2]
+		// clear (UEFI default), Apple wants to set them (interlace/depth config).
+		// Writing those bits to an active pipe causes a transient signal disruption
+		// that sets the panel's DPCD InterLane Alignment Lost bit (0x202=0x80),
+		// which checkLinkStatus detects ~10 s later and tears down the display.
+		// Fix: replace the pending TRANS_CONF with the current HW register value so
+		// paramsFbCompare sees no change and the partial pipe update is suppressed.
+		// PIPE_CONF_A (= TRANS_CONF in ICL+) = 0x70008.
+		// NOTE: 0x60008 is TRANS_HSYNC_A (horizontal sync timing) — do NOT use that.
+		uint32_t &transConf = pending[11]; // offset +0x2C
+		const uint32_t hwTransConf = NGreen::callback->readReg32(0x70008);
+		if (transConf != hwTransConf) {
+			static int v97CCount = 0;
+			if (v97CCount < 12) {
+				v97CCount++;
+				SYSLOG("ngreen", "V97C[%d]: CRTCParams TRANS_CONF 0x%x -> HW 0x%x (suppressed pipe update)",
+				       v97CCount, transConf, hwTransConf);
+			}
+			transConf = hwTransConf;
+		}
+	}
+
 	// Return the original result so that register reprogramming proceeds normally.
 	// The lane count mismatch (4→2) that previously broke the display is now fixed
 	// by the computeLaneCount hook forcing 4 lanes.  Without register updates, the
@@ -5823,54 +6281,73 @@ uint8_t Gen11::hwRegsNeedUpdate
 	return FunctionCast(hwRegsNeedUpdate, callback->ohwRegsNeedUpdate)(that, param_1, param_2, param_3, param_4, param_5);
 }
 
+// setupOptimalLaneCount is called by hwSetMode to pick the lane count that gets
+// stored in the port's cached LinkConfig (and ultimately into TRANS_DDI_FUNC_CTL).
+// Apple's implementation runs: optimal = computeLaneCount(...); then caps it to
+// port->maxLaneCount (from DPCD MAX_LANE_COUNT, which is 2 on this panel).
+// On !isRealTGL we instead snap the cached count to match DDI_BUF_CTL_A so that
+// SetupParams builds TRANS_DDI_FUNC_CTL with the correct HW-trained lane field.
+void Gen11::setupOptimalLaneCount(void *that, const void *timing, unsigned int bpp) {
+	// Always run Apple's original first to populate all other LinkConfig fields.
+	FunctionCast(setupOptimalLaneCount, callback->osetupOptimalLaneCount)(that, timing, bpp);
+
+	if (NGreen::callback->isRealTGL)
+		return;
+
+	// Read HW-trained lane count from DDI_BUF_CTL_A bits[3:1].
+	// PORT_WIDTH: 0=x1, 1=x2, 3=x4.
+	const uint32_t ddiA    = NGreen::callback->readReg32(0x64000);
+	const unsigned int width   = (ddiA >> 1) & 0x7u;
+	const unsigned int hwLanes = (width >= 3) ? 4u : (width >= 1) ? 2u : 1u;
+
+	// The port object stores the cached optimal lane count at a known offset.
+	// AppleIntelPort::setupOptimalLaneCount writes fOptimalLaneCount (confirmed
+	// by IDA: str result into [x0 + offset] before returning).
+	// We patch it post-call so the cap-to-DPCD logic is overridden.
+	// Offset 0x148 is fOptimalLaneCount in AppleIntelPort on this kext version.
+	unsigned int &cached = getMember<unsigned int>(that, 0x148);
+
+	static int v90L5Logs = 0;
+	if (v90L5Logs < 10) {
+		v90L5Logs++;
+		SYSLOG("ngreen", "V90L5[%d]: setupOptimalLC: was=%u DDI_BUF_CTL_A=0x%x hwLanes=%u",
+		       v90L5Logs, cached, ddiA, hwLanes);
+	}
+
+	if (hwLanes > cached)
+		cached = hwLanes;
+}
+
 void Gen11::computeLaneCount(void *that, const void *timing, unsigned int linkRate, unsigned int bpp, unsigned int *laneCount) {
 	if (!laneCount) return;
 
-	// Always try Apple's original first — it handles all standard DP rates correctly
-	// on both real TGL and spoofed paths.
+	// Call original first — handles all standard DP rates on both real TGL and spoofed paths.
 	FunctionCast(computeLaneCount, callback->ocomputeLaneCount)(that, timing, linkRate, bpp, laneCount);
 
-	if (*laneCount != 0) {
-		// Apple computed a valid result; use it unmodified.
-		static int v90L4Logs = 0;
-		if (v90L4Logs < 5) {
-			v90L4Logs++;
-			SYSLOG("ngreen", "V90L4[%d]: linkRate=%u bpp=%u laneCount=%u (Apple OK)",
-			       v90L4Logs, linkRate, bpp, *laneCount);
-		}
+	// Real TGL: preserve Apple's result unchanged.
+	if (NGreen::callback->isRealTGL)
 		return;
-	}
 
-	// Apple returned 0: non-standard link rate (e.g. rate=24 → 6480 Mbps eDP) that
-	// Apple's switch-table doesn't cover.  Compute the minimum lane count from the
-	// timing data rather than hardcoding a guess.
+	// For !isRealTGL (RPL spoofed): Apple's DPCD-based result (MAX_LANE_COUNT) reflects
+	// the panel's capability, but UEFI/GOP may have trained the link at a different lane
+	// count.  Read DDI_BUF_CTL_A to discover the actual HW-trained lane count and
+	// override Apple's result if UEFI trained more lanes than Apple computed.
 	//
-	//   linkRate unit: 270 Mbps per step  (6=RBR, 10=HBR, 20=HBR2, 24=custom, 30=HBR3)
-	//   8b/10b encoding overhead: effective bandwidth = linkRate × 270 Mbps × 0.8
-	//   Required bandwidth: pixelClock (Hz) × bpp (bits)
-	//   min_lanes = ceil(pixelClock × bpp / (linkRate × 270,000,000 × 0.8))
-	//   Round up to nearest valid DP lane count {1, 2, 4}.
-	unsigned int computed = 1;
-	if (timing != nullptr && linkRate > 0 && bpp > 0) {
-		const auto *t = static_cast<const IODetailedTimingInformationV2 *>(timing);
-		// perLane: effective bps per lane with 8b/10b overhead
-		const uint64_t perLane = static_cast<uint64_t>(linkRate) * 270000000ULL * 8 / 10;
-		const uint64_t needed  = t->pixelClock * bpp;
-		const unsigned int minLanes = static_cast<unsigned int>((needed + perLane - 1) / perLane);
-		computed = (minLanes > 2) ? 4u : (minLanes > 1) ? 2u : 1u;
-	} else {
-		// No timing info — fall back to 2 as the most common eDP configuration,
-		// but only as a last resort when we have nothing to compute from.
-		computed = 2;
-	}
-	*laneCount = computed;
+	// DDI_BUF_CTL PORT_WIDTH field bits[3:1]:
+	//   000 = x1 (1 lane),  001 = x2 (2 lanes),  011 = x4 (4 lanes)
+	const uint32_t ddiA    = NGreen::callback->readReg32(0x64000);  // DDI_BUF_CTL_A
+	const unsigned int width   = (ddiA >> 1) & 0x7u;
+	const unsigned int hwLanes = (width >= 3) ? 4u : (width >= 1) ? 2u : 1u;
 
-	static int v90L4FLogs = 0;
-	if (v90L4FLogs < 20) {
-		v90L4FLogs++;
-		SYSLOG("ngreen", "V90L4[%d]: linkRate=%u bpp=%u laneCount=%u (computed from timing)",
-		       v90L4FLogs, linkRate, bpp, *laneCount);
+	static int v90L4Logs = 0;
+	if (v90L4Logs < 10) {
+		v90L4Logs++;
+		SYSLOG("ngreen", "V90L4[%d]: linkRate=%u bpp=%u appleLC=%u DDI_BUF_CTL_A=0x%x hwLanes=%u",
+		       v90L4Logs, linkRate, bpp, *laneCount, ddiA, hwLanes);
 	}
+
+	if (hwLanes > *laneCount)
+		*laneCount = hwLanes;
 }
 
 void Gen11::getOnlineInfo(void *that, void *displayPath, unsigned char *online, unsigned char *changed) {
@@ -7799,6 +8276,15 @@ int Gen11::hwSetMode
 		  (void *that,void *param_1,
 		   void *param_2,void *param_3)
 {
+	// On RPL-P (spoofed TGL), setPortMode ran just before us and restored TRANS_DDI_FUNC_CTL_A
+	// to 0x8A000106 (4-lane eDP, matching UEFI DDI_BUF_CTL_A). paramsFbCompare inside the
+	// original hwSetMode reads TRANS_DDI_FUNC_CTL_A and compares it with the target 0x8A010102
+	// (2-lane DP SST). Write the correct value NOW so paramsFbCompare sees no lane-count change
+	// needed and leaves DDI_BUF_CTL_A alone — preserving the UEFI-trained 4-lane eDP link.
+	if (!NGreen::callback->isRealTGL) {
+		NGreen::callback->writeReg32(0x60400, 0x8A000106);  // TRANS_DDI_FUNC_CTL_A
+		DBGLOG("ngreen", "hwSetMode: pre-write TRANS_DDI_FUNC_CTL_A=0x8A000106 to prevent paramsFbCompare lane reprog");
+	}
 	auto ret= FunctionCast(hwSetMode, callback->ohwSetMode)(that, param_1, param_2, param_3);
 	if (hw)
 		enablePipe(that, param_1, param_2, param_3);

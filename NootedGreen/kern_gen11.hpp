@@ -10,6 +10,80 @@
 #include <Headers/kern_util.hpp>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 
+// ─── Platform info / connector structures (from NootedBlue reference) ────────
+// Note: ConnectorType enum is defined later in this file (below line 1100).
+
+struct PACKED VoltageConfig {
+	uint64_t pad;
+	uint8_t *voltageData;
+};
+
+struct PACKED ConnectorEntry {
+	uint32_t index;
+	uint32_t busId;
+	uint32_t pipe;
+	uint32_t pad;
+	uint32_t type;
+	uint32_t flags;
+};
+
+struct PACKED PlatformInfo {
+	uint32_t fInfoPlatformID;
+	uint32_t fPchType;
+	uint64_t *fModelNameAddr;
+	uint8_t  fMobile;
+	uint8_t  fPipeCount;
+	uint8_t  fInfoPortCount;
+	uint8_t  fInfoFramebufferCount;
+	uint32_t fInfoFramebufferMemorySize;
+	uint32_t fInfoFBCompressionMemorySize;
+	uint32_t fUnifiedMemorySize;
+	struct ConnectorEntry connectors[0x9];
+	uint32_t fInfoFlags;
+	uint32_t pad0;
+	struct VoltageConfig voltages[0x9];
+	uint32_t cameliav;
+	uint32_t MCLK;
+	uint32_t VCLK;
+	uint32_t TCONfbindex;
+	uint32_t BeaconLoc;
+	uint32_t MinFrmTim;
+	uint32_t MaxFrmTim;
+	uint32_t fInfoDynamicFBCThreshold;
+	uint32_t fVideoTurboFreq;
+	uint32_t fSliceCount;
+	uint32_t fmaxEuCount;
+	uint32_t fsubslices;
+};
+
+// Framebuffer flags (fInfoFlags / boot flags) used in platform info patching
+enum FramebufferFlags2 : uint32_t {
+	FB_FLAG_AVOID_FAST_LINK_TRAINING     = 0x1,
+	FB_FLAG_ENABLE_BACKLIGHT_REG_CONTROL = 0x2,
+	FB_FLAG_FRAMEBUFFER_COMPRESSION      = 0x4,
+	FB_FLAG_ENABLE_SLICE_FEATURES        = 0x8,
+	FB_FLAG_DYNAMIC_FBC_ENABLE           = 0x10,
+	FB_FLAG_USE_VIDEO_TURBO              = 0x20,
+	FB_FLAG_FORCE_POWER_ALWAYS_CONNECTED = 0x40,
+	FB_FLAG_DISABLE_HIGH_BITRATE_MODE2   = 0x80,
+	FB_FLAG_BOOST_PIXEL_FREQUENCY_LIMIT  = 0x100,
+	FB_FLAG_LIMIT_4K_SOURCE_SIZE         = 0x200,
+	FB_FLAG_ALTERNATE_PWM_INCREMENT1     = 0x400,
+	FB_FLAG_ALTERNATE_PWM_INCREMENT2     = 0x800,
+	FB_FLAG_DISABLE_FEATURE_IPS          = 0x1000,
+	FB_FLAG_ENABLE_DITHERING             = 0x2000,
+	FB_FLAG_ALLOW_CONNECTOR_RECOVER      = 0x4000,
+	FB_FLAG_DISABLE_PIPE_SCRAMBLE        = 0x8000,
+	FB_FLAG_disable3d                    = 0x10000,
+	FB_FLAG_ENABLE_HDMI_AUDIO            = 0x20000,
+	FB_FLAG_DISABLE_GFMP_PFM             = 0x40000,
+	FB_FLAG_ENABLE_PSR                   = 0x80000,
+	FB_FLAG_ENABLE_PSR2                  = 0x100000,
+	FB_FLAG_ENABLE_DYNAMIC_CDCLK         = 0x200000,
+	FB_FLAG_SUPPORT_4K_60HZ              = 0x400000,
+	FB_FLAG_SUPPORT_5K_SOURCE_SIZE       = 0x800000,
+};
+
 // ─── DMC (Display Microcontroller) firmware structures ──────────────────────
 // Used to parse Intel DMC firmware blobs for display power management
 #define DMC_DEFAULT_FW_OFFSET		0xFFFFFFFF
@@ -1423,6 +1497,12 @@ private:
 	mach_vm_address_t oFastWriteRegister32 {};
 	
 	mach_vm_address_t gPlatformInformationList {};
+
+	static void     initPlatformWorkarounds(void *that);
+	mach_vm_address_t oinitPlatformWorkarounds {};
+
+	static uint64_t getOSInformation(void *that);
+	mach_vm_address_t ogetOSInformation {};
 	
 	static uint8_t setDisplayMode(void *that,int param_1,int param_2);
 	mach_vm_address_t osetDisplayMode {};
@@ -1433,10 +1513,15 @@ private:
 			   void *param_5);
 	mach_vm_address_t ohwRegsNeedUpdate {};
 
-	// Force eDP lane count to 4 — BIOS trains at 4 lanes (HBR3 x4), but the driver
-	// computes 2 (sufficient bandwidth for 60 Hz) causing a PHY/transcoder mismatch.
+	// Force eDP lane count to match the HW-trained count from DDI_BUF_CTL_A.
 	static void computeLaneCount(void *that, const void *timing, unsigned int linkRate, unsigned int bpp, unsigned int *laneCount);
 	mach_vm_address_t ocomputeLaneCount {};
+
+	// setupOptimalLaneCount caps computeLaneCount's result to DPCD MAX_LANE_COUNT.
+	// On RPL the panel reports MAX_LANE_COUNT=2 but UEFI trained 4 lanes, so we
+	// override the cached optimal to match DDI_BUF_CTL_A instead.
+	static void setupOptimalLaneCount(void *that, const void *timing, unsigned int bpp);
+	mach_vm_address_t osetupOptimalLaneCount {};
 
 	// V96: Force display online — WEG's force-online (FOD) hooks getDisplayStatus which
 	// does NOT exist in the TGL framebuffer kext, so it fails with "err 2" at boot.

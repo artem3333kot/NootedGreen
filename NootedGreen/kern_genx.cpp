@@ -367,23 +367,42 @@ IOReturn Genx::wrapICLReadAUX(void *that, uint32_t address, void *buffer, uint32
 			       auxLogCount, address, length, retVal);
 	}
 
+	// V98T removed: do NOT clamp DPCD[0x0100-0x0101] (LINK_BW_SET / LANE_COUNT_SET).
+	// Capping these to HBR2/2-lanes caused Apple to train the link at HBR2×2 lanes.
+	// V97P then wrote a 4-lane DDI_FUNC_CTL value to a 2-lane trained link → black screen.
+	// UEFI already trained the link at HBR3×4 lanes; we must let Apple see those values
+	// so it (re-)trains consistently and V97P's bit16-only correction stays coherent.
 	if (!NGreen::callback->isRealTGL && address == 0x0100 && buffer && length >= 1) {
-		// V98T: Clamp observed link-training set to HBR2 + 2 lanes on spoofed path.
-		// Some panel/driver combinations oscillate with aggressive defaults (HBR3 / 4-lane bits).
 		auto *raw = reinterpret_cast<uint8_t *>(buffer);
-		if (raw[0] > 0x14) raw[0] = 0x14;      // LINK_BW_SET <= HBR2
-		if (length >= 2) {
-			raw[1] = (raw[1] & 0xE0) | 0x02;   // lane count = 2, keep upper feature bits
-		}
 		static int v98tLogs = 0;
-		if (v98tLogs < 10) {
+		if (v98tLogs < 5) {
 			v98tLogs++;
 			if (length >= 2)
-				SYSLOG("ngreen", "V98T[%d]: clamped 0x0100 read to bw=0x%02x lanes=0x%02x",
+				SYSLOG("ngreen", "V98T[%d]: DPCD 0x0100 passthrough bw=0x%02x lanes=0x%02x",
 				       v98tLogs, raw[0], raw[1]);
 			else
-				SYSLOG("ngreen", "V98T[%d]: clamped 0x0100 read to bw=0x%02x (len=1)",
+				SYSLOG("ngreen", "V98T[%d]: DPCD 0x0100 passthrough bw=0x%02x (len=1)",
 				       v98tLogs, raw[0]);
+		}
+	}
+
+	// V99: Suppress spurious LINK_STATUS_UPDATED (DPCD[0x204] bit7) on RPL-P.
+	// HDCP probing reads DPCD 0x6921d, which causes the eDP panel to assert IRQ_HPD,
+	// setting LINK_STATUS_UPDATED=1. Apple's checkLinkStatus then sees
+	// INTERLANE_ALIGN_DONE=0 and tears down the display (~10s after boot).
+	// The physical link is healthy; only the IRQ flag is spurious.
+	// Clearing bit7 of DPCD[0x204] prevents the driver from acting on the IRQ.
+	if (!NGreen::callback->isRealTGL && address == 0x0202 && buffer && length >= 3) {
+		auto *raw = reinterpret_cast<uint8_t *>(buffer);
+		if (raw[2] & 0x80) {
+			static int v99Logs = 0;
+			if (v99Logs < 10) {
+				v99Logs++;
+				SYSLOG("ngreen", "V99[%d]: suppressed DPCD 0x204 LINK_STATUS_UPDATED "
+				       "(was 0x%02x, lanes=[0x%02x 0x%02x])",
+				       v99Logs, raw[2], raw[0], raw[1]);
+			}
+			raw[2] &= ~0x80u; // clear LINK_STATUS_UPDATED
 		}
 	}
 
@@ -395,16 +414,15 @@ IOReturn Genx::wrapICLReadAUX(void *that, uint32_t address, void *buffer, uint32
 	auto caps = reinterpret_cast<DPCDCap16*>(buffer);
 
 	if (!NGreen::callback->isRealTGL) {
-		// V98: Spoofed RPL path is unstable with aggressive sink caps (HBR3/deep-color).
-		// Advertise a conservative max link rate so Apple's training chooses safer timings.
-		if (caps->maxLinkRate > 0x14) {
-			caps->maxLinkRate = 0x14; // HBR2 (5.4 Gbps)
-		}
-		caps->maxLaneCount = (caps->maxLaneCount & 0xE0) | 0x02; // advertise max 2 lanes
+		// V98: Do NOT cap maxLaneCount or maxLinkRate.
+		// Previous versions capped maxLaneCount to 2, which caused Apple to train at
+		// 2 lanes while V97P subsequently wrote a 4-lane DDI_FUNC_CTL value → black screen.
+		// The hardware is trained at HBR3×4 lanes by UEFI; let Apple see those real caps
+		// so its LightUpEDP (re-)trains consistently at HBR3×4 lanes.
 		static int v98Logs = 0;
-		if (v98Logs < 10) {
+		if (v98Logs < 5) {
 			v98Logs++;
-			SYSLOG("ngreen", "V98[%d]: capped DPCD caps @0x%04x to maxLinkRate=0x%02x maxLane=0x%02x",
+			SYSLOG("ngreen", "V98[%d]: DPCD caps @0x%04x maxLinkRate=0x%02x maxLane=0x%02x (passthrough)",
 			       v98Logs, address, caps->maxLinkRate, caps->maxLaneCount);
 		}
 	}
