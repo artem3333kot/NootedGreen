@@ -2074,6 +2074,24 @@ void Gen11::wrapWriteRegister32(void *controller, uint32_t address, uint32_t val
 		return;
 	}
 
+	// V195: HSW_PWR_WELL_CTL1 (0x45400) — preserve display power-domain bits [14,12].
+	// The ICL DMC save/restore table periodically writes CTL1 = 0x401, clearing bits 14,12.
+	// Those bits enable vsync interrupts; losing them stalls WindowServer.
+	// Only on spoofed (non-real-TGL) hardware — real TGL manages its own power wells.
+	if (address == 0x45400 && NGreen::callback && !NGreen::callback->isRealTGL
+	    && NGreen::callback->uefiCtl1 != 0) {
+		uint32_t preserve = NGreen::callback->uefiCtl1 & 0x5000u; // bits 14,12
+		if (preserve && (value & preserve) != preserve) {
+			static int v195Count = 0;
+			if (v195Count < 20) {
+				v195Count++;
+				SYSLOG("ngreen", "V195W[%d]: CTL1 write 0x%x -> 0x%x (bits 14,12 preserved)",
+				       v195Count, value, value | preserve);
+			}
+			value |= preserve;
+		}
+	}
+
 	// ── V72: EMR write intercept — force all errors masked ──
 	// RCS EMR = 0x20b4, BCS EMR = 0x220b4
 	// Apple writes 0xfffffffa (unmasks bits 0,2) → triggers phantom ERROR_GEN6=0x7b
@@ -2600,16 +2618,15 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 					}
 				}
 				
-				// V68: Clear sched error EARLY (don't wait for iteration 5)
-				// This mutates live scheduler memory; keep disabled in read-only mode.
+				// V68: Clear sched error EARLY (don't wait for iteration 5).
+				// Clearing an error flag is safe regardless of V60 mode — the scheduler
+				// error 0x7b blocks all GPU submissions and must be cleared on boot.
 				uint32_t schedErr = *reinterpret_cast<uint32_t *>(schedBase + 0x0C);
-				if (schedErr && v60Aggressive) {
+				if (schedErr) {
 					*reinterpret_cast<uint32_t *>(schedBase + 0x0C) = 0;
 					*reinterpret_cast<uint32_t *>(schedBase + 0x00) = 0;
 					SYSLOG("ngreen", "V68: early sched clear err=0x%x->0x%x flag=0x0",
 						schedErr, *reinterpret_cast<uint32_t *>(schedBase + 0x0C));
-				} else if (schedErr) {
-					SYSLOG("ngreen", "V68: sched err=0x%x observed (read-only mode, not clearing)", schedErr);
 				}
 			} else {
 				SYSLOG("ngreen", "V67: scheduler ptr is NULL!");
@@ -2951,15 +2968,12 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 			}
 		}
 
-		// V104P: PWR_WELL CTL1 enforcement — restore UEFI bits [14,12] every V60 tick.
-		// ICL DMC's MMIO save/restore table writes CTL1=0x401 during init/DC-exit, clearing
-		// bits [14,12] needed for vsync interrupt delivery. Without vsync, WindowServer never
-		// gets display-ready events → GPU ring stays idle → black screen (CSB=0x0).
-		if (NGreen::callback->dmcIsAdlp && NGreen::callback->uefiCtl1 != 0) {
+		// V104P: diagnostic only — V195 now intercepts CTL1 writes immediately.
+		if (!NGreen::callback->isRealTGL && NGreen::callback->uefiCtl1 != 0) {
 			uint32_t targetCtl1 = NGreen::callback->uefiCtl1 | 0x00000401u;
 			if (pwrWell != targetCtl1) {
-				NGreen::callback->writeReg32(0x45400, targetCtl1);
-				SYSLOG("ngreen", "V104P[%d]: PWR_WELL CTL1 0x%x -> 0x%x (restored)", v60Count, pwrWell, targetCtl1);
+				SYSLOG("ngreen", "V104P[%d]: CTL1 still wrong: 0x%x (expected 0x%x) — V195 miss?",
+				       v60Count, pwrWell, targetCtl1);
 			}
 		}
 	}
@@ -5100,6 +5114,24 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 		}
 	}
 
+	// V195: HSW_PWR_WELL_CTL1 (0x45400) — preserve display power-domain bits [14,12].
+	// The ICL DMC save/restore table periodically writes CTL1 = 0x401, clearing bits 14,12.
+	// Those bits enable vsync interrupts; losing them stalls WindowServer.
+	// Only on spoofed (non-real-TGL) hardware — real TGL manages its own power wells.
+	if ((param_1 & 0xFFFFF) == 0x45400 && NGreen::callback && !NGreen::callback->isRealTGL
+	    && NGreen::callback->uefiCtl1 != 0) {
+		uint32_t preserve = NGreen::callback->uefiCtl1 & 0x5000u; // bits 14,12
+		if (preserve && (param_2 & preserve) != preserve) {
+			static int v195Count = 0;
+			if (v195Count < 20) {
+				v195Count++;
+				SYSLOG("ngreen", "V195[%d]: CTL1 ra write 0x%x -> 0x%x (bits 14,12 preserved)",
+				       v195Count, param_2, param_2 | preserve);
+			}
+			param_2 |= preserve;
+		}
+	}
+
 	// V99S: PLANE_SURF arm — force correct STRIDE immediately before latching.
 	// raWriteRegister32/WriteRegister32 is a CACHE-ONLY update; hardware MMIO for
 	// double-buffered PLANE_STRIDE is written via a volatile* path not caught by
@@ -5704,28 +5736,30 @@ void Gen11::hwSetPowerWellStatePG(void *that,bool param_1,uint param_2)
 }
 
 // V183: ADL-P/RPL write-only power well handler.
-// HSW_PWR_WELL_CTL2 (0x45404): REQ bits = mask 0xAA (bits 1,3,5,7);
-//                               STATE bits = mask 0x55 (bits 0,2,4,6).
+// HSW_PWR_WELL_CTL1 (0x45400): REQ bits = odd bits (mask 0xAA: bits 1,3,5,7,...);
+//                               STATE bits = even bits (mask 0x55: bits 0,2,4,6,...).
 // TGL original polls STATE bits after writing REQ — on ADL-P those ACKs
 // never arrive within the 20-iteration timeout, spinning the CPU.
-// Fix: write REQ bits directly, skip polling entirely.
-// param_2 carries the REQ bitmask (matches the `(val & 0xFFFFFF55) | param_2`
-// pattern seen in IDA for PGE enable stages).
+// Fix: write REQ bits directly to CTL1, skip polling entirely.
+// Previously this wrote to CTL2 (0x45404) — wrong register. CTL2 controls DDI/AUX
+// wells; PG display wells (PG1/PG2) are in CTL1. Writing to CTL2 left CTL1 at the
+// DMC-reset value (0x405, no REQ bits) → hardware never enabled display power domains
+// → vsync interrupts never delivered → GPU ring idle → framebuffer stayed black.
 void Gen11::hwSetPowerWellStatePGE(void *that, bool param_1, uint param_2)
 {
 	if (!NGreen::callback->isRealTGL) {
-		uint32_t ctl2 = NGreen::callback->readReg32(0x45404);
+		uint32_t ctl1 = NGreen::callback->readReg32(0x45400);
 		uint32_t newVal;
 		if (param_1) {
 			// Enable: clear all REQ bits then set the requested ones.
-			newVal = (ctl2 & 0xFFFFFF55U) | (param_2 & 0xAAU);
+			newVal = (ctl1 & 0xFFFFFF55U) | (param_2 & 0xAAU);
 		} else {
 			// Disable: clear the requested REQ bits.
-			newVal = ctl2 & ~(param_2 & 0xAAU);
+			newVal = ctl1 & ~(param_2 & 0xAAU);
 		}
-		DBGLOG("ngreen", "V183.PGE: en=%u mask=0x%x ctl2: 0x%x->0x%x",
-		       (unsigned)param_1, param_2, ctl2, newVal);
-		NGreen::callback->writeReg32(0x45404, newVal);
+		SYSLOG("ngreen", "V183.PGE: en=%u mask=0x%x ctl1: 0x%x->0x%x",
+		       (unsigned)param_1, param_2, ctl1, newVal);
+		NGreen::callback->writeReg32(0x45400, newVal);
 		return;
 	}
 	// Real TGL: use original with ccont fixup.
@@ -6152,6 +6186,21 @@ void Gen11::FastWriteRegister32(void *that,unsigned long param_1,uint32_t param_
 					   v103FCount, param_2);
 			}
 			param_2 = 0;
+		}
+	}
+
+	// V195: HSW_PWR_WELL_CTL1 (0x45400) — same preservation as raWriteRegister32.
+	if ((param_1 & 0xFFFFF) == 0x45400 && NGreen::callback && !NGreen::callback->isRealTGL
+	    && NGreen::callback->uefiCtl1 != 0) {
+		uint32_t preserve = NGreen::callback->uefiCtl1 & 0x5000u;
+		if (preserve && (param_2 & preserve) != preserve) {
+			static int v195FCount = 0;
+			if (v195FCount < 20) {
+				v195FCount++;
+				SYSLOG("ngreen", "V195F[%d]: CTL1 FastWrite 0x%x -> 0x%x (bits 14,12 preserved)",
+				       v195FCount, param_2, param_2 | preserve);
+			}
+			param_2 |= preserve;
 		}
 	}
 
