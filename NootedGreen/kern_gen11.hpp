@@ -1543,20 +1543,24 @@ private:
 	static void logStateInRegistry(void *that,uint param_1);
 	mach_vm_address_t ologStateInRegistry {};
 	
-	static bool	AppleIntelFramebufferinit(void *frame,void *cont,uint32_t param_2);
+	static uint32_t AppleIntelFramebufferinit(void *frame,void *cont,uint32_t param_2);
 	mach_vm_address_t oAppleIntelFramebufferinit {};
-	
-	static uint8_t  AppleIntelPlaneinit(void *that,uint8_t param_1);
+
+	static uint64_t AppleIntelPlaneinit(void *that,uint32_t param_1);
 	mach_vm_address_t oAppleIntelPlaneinit {};
-	
-	static unsigned long AppleIntelScalerinit(void *that,uint8_t param_1);
+
+	static uint64_t AppleIntelScalerinit(void *that,uint32_t param_1);
 	mach_vm_address_t oAppleIntelScalerinit {};
-	
-	
+
+	static void  disableScaler(void *that,bool param_1);
+	mach_vm_address_t odisableScaler {};
+
 	static void  enablePlane(void *that,bool param_1);
 	mach_vm_address_t oenablePlane {};
-	
-	
+
+	static void programPipeScaler(void *that,void *param_1);
+	mach_vm_address_t oprogramPipeScaler {};
+
 	static void  disablePowerWellPG(void *that,uint param_1);
 	mach_vm_address_t odisablePowerWellPG {};
 	
@@ -1596,9 +1600,6 @@ private:
 
 	static uint8_t enableController(void *that);
 	mach_vm_address_t oenableController {};
-	
-	static void  disableScaler(void *that,bool param_1);
-	mach_vm_address_t odisableScaler {};
 	
 	static void initializeLogging(void *that);
 	mach_vm_address_t oinitializeLogging {};
@@ -1775,14 +1776,6 @@ private:
 	static bool AppleIntelBaseControllerstart(void *that,void *param_1);
 	mach_vm_address_t oAppleIntelBaseControllerstart {};
 	
-	static void programPipeScaler(void *that,void *param_1);
-	mach_vm_address_t oprogramPipeScaler {};
-	
-	static void AppleIntelScalerupdateRegisterCache(void *that);
-	mach_vm_address_t oAppleIntelScalerupdateRegisterCache {};
-	
-	static void AppleIntelPlaneupdateRegisterCache(void *that);
-	mach_vm_address_t oAppleIntelPlaneupdateRegisterCache {};
 	
 	static void * AppleIntelPlanenew(unsigned long param_1);
 	mach_vm_address_t oAppleIntelPlanenew {};
@@ -1791,7 +1784,13 @@ private:
 		
 	static long getPortByDDI(uint param_1);
 	mach_vm_address_t ogetPortByDDI {};
-	
+
+	static void AppleIntelScalerupdateRegisterCache(void *that);
+	mach_vm_address_t oAppleIntelScalerupdateRegisterCache {};
+
+	static void AppleIntelPlaneupdateRegisterCache(void *that);
+	mach_vm_address_t oAppleIntelPlaneupdateRegisterCache {};
+
 	static void PowerWellinit(void *that,void *param_1);
 	mach_vm_address_t oPowerWellinit {};
 	

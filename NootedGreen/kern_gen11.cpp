@@ -449,6 +449,11 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			{"__ZN19AppleIntelPowerWell21hwSetPowerWellStatePGEbj.cold.11",releaseDoorbell},
 			{"__ZN19AppleIntelPowerWell21hwSetPowerWellStatePGEbj.cold.12",releaseDoorbell},
 			{"__ZN19AppleIntelPowerWell22hwSetPowerWellStateAuxEbj.cold.1",releaseDoorbell},*/
+			// AppleIntelPlaneinit/Scalerinit hooks are disabled in kern_genx.cpp, so fields
+			// 0x90 (plane RAM) and 0x28/0x10 (scaler RAM) are never set at object-init time.
+			// Every entry point into Plane/Scaler that calls ReadRegister32 will crash with
+			// this=NULL unless we patch ccont in here.  These hooks must stay until the init
+			// hooks are re-enabled (see kern_genx.cpp lines 75-76).
 			{"__ZN16AppleIntelScaler13disableScalerEb",disableScaler, this->odisableScaler},
 			{"__ZN15AppleIntelPlane11enablePlaneEb",enablePlane, this->oenablePlane},
 			{"__ZN16AppleIntelScaler17programPipeScalerEP21AppleIntelDisplayPath",programPipeScaler, this->oprogramPipeScaler},
@@ -739,12 +744,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		else {
 			LookupPatchPlus const patches[] = {// tgl debug kext
 				{activeKext, f1, r1, arrsize(f1),	1},
-				// f2 (osinfo pipe/port/fb counts) disabled: wrong counts can corrupt scanout layout
-				//{activeKext, f2, r2, arrsize(f2),	1},
-				/*{activeKext, f2b, r2b, arrsize(f2b),	1},
-				 {activeKext, f2c, r2c, arrsize(f2c),	1},*/
-				 {activeKext, f2d, r2d, arrsize(f2d),	1},
-				//{activeKext, f2e, r2e, arrsize(f2e),	1},
+				// f2/f2d: osinfo pipe/port/fb counts now set via getOSInformation hook — no binary patch needed.
 				{activeKext, f3, r3, arrsize(f3),	1},
 				{activeKext, f4, r4, arrsize(f4),	12},
 				{activeKext, f4a, r4a, arrsize(f4a),	11},
@@ -779,15 +779,6 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			};
 
 			PANIC_COND(!LookupPatchPlus::applyAll(patcher, patches , address, size), "ngreen", "kextG11FBT Failed to apply dbg patches!");
-
-				// Reference probe: enable only old f2 topology/osinfo bypass on demand.
-				// Keeps current stability protections while testing whether f2 is the flash trigger.
-				LookupPatchPlus const probeF2Patch[] = {
-					{activeKext, f2, r2, arrsize(f2), 1},
-				};
-				PANIC_COND(!LookupPatchPlus::applyAll(patcher, probeF2Patch, address, size),
-					"ngreen", "kextG11FBT Failed to apply reference f2 probe patch!");
-				SYSLOG("ngreen", "V109: reference probe enabled (f2 osinfo patch active)");
 		}
 		
 		return true;
@@ -1905,8 +1896,6 @@ void *ccont;
 void *ccont2;  // AppleIntelBaseController pointer (captured in FBMemMgr_Init)
 
 IOReturn Gen11::wrapPavpSessionCallback( void *intelAccelerator, int32_t sessionCommand, uint32_t sessionAppId, uint32_t *a4, bool flag) {
-	
-	getMember<void *>(intelAccelerator, 0x90) = ccont;
 
 	//void* pPavpContext = *getMember<void**>(intelAccelerator, 0x1278);
 	//void* pStampTrackingStruct = *(void**)getMember<char*>(pPavpContext, 0xb8);
@@ -2873,18 +2862,20 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		SYSLOG("ngreen", "V79[%d]: PIPE=0x%x CTL=0x%x STRIDE=0x%x SURF=0x%x SIZE=0x%x POS=0x%x tiling=%d",
 			   v60Count, pipeConf, planCtl, planStrd, planSurf, planSize, planPos, tiling);
 
-		// V105 (here): gamma check uses planSurf already read above — avoids race with hwSetMode.
-		// The periodic-section V105 reads SURF before hwSetMode fires; V79 reads AFTER.
+		// V105B: same blanking-pedestal check as V105, applied here after V79 reads SURF.
 		if (planSurf != 0) {
-			NGreen::callback->writeReg32(0x4A400, 128); // PAL_PREC_INDEX = 128
+			NGreen::callback->writeReg32(0x4A400, 0);    // index 0
+			uint32_t g0b  = NGreen::callback->readReg32(0x4A404);
+			NGreen::callback->writeReg32(0x4A400, 128);
 			uint32_t g128 = NGreen::callback->readReg32(0x4A404);
-			if (g128 == 0) {
+			if (g0b == g128 || g128 == 0) {
 				static int v105bCount = 0;
 				if (v105bCount < 10) {
 					v105bCount++;
-					SYSLOG("ngreen", "V105B[%d]: Gamma zero (iter %d, SURF=0x%x) — linear LUT", v105bCount, v60Count, planSurf);
+					SYSLOG("ngreen", "V105B[%d]: Gamma bad (iter %d, SURF=0x%x g0=0x%x g128=0x%x) — linear LUT",
+					       v105bCount, v60Count, planSurf, g0b, g128);
 				}
-				NGreen::callback->writeReg32(0x4A400, 0x8000); // index=0, auto-increment
+				NGreen::callback->writeReg32(0x4A400, 0x8000);
 				for (int i = 0; i < 256; i++) {
 					uint32_t v10 = (uint32_t)i * 4;
 					NGreen::callback->writeReg32(0x4A404, (v10 << 20) | (v10 << 10) | v10);
@@ -2940,23 +2931,31 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 			NGreen::callback->writeReg32(0x45504, 0);
 			SYSLOG("ngreen", "V103P[%d]: DC_STATE_EN was 0x%x, forced to 0", v60Count, dcState);
 		}
-		// V105: Pipe-A gamma LUT enforcement — write linear pass-through when LUT is zero.
+		// V105: Pipe-A gamma LUT enforcement — write linear pass-through when LUT is bad.
 		// The Apple driver enables precision gamma mode before WindowServer writes the actual
-		// LUT, so every pixel maps to 0 (black) until WindowServer initialises it.
-		// We check on every tick (while display is active) and write linear 8→10-bit LUT
-		// so the display output equals framebuffer content until WindowServer takes over.
-		// PAL_PREC_DATA (0x4A404) format: bits[29:20]=red, [19:10]=green, [9:0]=blue (10-bit).
+		// LUT.  Two bad states are observed:
+		//   zero LUT (g[128]=0): all pixels map to black
+		//   blanking pedestal (g[128]=0x8020080, R=G=B=128/1023): uniform dim grey —
+		//   the Apple IGFB power-management code sets this during display blanking and
+		//   does not clear it before WindowServer takes over.  Both states cause the
+		//   display to appear black/dark regardless of framebuffer content.
+		// Detect: sample entries 0 and 128; if they are equal (constant LUT = blanking)
+		// or both are zero, write a linear 8→10-bit pass-through until WS initialises.
+		// PAL_PREC_DATA (0x4A404) format: bits[29:20]=red, [19:10]=green, [9:0]=blue.
 		{
 			uint32_t planSurf = NGreen::callback->readReg32(0x7019C); // PLANE_SURF_A
 			if (planSurf != 0) {
-				// Sample entry 128 to detect if gamma is zero
+				NGreen::callback->writeReg32(0x4A400, 0);    // PAL_PREC_INDEX = 0
+				uint32_t g0   = NGreen::callback->readReg32(0x4A404);
 				NGreen::callback->writeReg32(0x4A400, 128);  // PAL_PREC_INDEX = 128
-				uint32_t g128 = NGreen::callback->readReg32(0x4A404); // PAL_PREC_DATA
-				if (g128 == 0) {
+				uint32_t g128 = NGreen::callback->readReg32(0x4A404);
+				// Constant LUT (all entries equal) = blanking or zero = bad state
+				if (g0 == g128 || g128 == 0) {
 					static int v105Count = 0;
 					if (v105Count < 10) {
 						v105Count++;
-						SYSLOG("ngreen", "V105[%d]: Gamma LUT zero at iter %d — writing linear pass-through", v105Count, v60Count);
+						SYSLOG("ngreen", "V105[%d]: Gamma bad at iter %d (g0=0x%x g128=0x%x) — linear pass-through",
+						       v105Count, v60Count, g0, g128);
 					}
 					// Write linear LUT: set index=0 + AUTO_INCREMENT (bit 15 = 0x8000)
 					NGreen::callback->writeReg32(0x4A400, 0x8000);
@@ -5063,11 +5062,20 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 			DBGLOG("ngreen", "V99R: PLANE_STRIDE 0x%x -> 0x%x", param_2, strideFixed);
 		param_2 = strideFixed;
 	}
-	// V99: PLANE_CTL — when driver sets X-tiled (bits[12:10]=001), change to Y-tiled
-	// legacy (bits[12:10]=100) to match EFI GOP state and IntelAccelerator IOSurface format.
+	// V99: PLANE_CTL — tiling fixup.
+	// dp0 (CPU compositing): force linear so WindowServer's BAR2 writes scan out correctly.
+	// Default path: X-tiled (001) → Y-tiled legacy (100) to match EFI GOP and IOSurface.
 	if ((param_1 & 0xFFFFF) == 0x70180) { // PLANE_CTL Pipe A Plane 1
+		static const bool dpForced = isDisplayPipeForceDisabled();
 		uint32_t tiling = (param_2 >> 10) & 0x7;
-		if (tiling == 0x1) { // X-tiled (001) → Y-tiled legacy (100)
+		if (dpForced && tiling != 0) {
+			uint32_t ctlFixed = param_2 & ~(0x7u << 10); // clear tiling → linear
+			static int v99CdpCount = 0;
+			if (v99CdpCount < 5)
+				SYSLOG("ngreen", "V99R[Cdp%d]: PLANE_CTL 0x%x->0x%x (dp0: tiling %d->linear)",
+					   ++v99CdpCount, param_2, ctlFixed, tiling);
+			param_2 = ctlFixed;
+		} else if (tiling == 0x1) { // X-tiled (001) → Y-tiled legacy (100)
 			uint32_t ctlFixed = (param_2 & ~(0x7u << 10)) | (0x4u << 10);
 			static int v99CCount = 0;
 			if (v99CCount < 5)
@@ -5132,11 +5140,19 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 		}
 	}
 
-	// V99S: PLANE_SURF arm — force correct STRIDE immediately before latching.
+	// V99S: PLANE_SURF arm — force correct STRIDE/CTL immediately before latching.
 	// raWriteRegister32/WriteRegister32 is a CACHE-ONLY update; hardware MMIO for
 	// double-buffered PLANE_STRIDE is written via a volatile* path not caught by
-	// FastWriteRegister32. Forcing writeReg32 here ensures the pending shadow
-	// holds 0xa0 (160 × 64B = 10240B = 2560px BGRA8 Y-tiled) right before SURF arm.
+	// FastWriteRegister32. Forcing writeReg32 here ensures the hardware shadow is
+	// correct right before SURF arms the double-buffer flip.
+	//
+	// dp0 path: also redirect non-aperture SURF to 0x0.
+	// setupScanoutMemory migrates SURF from aperture to ≥0x10000000 (non-aperture
+	// stolen RAM, phys ~0x7e…) when WindowServer sets kIOWindowServerActiveAttribute=3.
+	// That region is inaccessible via BAR2; the CPU compositor writes to BAR2 offset 0
+	// (GGTT[0]) while the display scans from 0x412be000 — neither sees the other.
+	// Fix: keep SURF=0x0 (aperture start, BAR2 offset 0) and force CTL linear so
+	// both paths share the same pages.
 	if ((param_1 & 0xFFFFF) == 0x7019C && NGreen::callback) {
 		uint32_t hwStride = NGreen::callback->readReg32(0x70188);
 		uint32_t hwCtl    = NGreen::callback->readReg32(0x70180);
@@ -5145,15 +5161,33 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 			SYSLOG("ngreen", "V99S[%d]: SURF arm 0x%x: pre-arm STRIDE=0x%x CTL=0x%x",
 				   ++v99SCount, (uint32_t)param_2, hwStride, hwCtl);
 		}
-		// Force STRIDE to 0xa0 (Y-tiled/linear units: 160 × 64B = 10240B = 2560px × 4bpp)
-		if (hwStride != 0xa0) {
-			NGreen::callback->writeReg32(0x70188, 0xa0);
-		}
-		// Force CTL to Y-tiled legacy if currently X-tiled (001→100)
-		uint32_t hwTiling = (hwCtl >> 10) & 0x7;
-		if (hwTiling == 0x1) {
-			uint32_t newCtl = (hwCtl & ~(0x7u << 10)) | (0x4u << 10);
-			NGreen::callback->writeReg32(0x70180, newCtl);
+		static const bool dpForced = isDisplayPipeForceDisabled();
+		if (dpForced) {
+			// Block non-aperture migration: redirect SURF to aperture start.
+			if (param_2 >= 0x10000000u) {
+				static int v99PCount = 0;
+				if (v99PCount < 8)
+					SYSLOG("ngreen", "V99R[P%d]: SURF 0x%x->0 (dp0: non-aperture blocked, aperture kept)",
+						   ++v99PCount, (uint32_t)param_2);
+				param_2 = 0;
+			}
+			// Force CTL linear (tiling=0): CPU compositor writes linearly via BAR2.
+			uint32_t hwTiling = (hwCtl >> 10) & 0x7;
+			if (hwTiling != 0)
+				NGreen::callback->writeReg32(0x70180, hwCtl & ~(0x7u << 10));
+			// Force STRIDE to 0xa0 (linear 64B units: 160×64B=10240B=2560px×4bpp).
+			if (hwStride != 0xa0)
+				NGreen::callback->writeReg32(0x70188, 0xa0);
+		} else {
+			// Force STRIDE to 0xa0 (Y-tiled/linear units: 160 × 64B = 10240B = 2560px × 4bpp)
+			if (hwStride != 0xa0)
+				NGreen::callback->writeReg32(0x70188, 0xa0);
+			// Force CTL to Y-tiled legacy if currently X-tiled (001→100)
+			uint32_t hwTiling = (hwCtl >> 10) & 0x7;
+			if (hwTiling == 0x1) {
+				uint32_t newCtl = (hwCtl & ~(0x7u << 10)) | (0x4u << 10);
+				NGreen::callback->writeReg32(0x70180, newCtl);
+			}
 		}
 	}
 
@@ -5164,7 +5198,8 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 
 void Gen11::raWriteRegister32f(void *that,unsigned long param_1, UInt32 param_2)
 {
-	// V99f: also intercept the "f" (fast/direct) variant in case STRIDE uses this path.
+	// V99f: also intercept the "f" (fast/direct) variant in case STRIDE/CTL/SURF use this path.
+	static const bool dpForced = isDisplayPipeForceDisabled();
 	if ((param_1 & 0xFFFFF) == 0x70188) {
 		uint32_t strideFixed = param_2 * 8;
 		DBGLOG("ngreen", "V99f: PLANE_STRIDE(f) 0x%x -> 0x%x", param_2, strideFixed);
@@ -5172,12 +5207,20 @@ void Gen11::raWriteRegister32f(void *that,unsigned long param_1, UInt32 param_2)
 	}
 	if ((param_1 & 0xFFFFF) == 0x70180) {
 		uint32_t tiling = (param_2 >> 10) & 0x7;
-		if (tiling == 0x1) {
+		if (dpForced && tiling != 0) {
+			param_2 &= ~(0x7u << 10); // dp0: force linear
+			DBGLOG("ngreen", "V99f: dp0 CTL tiling %d->linear 0x%x", tiling, param_2);
+		} else if (tiling == 0x1) {
 			param_2 = (param_2 & ~(0x7u << 10)) | (0x4u << 10);
 			DBGLOG("ngreen", "V99f: PLANE_CTL(f) X->Y 0x%x", param_2);
 		}
 	}
-	FunctionCast(raWriteRegister32f, callback->oraWriteRegister32f)( that,param_1,param_2);
+	// dp0: redirect non-aperture SURF writes to aperture start (same as V99S in cached path).
+	if ((param_1 & 0xFFFFF) == 0x7019C && dpForced && param_2 >= 0x10000000u) {
+		DBGLOG("ngreen", "V99f: dp0 SURF 0x%x->0 (non-aperture blocked)", param_2);
+		param_2 = 0;
+	}
+	FunctionCast(raWriteRegister32f, callback->oraWriteRegister32f)(that, param_1, param_2);
 };
 
 void Gen11::raWriteRegister32b(void *that,void *param_1,unsigned long param_2, UInt32 param_3)
@@ -5583,35 +5626,59 @@ void Gen11::disableCDClock(void *that)
 }
 
 
-bool Gen11::AppleIntelFramebufferinit(void *frame,void *cont,uint32_t param_2)
+void Gen11::disableScaler(void *that,bool param_1)
+{
+	getMember<void *>(that, 0x28) = ccont;
+	FunctionCast(disableScaler, callback->odisableScaler)(that,param_1);
+}
+
+void Gen11::enablePlane(void *that,bool param_1)
+{
+	getMember<void *>(that, 0x90) = ccont;
+	FunctionCast(enablePlane, callback->oenablePlane)(that,param_1);
+}
+
+void Gen11::programPipeScaler(void *that,void *param_1)
+{
+	getMember<void *>(that, 0x28) = ccont;
+	FunctionCast(programPipeScaler, callback->oprogramPipeScaler)(that,param_1);
+}
+
+void Gen11::AppleIntelScalerupdateRegisterCache(void *that)
+{
+	getMember<void *>(that, 0x28) = ccont;
+	FunctionCast(AppleIntelScalerupdateRegisterCache, callback->oAppleIntelScalerupdateRegisterCache)(that);
+}
+
+void Gen11::AppleIntelPlaneupdateRegisterCache(void *that)
+{
+	getMember<void *>(that, 0x90) = ccont;
+	FunctionCast(AppleIntelPlaneupdateRegisterCache, callback->oAppleIntelPlaneupdateRegisterCache)(that);
+}
+
+uint32_t Gen11::AppleIntelFramebufferinit(void *frame,void *cont,uint32_t param_2)
 {
 	getMember<void *>(frame, 0x4a40) = ccont;
 	getMember<void *>(frame, 0xc40)  = ccont;
-	auto ret=FunctionCast(AppleIntelFramebufferinit, callback->oAppleIntelFramebufferinit)(frame,cont,param_2 );
+	auto ret = FunctionCast(AppleIntelFramebufferinit, callback->oAppleIntelFramebufferinit)(frame,cont,param_2);
 	getMember<void *>(frame, 0x4a40) = ccont;
 	getMember<void *>(frame, 0xc40)  = ccont;
 	return ret;
 }
 
-uint8_t  Gen11::AppleIntelPlaneinit(void *that,uint8_t param_1)
+uint64_t Gen11::AppleIntelPlaneinit(void *that,uint32_t param_1)
 {
-	auto ret = FunctionCast(AppleIntelPlaneinit, callback->oAppleIntelPlaneinit)(that,param_1 );
+	auto ret = FunctionCast(AppleIntelPlaneinit, callback->oAppleIntelPlaneinit)(that,param_1);
 	getMember<void *>(that, 0x90) = ccont;
 	return ret;
 }
 
-unsigned long Gen11::AppleIntelScalerinit(void *that,uint8_t param_1)
+uint64_t Gen11::AppleIntelScalerinit(void *that,uint32_t param_1)
 {
-	auto ret = FunctionCast(AppleIntelScalerinit, callback->oAppleIntelScalerinit)(that,param_1 );
+	auto ret = FunctionCast(AppleIntelScalerinit, callback->oAppleIntelScalerinit)(that,param_1);
 	getMember<void *>(that, 0x28) = ccont;
 	getMember<void *>(that, 0x10) = ccont2;
 	return ret;
-}
-
-void  Gen11::disableScaler(void *that,bool param_1)
-{
-	getMember<void *>(that, 0x28) = ccont;
-	FunctionCast(disableScaler, callback->odisableScaler)(that,param_1 );
 }
 
 void Gen11::initPlatformWorkarounds(void *that)
@@ -5680,30 +5747,6 @@ uint64_t Gen11::getOSInformation(void *that)
 		SYSLOG("ngreen", "getOSInformation: patched pinfo[1] for ADL-P (LVDS+HDMI, mobile)");
 	}
 	return FunctionCast(getOSInformation, callback->ogetOSInformation)(that);
-}
-
-void Gen11::programPipeScaler(void *that,void *param_1)
-{
-	getMember<void *>(that, 0x28) = ccont;
-	FunctionCast(programPipeScaler, callback->oprogramPipeScaler)(that,param_1 );
-}
-
-void  Gen11::enablePlane(void *that,bool param_1)
-{
-	getMember<void *>(that, 0x90) = ccont;
-	FunctionCast(enablePlane, callback->oenablePlane)(that,param_1 );
-}
-
-void Gen11::AppleIntelScalerupdateRegisterCache(void *that)
-{
-	getMember<void *>(that, 0x28) = ccont;
-	FunctionCast(AppleIntelScalerupdateRegisterCache, callback->oAppleIntelScalerupdateRegisterCache)(that );
-}
-
-void Gen11::AppleIntelPlaneupdateRegisterCache(void *that)
-{
-	getMember<void *>(that, 0x90) = ccont;
-	FunctionCast(AppleIntelPlaneupdateRegisterCache, callback->oAppleIntelPlaneupdateRegisterCache)(that );
 }
 
 void Gen11::enableDisplayEngine(void *that)
