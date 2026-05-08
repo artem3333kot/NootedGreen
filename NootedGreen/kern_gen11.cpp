@@ -5066,7 +5066,7 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 	// dp0 (CPU compositing): force linear so WindowServer's BAR2 writes scan out correctly.
 	// Default path: X-tiled (001) → Y-tiled legacy (100) to match EFI GOP and IOSurface.
 	if ((param_1 & 0xFFFFF) == 0x70180) { // PLANE_CTL Pipe A Plane 1
-		static const bool dpForced = isDisplayPipeForceDisabled();
+		const bool dpForced = isDisplayPipeForceDisabled();
 		uint32_t tiling = (param_2 >> 10) & 0x7;
 		if (dpForced && tiling != 0) {
 			uint32_t ctlFixed = param_2 & ~(0x7u << 10); // clear tiling → linear
@@ -5161,7 +5161,7 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 			SYSLOG("ngreen", "V99S[%d]: SURF arm 0x%x: pre-arm STRIDE=0x%x CTL=0x%x",
 				   ++v99SCount, (uint32_t)param_2, hwStride, hwCtl);
 		}
-		static const bool dpForced = isDisplayPipeForceDisabled();
+		const bool dpForced = isDisplayPipeForceDisabled();
 		if (dpForced) {
 			// Block non-aperture migration: redirect SURF to aperture start.
 			if (param_2 >= 0x10000000u) {
@@ -5199,7 +5199,7 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 void Gen11::raWriteRegister32f(void *that,unsigned long param_1, UInt32 param_2)
 {
 	// V99f: also intercept the "f" (fast/direct) variant in case STRIDE/CTL/SURF use this path.
-	static const bool dpForced = isDisplayPipeForceDisabled();
+	const bool dpForced = isDisplayPipeForceDisabled();
 	if ((param_1 & 0xFFFFF) == 0x70188) {
 		uint32_t strideFixed = param_2 * 8;
 		DBGLOG("ngreen", "V99f: PLANE_STRIDE(f) 0x%x -> 0x%x", param_2, strideFixed);
