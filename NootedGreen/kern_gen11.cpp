@@ -10,7 +10,7 @@
 #include <kern/thread_call.h>
 
 // ==== 6 kextInfos: ICL fallback + dual TGL identities (com.xxxxx and com.apple) from /Library/Extensions ====
-
+//trivial
 // ICL FB — com.apple (fallback path)
 static const char *pathsICLFB[] = {
     "/System/Library/Extensions/AppleIntelICLLPGraphicsFramebuffer.kext/Contents/MacOS/AppleIntelICLLPGraphicsFramebuffer",
