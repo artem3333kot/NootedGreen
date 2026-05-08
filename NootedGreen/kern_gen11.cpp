@@ -2272,12 +2272,20 @@ static void v45DelayedChildCheck(thread_call_param_t p0, thread_call_param_t p1)
 						SYSLOG("ngreen", "V55: accelerator isOpen=%d", svc->isOpen());
 						
 						if (childState == 0) {
-							SYSLOG("ngreen", "V55: %s at state=0x0 — calling registerService()", childName);
-							child->registerService(kIOServiceAsynchronous);
-							IODelay(500);
-							uint64_t newState = child->getState();
-							SYSLOG("ngreen", "V55: %s after registerService → state=0x%llx",
-								   childName, (unsigned long long)newState);
+							if (strcmp(childName, "IOAccelDisplayPipeUserClient2") == 0 && isDisplayPipeForceDisabled()) {
+								// dp0 mode: keep display pipe at state=0x0 so it never starts
+								// transaction machinery. Starting it causes stamp-9 timeouts every
+								// ~5.4s (AccessComplete is stubbed → stamp never advances →
+								// GPURestartSignaled → WS compositor briefly interrupted per cycle).
+								SYSLOG("ngreen", "V55: %s at state=0x0 — skip registerService (dp0: prevent stamp-9 timeout loop)", childName);
+							} else {
+								SYSLOG("ngreen", "V55: %s at state=0x0 — calling registerService()", childName);
+								child->registerService(kIOServiceAsynchronous);
+								IODelay(500);
+								uint64_t newState = child->getState();
+								SYSLOG("ngreen", "V55: %s after registerService → state=0x%llx",
+									   childName, (unsigned long long)newState);
+							}
 						}
 					}
 				}
@@ -3081,7 +3089,10 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 
 	// V88 scanout fill is intentionally opt-in: it paints debug bars/colors and can
 	// override normal Apple UI composition. Enable only for diagnostics with -ngreenv88.
-	if (isExperimentalMonitorEnabled() && isV88ScanoutFillEnabled() && v60Count >= 1 && v60Count <= 30) {
+	// In dp0 mode V88 is harmful: readReg32(PLANE_SURF) returns the hardware echo of
+	// setupScanoutMemory's 0x412be000 write (before V99S redirects it), causing V88[5]'s
+	// plane toggle to arm with the wrong SURF and fill non-aperture pages with color bands.
+	if (isExperimentalMonitorEnabled() && isV88ScanoutFillEnabled() && !isDisplayPipeForceDisabled() && v60Count >= 1 && v60Count <= 30) {
 		uint32_t surfAddr = NGreen::callback->readReg32(0x7019C);
 		uint32_t surfPage = surfAddr >> 12;
 
@@ -5146,13 +5157,12 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 	// FastWriteRegister32. Forcing writeReg32 here ensures the hardware shadow is
 	// correct right before SURF arms the double-buffer flip.
 	//
-	// dp0 path: also redirect non-aperture SURF to 0x0.
-	// setupScanoutMemory migrates SURF from aperture to ≥0x10000000 (non-aperture
-	// stolen RAM, phys ~0x7e…) when WindowServer sets kIOWindowServerActiveAttribute=3.
-	// That region is inaccessible via BAR2; the CPU compositor writes to BAR2 offset 0
-	// (GGTT[0]) while the display scans from 0x412be000 — neither sees the other.
-	// Fix: keep SURF=0x0 (aperture start, BAR2 offset 0) and force CTL linear so
-	// both paths share the same pages.
+	// dp0 path: redirect non-aperture SURF to 0x0 AND remap GGTT[0..] to the same
+	// physical pages (V99G).  setupScanoutMemory migrates SURF from aperture to
+	// ≥0x10000000 (non-aperture stolen RAM, phys ~0x7f…) when WindowServer sets
+	// kIOWindowServerActiveAttribute=3. After migration WS writes to the non-aperture
+	// physical pages; PLANE_SURF must also scan them. V99G copies the GGTT PTEs from the
+	// non-aperture range down to GGTT[0..3999] so SURF=0x0 scans the same pages.
 	if ((param_1 & 0xFFFFF) == 0x7019C && NGreen::callback) {
 		uint32_t hwStride = NGreen::callback->readReg32(0x70188);
 		uint32_t hwCtl    = NGreen::callback->readReg32(0x70180);
@@ -5164,11 +5174,38 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 		const bool dpForced = isDisplayPipeForceDisabled();
 		if (dpForced) {
 			// Block non-aperture migration: redirect SURF to aperture start.
+			// ALSO: remap GGTT[0..3999] to the non-aperture physical pages on first
+			// interception.  setupScanoutMemory updates WS's write target to those pages,
+			// so SURF=0x0 must scan them too.  Without this remap the display reads the old
+			// (blank) aperture physical pages while WS composes to the new non-aperture ones.
 			if (param_2 >= 0x10000000u) {
 				static int v99PCount = 0;
 				if (v99PCount < 8)
 					SYSLOG("ngreen", "V99R[P%d]: SURF 0x%x->0 (dp0: non-aperture blocked, aperture kept)",
 						   ++v99PCount, (uint32_t)param_2);
+
+				// V99G: one-shot GGTT remap — copy PTEs from the non-aperture surface pages
+				// (GGTT[surfPage..surfPage+3999]) to GGTT[0..3999] so that SURF=0x0 scans
+				// the SAME physical memory that WS's CPU compositor is writing into.
+				static bool ggttRemapped = false;
+				if (!ggttRemapped) {
+					ggttRemapped = true;
+					uint32_t srcPage = (uint32_t)param_2 >> 12;
+					int remapped = 0, remapSkipped = 0;
+					for (int i = 0; i < 4000; i++) {
+						uint32_t lo = NGreen::callback->readReg32(GGTT_PTE_LO(srcPage + i));
+						uint32_t hi = NGreen::callback->readReg32(GGTT_PTE_HI(srcPage + i));
+						if (!(lo & 1)) { remapSkipped++; continue; }
+						NGreen::callback->writeReg32(GGTT_PTE_LO(i), lo);
+						NGreen::callback->writeReg32(GGTT_PTE_HI(i), hi);
+						remapped++;
+					}
+					// Flush GGTT TLB so the display engine sees the updated mappings.
+					NGreen::callback->writeReg32(0x101008, 0x1);
+					SYSLOG("ngreen", "V99G: GGTT[0..%d] <- GGTT[0x%x..] remapped=%d skip=%d",
+						   remapped - 1, srcPage, remapped, remapSkipped);
+				}
+
 				param_2 = 0;
 			}
 			// Force CTL linear (tiling=0): CPU compositor writes linearly via BAR2.
