@@ -28,7 +28,13 @@ Patches Apple's Tiger Lake (Gen12) graphics drivers to work with newer Intel iGP
 
 ### Recent Progress
 
-- **V80L fix:** `userspace watchdog timeout` KP root cause confirmed and fixed. V80L (plane-linearization writes in `v71EmrEnforcer`) limited to first 3 ticks only. Brief display flash preserved; WS crash-loop eliminated. `-ngreenv80l` enables continuous mode for testing.
+- **dp0 path (CPU compositor / `-ngreendp0`) active investigation:**
+  - **V99S**: Hook in `raWriteRegister32` intercepts all `PLANE_SURF` writes ≥`0x10000000` (non-aperture) and redirects them to `0x0`; simultaneously forces `PLANE_CTL` linear and `PLANE_STRIDE=0xa0`. Keeps the display scanning BAR2 aperture while the Intel driver tries to migrate to non-aperture GGTT.
+  - **V99G**: One-shot GGTT remap — when V99S first intercepts a non-aperture `PLANE_SURF` write, copies PTEs from the non-aperture surface pages (`GGTT[surfPage..surfPage+3999]`) to `GGTT[0..3999]` so that `SURF=0x0` scans the same physical pages that WindowServer's CPU compositor writes to. Confirmed visible: Apple boot flash appears briefly on dp0.
+  - **V88 dp0 guard**: Added `!isDisplayPipeForceDisabled()` guard to the V88 scanout-fill block. Without this, V88 iteration 5 read the hardware `PLANE_SURF` echo (`0x412be000`) before V99S redirected it, causing V88's plane toggle to arm with the wrong surface and paint non-aperture pages with color bands (confirmed red horizontal bar artefact — now fixed).
+  - **Remaining blocker**: `kIOWindowServerActiveAttribute = 0x3 → 0x1` transition fires ~215–233 ms after WindowServer goes active. After reaching state `0x1`, WS stops CPU compositing — screen freezes on the last written frame. Root cause under investigation: stamp-9 timeout in `IOAccelDisplayPipe` transactions (V55/Path D testing), possible inability to open `IOAccelDisplayPipeUserClient2`, or WS degrading due to a GPU restart signal propagation.
+- **V80L fix:** `userspace watchdog timeout` KP root cause confirmed and fixed. V80L (plane-linearization writes in `v71EMrEnforcer`) limited to first 3 ticks only. Brief display flash preserved; WS crash-loop eliminated. `-ngreenv80l` enables continuous mode for testing.
+- **V158:** Cancel pending execlist contexts + drain CSB after every fake-success `resetGraphicsEngine` return. Writes 4×0 to `RING_ELSP` (null EL0+EL1 context descriptors), then reads `RING_CONTEXT_STATUS_PTR` and advances read_ptr to write_ptr. Applied on both V153 and V154 return-0 paths.
 - **V158:** Cancel pending execlist contexts + drain CSB after every fake-success `resetGraphicsEngine` return. Writes 4×0 to `RING_ELSP` (two null 64-bit context descriptors = cancel EL0 + EL1), then reads `RING_CONTEXT_STATUS_PTR` and writes back with read_ptr set to write_ptr. Logs `EXEC` value after the null writes to confirm whether execlist FIFO cleared. Applied on both V153 and V154 return-0 paths. Build confirmed clean. Boot test pending.
 - **V157:** Removed `rcsCtl == 0` guard from V153 quiescent check — hardware restores CTL to `0x7001` before V153 reads it, so the condition was always false. Only `rcsHead == rcsTail && err == 0` is needed. Boot log confirmed: V153 now fires from call #1.
 - **V156:** Fixed `RING_ENABLE` bit (ORed `| 1` at all CTL write sites). Dropped `bCtl == 0` from V154 check. Stabilized ring-enabled state across all fake-success paths.
@@ -69,7 +75,11 @@ Key registers (all offsets from `RENDER_RING_BASE = 0x2000`):
 
 ### Current Status
 
-System boots to login on RPL macOS 14.7.1 (`23H222`). The GPU reset storm is tamed: V153+V154 prevent the health monitor from burning the watchdog budget on redundant reset calls. CTL is stable at `0x7001`. The `userspace watchdog timeout` KP root cause has been identified and fixed: V80L plane-linearization writes in `v71EmrEnforcer` were fighting WindowServer over `PLANE_CTL`/`PLANE_STRIDE`/`PLANE_SURF` every 50ms — this has been corrected (first 3 ticks only). Active investigation continues on execlist/CSB cleanup (V158). V88 visual fill is opt-in only (`-ngreenv88`) so default boots preserve normal Apple UI layout.
+System boots to login on RPL macOS 14.7.1 (`23H222`). GPU reset storm tamed (V153/V154). `userspace watchdog timeout` KP fixed (V80L). CTL stable at `0x7001`.
+
+**dp0 investigation** (`-ngreendp0`): V99G GGTT remap + V99S PLANE_SURF redirect confirmed working — boot flash (Apple logo) is visible briefly, proving WS writes are reaching the display. V88 red-bar artefact eliminated. Active blocker: `kIOWindowServerActiveAttribute 0x3→0x1` ~215–233 ms after WS goes active; WS stops compositing after that transition and the screen freezes on the last written frame (cursor on black). V55/Path D testing in progress.
+
+V88 visual fill remains opt-in only (`-ngreenv88`). Default boots preserve normal Apple UI layout.
 
 ## Requirements
 
@@ -95,8 +105,10 @@ These properties are essential for correct platform identification and WEG coexi
 ## Boot args
 
 ```
--v keepsyms=1 debug=0x100 IGLogLevel=8 -NGreenDebug -liludbg liludump=200 ngreen-dmc=skip -allow3d -disablegfxfirmware -ngreenexp
+-v keepsyms=1 debug=0x100 IGLogLevel=8 -NGreenDebug -liludbg liludump=220 ngreen-dmc=adlp -allow3d -disablegfxfirmware -ngreenfullmtldyld -ngreenfullmtlcore -ngreendp0 -ngreenexp -ngreenv60 -ngreenv88
 ```
+
+> **Note:** `-ngreendp0 -ngreenv88` are diagnostic flags for the dp0/CPU-compositor investigation path. Remove them for normal operation.
 
 | Arg | Purpose |
 |---|---|
@@ -118,6 +130,7 @@ These properties are essential for correct platform identification and WEG coexi
 | `-ngreenv93` / `ngreenv93=1` | Enable V93 plane guard diagnostics (disabled by default). |
 | `-ngreenfullmtl` / `ngreenfullmtl=1` | Force full CoreDisplay Metal path on Ventura+/Sonoma by skipping Stage-3 NULL safety stubs (GetMTLTexture/GetMTLCommandQueue/RunFullDisplayPipe guard). This **does not** auto-enable Apple's original Blit3D initializer. |
 | `-ngreenfullmtldyld` / `ngreenfullmtldyld=1` | DYLD-side full-MTL override only. |
+| `-ngreenfullmtlcore` / `ngreenfullmtlcore=1` | Kernel-side full-MTL override only — forces `shouldForceFullMetalPath()` true. Accepts unified `-ngreenfullmtl` as fallback. Use together with `-ngreenfullmtldyld` for full override. |
 | `ngreenV142=0|1|2|3` / `-ngreenV142hardunsupported` / `-ngreenV142ok` / `-ngreenV142pass` / `-ngreenV142orig` | Select spoof-path `submitBlit` behavior on non-real TGL. `0`=return unsupported, `1`=bypass return 0 (**default/recommended**), `2`=bypass return 1, `3`=call Apple original (high-risk diagnostic). V186 applies this mode early before task/context mutation to reduce `IGAccelTask::release` lifetime crashes. |
 | `-ngreenbcsirq` | Enable BCS bit in tier-1 interrupt want mask on spoof path (advanced diagnostic). |
 | `ngreenV120=0|1|2` / `-ngreenV120ok` / `-ngreenV120fail` / `-ngreenV120pass` | Fallback return mode used when submitBlit sees invalid/null task on spoof path. |
@@ -322,7 +335,7 @@ Open `NootedGreen.xcodeproj` and select the **NootedGreen** scheme to build the 
 
 - **Stefano Giammori** ([@sgiammori](https://github.com/sgiammori)) — reverse engineering, driver development, hardware testing
 - Thanks to [@shl628](https://github.com/lshbluesky) and [@jalavoui](https://github.com/macintelk), developers of NootedBlue
-- **GitHub Copilot** (Claude Sonnet 4.6) — AI pair-programming, code generation, debug analysis
+- **Claude Code** (Claude Opus 4.7) — AI pair-programming, code generation, debug analysis
 
 ## License
 
