@@ -1789,6 +1789,12 @@ private:
 	// FB controller start — wraps original, adds registerService() for accelerator matching
 	static bool AppleIntelBaseControllerstart(void *that,void *param_1);
 	mach_vm_address_t oAppleIntelBaseControllerstart {};
+
+	// IntelAccelerator personality registration in IOCatalogue. Lives in the HW-kext
+	// path (ICL or TGL Graphics, not Framebuffer) — must run before the FBController's
+	// registerService() so IOKit can match IntelAccelerator. Idempotent.
+	void injectAcceleratorPersonality(bool useTglNames);
+	bool acceleratorPersonalityInjected {false};
 	
 	
 	static void * AppleIntelPlanenew(unsigned long param_1);

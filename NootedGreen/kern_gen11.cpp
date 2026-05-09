@@ -478,7 +478,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			{"__ZN14AppleIntelPort16computeLaneCountEPK29IODetailedTimingInformationV2jjPj",computeLaneCount, this->ocomputeLaneCount},
 			{"__ZN14AppleIntelPort21setupOptimalLaneCountEPK29IODetailedTimingInformationV2j",setupOptimalLaneCount, this->osetupOptimalLaneCount},
 			// V97: Log AUX transactions to diagnose eDP link training failures on RPL
-			{"__ZN14AppleIntelPort7readAUXEjPvj", Genx::wrapICLReadAUX, Genx::callback->orgICLReadAUX},
+			{"__ZN14AppleIntelPort7readAUXEjPvj", wrapICLReadAUX, this->orgICLReadAUX},
 			// V96: Force display online — WEG's getDisplayStatus hook (FOD) fails with
 			// "err 2" on TGL kext because that symbol doesn't exist. TGL uses getOnlineInfo.
 			{"__ZN21AppleIntelFramebuffer13getOnlineInfoEP21AppleIntelDisplayPathPhS2_", getOnlineInfo, this->ogetOnlineInfo},
@@ -731,15 +731,17 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		static const uint8_t f25[]= {0x77, 0x77, 0x00, 0x00};
 		static const uint8_t r25[]= {0x33, 0x00, 0x00, 0x00};
 
-		// Path E (TCON ID): replace Apple's expected CamelliaTcon2 / BanksiaTcon3 panel IDs
-		// with the user's actual panel ID 0x14 0x1e 0xc4 0xc1 so the kext recognises this
-		// panel and runs the matching TCON init path (PSR / power / timing).  Both compares
-		// are `cmp eax, IMM32` (5 bytes: 0x3D + 4 LE bytes).  Each pattern verified unique
-		// (1 occurrence) in the user's production le/AppleIntelTGLGraphicsFramebuffer.
+		// Path E (TCON ID): COMMENTED OUT — depends on GFX/AGDC services to actually run
+		// the CamelliaTcon2 init path. With FB-only boot (no GFX kext), making the FB binary
+		// recognise the panel as CamelliaTcon2 causes the FB driver to call into accelerator
+		// services that don't exist → hang during init.
+		// Re-enable only when GFX is loaded (with -ngreentglwithgfx + -allow3d).
+		/*
 		static const uint8_t f_tcon_camellia[]= {0x3d, 0x11, 0x0a, 0x84, 0x41};
 		static const uint8_t r_tcon_camellia[]= {0x3d, 0x14, 0x1e, 0xc4, 0xc1};
 		static const uint8_t f_tcon_banksia[] = {0x3d, 0x12, 0x14, 0xc4, 0x41};
 		static const uint8_t r_tcon_banksia[] = {0x3d, 0x14, 0x1e, 0xc4, 0xc1};
+		*/
 
 		if (isprod){
 			LookupPatchPlus const patchesp[] = {// tgl production kext
@@ -767,9 +769,9 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				{activeKext, f24cp, r24cp, arrsize(f24cp),	1},
 				{activeKext, f24dp, r24dp, arrsize(f24dp),	4},
 				{activeKext, f25,  r25,  arrsize(f25),	6},
-				// Path E: TCON ID rewrite so the kext recognises this panel
-				{activeKext, f_tcon_camellia, r_tcon_camellia, arrsize(f_tcon_camellia),	1},
-				{activeKext, f_tcon_banksia,  r_tcon_banksia,  arrsize(f_tcon_banksia),	1},
+				// Path E: TCON ID rewrite — COMMENTED OUT (depends on GFX, hangs FB-only boot)
+				//{activeKext, f_tcon_camellia, r_tcon_camellia, arrsize(f_tcon_camellia),	1},
+				//{activeKext, f_tcon_banksia,  r_tcon_banksia,  arrsize(f_tcon_banksia),	1},
 			};
 
 			PANIC_COND(!LookupPatchPlus::applyAll(patcher, patchesp , address, size), "ngreen", "kextG11FBT Failed to apply production patches!");
@@ -809,9 +811,9 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				{activeKext, f24c, r24c, arrsize(f24c),	1},
 				{activeKext, f24d, r24d, arrsize(f24d),	6},
 				{activeKext, f25,  r25,  arrsize(f25),	6},
-				// Path E: TCON ID rewrite so the kext recognises this panel
-				{activeKext, f_tcon_camellia, r_tcon_camellia, arrsize(f_tcon_camellia),	1},
-				{activeKext, f_tcon_banksia,  r_tcon_banksia,  arrsize(f_tcon_banksia),	1},
+				// Path E: TCON ID rewrite — COMMENTED OUT (depends on GFX, hangs FB-only boot)
+				//{activeKext, f_tcon_camellia, r_tcon_camellia, arrsize(f_tcon_camellia),	1},
+				//{activeKext, f_tcon_banksia,  r_tcon_banksia,  arrsize(f_tcon_banksia),	1},
 			};
 
 			PANIC_COND(!LookupPatchPlus::applyAll(patcher, patches , address, size), "ngreen", "kextG11FBT Failed to apply dbg patches!");
@@ -827,6 +829,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		}
 		auto *activeKext = &kextG11HW;
 		DBGLOG("ngreen", "init AppleIntelICLGraphics!");
+		injectAcceleratorPersonality(false);
 		NGreen::callback->setRMMIOIfNecessary();
 		const bool wegCoexist = isWEGCoexistMode();
 
@@ -929,6 +932,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		this->tglHWLoaded = true;
 		auto *activeKext = (kextG11HWTA.loadIndex == index) ? &kextG11HWTA : &kextG11HWT;
 		SYSLOG("ngreen", "init AppleIntelTGLGraphics (HW accelerator)");
+		injectAcceleratorPersonality(true);
 		NGreen::callback->setRMMIOIfNecessary();
 		SYSLOG("ngreen", "V165: setRMMIO done, starting symbol resolve");
 
@@ -5467,16 +5471,85 @@ uint8_t  Gen11::setPortMode(void *that,uint32_t param_1)
 
 IOReturn Gen11::wrapICLReadAUX(void *that, uint32_t address, void *buffer, uint32_t length) {
 
-	IOReturn retVal =	FunctionCast(wrapICLReadAUX, callback->orgICLReadAUX)(that,address, buffer, length );
+	IOReturn retVal = FunctionCast(wrapICLReadAUX, callback->orgICLReadAUX)(that, address, buffer, length);
 
-	if (address != 0x0000 && address != 0x2200)	return retVal;
-	
-	auto caps = reinterpret_cast<DPCDCap16*>(buffer);
-	
-	if (caps->revision < 0x03) {
-		caps->maxLinkRate=0;
+	// V97AUX: log first ~40 AUX reads to diagnose eDP link training failures.
+	static int auxLogCount = 0;
+	if (auxLogCount < 40) {
+		auxLogCount++;
+		uint8_t *b = reinterpret_cast<uint8_t *>(buffer);
+		if (length >= 2)
+			SYSLOG("ngreen", "V97AUX[%d]: addr=0x%04x len=%u ret=0x%x [0]=0x%02x [1]=0x%02x",
+			       auxLogCount, address, length, retVal, b ? b[0] : 0xFF, (b && length >= 2) ? b[1] : 0xFF);
+		else
+			SYSLOG("ngreen", "V97AUX[%d]: addr=0x%04x len=%u ret=0x%x",
+			       auxLogCount, address, length, retVal);
 	}
-	
+
+	// V98T removed: do NOT clamp DPCD[0x0100-0x0101] (LINK_BW_SET / LANE_COUNT_SET).
+	// Capping these to HBR2/2-lanes caused Apple to train the link at HBR2×2 lanes.
+	// V97P then wrote a 4-lane DDI_FUNC_CTL value to a 2-lane trained link → black screen.
+	// UEFI already trained the link at HBR3×4 lanes; we must let Apple see those values
+	// so it (re-)trains consistently and V97P's bit16-only correction stays coherent.
+	if (NGreen::callback && !NGreen::callback->isRealTGL && address == 0x0100 && buffer && length >= 1) {
+		auto *raw = reinterpret_cast<uint8_t *>(buffer);
+		static int v98tLogs = 0;
+		if (v98tLogs < 5) {
+			v98tLogs++;
+			if (length >= 2)
+				SYSLOG("ngreen", "V98T[%d]: DPCD 0x0100 passthrough bw=0x%02x lanes=0x%02x",
+				       v98tLogs, raw[0], raw[1]);
+			else
+				SYSLOG("ngreen", "V98T[%d]: DPCD 0x0100 passthrough bw=0x%02x (len=1)",
+				       v98tLogs, raw[0]);
+		}
+	}
+
+	// V99: Suppress spurious LINK_STATUS_UPDATED (DPCD[0x204] bit7) on RPL-P.
+	// HDCP probing reads DPCD 0x6921d, which causes the eDP panel to assert IRQ_HPD,
+	// setting LINK_STATUS_UPDATED=1. Apple's checkLinkStatus then sees
+	// INTERLANE_ALIGN_DONE=0 and tears down the display (~10s after boot).
+	// The physical link is healthy; only the IRQ flag is spurious.
+	// Clearing bit7 of DPCD[0x204] prevents the driver from acting on the IRQ.
+	if (NGreen::callback && !NGreen::callback->isRealTGL && address == 0x0202 && buffer && length >= 3) {
+		auto *raw = reinterpret_cast<uint8_t *>(buffer);
+		if (raw[2] & 0x80) {
+			static int v99Logs = 0;
+			if (v99Logs < 10) {
+				v99Logs++;
+				SYSLOG("ngreen", "V99[%d]: suppressed DPCD 0x204 LINK_STATUS_UPDATED "
+				       "(was 0x%02x, lanes=[0x%02x 0x%02x])",
+				       v99Logs, raw[2], raw[0], raw[1]);
+			}
+			raw[2] &= ~0x80u; // clear LINK_STATUS_UPDATED
+		}
+	}
+
+	if (address != 0x0000 && address != 0x2200) return retVal;
+
+	if (length < sizeof(DPCDCap16) || buffer == nullptr)
+		return retVal;
+
+	auto caps = reinterpret_cast<DPCDCap16 *>(buffer);
+
+	if (NGreen::callback && !NGreen::callback->isRealTGL) {
+		// V98: Do NOT cap maxLaneCount or maxLinkRate.
+		// Previous versions capped maxLaneCount to 2, which caused Apple to train at
+		// 2 lanes while V97P subsequently wrote a 4-lane DDI_FUNC_CTL value → black screen.
+		// The hardware is trained at HBR3×4 lanes by UEFI; let Apple see those real caps
+		// so its LightUpEDP (re-)trains consistently at HBR3×4 lanes.
+		static int v98Logs = 0;
+		if (v98Logs < 5) {
+			v98Logs++;
+			SYSLOG("ngreen", "V98[%d]: DPCD caps @0x%04x maxLinkRate=0x%02x maxLane=0x%02x (passthrough)",
+			       v98Logs, address, caps->maxLinkRate, caps->maxLaneCount);
+		}
+	}
+
+	if (caps->revision < 0x03) {
+		caps->maxLinkRate = 0;
+	}
+
 	return retVal;
 }
 
@@ -5531,120 +5604,126 @@ bool Gen11::AppleIntelBaseControllerstart(void *that,void *param_1)
 	SYSLOG("ngreen", "FBController::start() returned %d", ret);
 	
 	if (ret) {
-		// The original start succeeded but the accelerator may still need personality
-		// reinforcement in IOCatalogue for reliable IOAccelerator matching.
-		// Lilu loaded the binary and we patched its code, but IOKit doesn't know the personality exists.
-		// Fix: manually inject the personality into IOCatalogue so IOKit will match IntelAccelerator
-		// against the PCI device under the IOAccelerator match category.
-		
+		// The personality dict itself was registered in IOCatalogue from the HW-kext
+		// processKext branch (see Gen11::injectAcceleratorPersonality). All this wrapper
+		// does — and all an FB-tier route should do — is poke the FBController service
+		// so IOKit re-runs matching now that the personality is present.
 		auto *service = OSDynamicCast(IOService, reinterpret_cast<OSObject *>(that));
 		if (service) {
-			SYSLOG("ngreen", "FBController: injecting IntelAccelerator personality into IOCatalogue");
-			
-			auto *dict = OSDictionary::withCapacity(24);
-			if (dict) {
-				const bool useTglNames = callback && callback->tglHWLoaded;
-				const char *bundleId = useTglNames ? "com.xxxxx.driver.AppleIntelTGLGraphics" : "com.apple.driver.AppleIntelICLGraphics";
-				const char *mtlName = useTglNames ? "AppleIntelTGLGraphicsMTLDriver" : "AppleIntelICLGraphicsMTLDriver";
-				const char *glName = useTglNames ? "AppleIntelTGLGraphicsGLDriver" : "AppleIntelICLGraphicsGLDriver";
-				const char *vaName = useTglNames ? "AppleIntelTGLGraphicsVADriver" : "AppleIntelICLGraphicsVADriver";
-
-				// Basic matching properties
-				auto *bi  = OSString::withCString(bundleId);
-				auto *cls = OSString::withCString("IntelAccelerator");
-				auto *mc  = OSString::withCString("IOAccelerator");
-				auto *pv  = OSString::withCString("IOPCIDevice");
-				auto *pcm = OSString::withCString("0x03000000&0xff000000");
-				auto *ps  = OSNumber::withNumber(static_cast<unsigned long long>(1000), 32);
-				
-				dict->setObject("CFBundleIdentifier", bi);
-				dict->setObject("IOClass", cls);
-				dict->setObject("IOMatchCategory", mc);
-				dict->setObject("IOProviderClass", pv);
-				dict->setObject("IOPCIClassMatch", pcm);
-				dict->setObject("IOProbeScore", ps);
-				
-				OSSafeReleaseNULL(bi);
-				OSSafeReleaseNULL(cls);
-				OSSafeReleaseNULL(mc);
-				OSSafeReleaseNULL(pv);
-				OSSafeReleaseNULL(pcm);
-				OSSafeReleaseNULL(ps);
-				
-				// V44: GPU driver bundle names — required by IOAcceleratorFamily2 and WindowServer
-				auto *mtl = OSString::withCString(mtlName);
-				auto *gl  = OSString::withCString(glName);
-				auto *dvd = OSString::withCString(vaName);
-				auto *src = OSString::withCString("0.0.0.0.0");
-				auto *vaCodec   = OSString::withCString("Gen10");
-				auto *vaScaler  = OSString::withCString("Gen10");
-				auto *vaBGRA    = OSString::withCString("Gen10");
-				auto *vaRendID  = OSNumber::withNumber(static_cast<unsigned long long>(17301568), 32); // 0x1084000
-				
-				dict->setObject("MetalPluginName", mtl);
-				dict->setObject("IOGLBundleName", gl);
-				dict->setObject("IODVDBundleName", dvd);
-				dict->setObject("IOSourceVersion", src);
-				dict->setObject("IOGVACodec", vaCodec);
-				dict->setObject("IOGVAScaler", vaScaler);
-				dict->setObject("IOGVABGRAEnc", vaBGRA);
-				dict->setObject("IOVARendererID", vaRendID);
-				
-				OSSafeReleaseNULL(mtl);
-				OSSafeReleaseNULL(gl);
-				OSSafeReleaseNULL(dvd);
-				OSSafeReleaseNULL(src);
-				OSSafeReleaseNULL(vaCodec);
-				OSSafeReleaseNULL(vaScaler);
-				OSSafeReleaseNULL(vaBGRA);
-				OSSafeReleaseNULL(vaRendID);
-				
-				// IOAccelerator2D plugin type (required for 2D acceleration matching)
-				auto *pluginDict = OSDictionary::withCapacity(1);
-				if (pluginDict) {
-					auto *pluginName = OSString::withCString("IOAccelerator2D.plugin");
-					pluginDict->setObject("ACCF0000-0000-0000-0000-000a2789904e", pluginName);
-					OSSafeReleaseNULL(pluginName);
-					dict->setObject("IOCFPlugInTypes", pluginDict);
-					pluginDict->release();
-				}
-				
-				// V77: Display pipe capabilities — DISABLED to prevent WS GPU compositing crash.
-				// See V77 comment in start() for full explanation.
-				auto *dpCaps = OSDictionary::withCapacity(2);
-				if (dpCaps) {
-					auto *dpSupp = OSNumber::withNumber(static_cast<unsigned long long>(0), 32);
-					auto *trSupp = OSNumber::withNumber(static_cast<unsigned long long>(0), 32);
-					dpCaps->setObject("DisplayPipeSupported", dpSupp);
-					dpCaps->setObject("TransactionsSupported", trSupp);
-					OSSafeReleaseNULL(dpSupp);
-					OSSafeReleaseNULL(trSupp);
-					dict->setObject("IOAccelDisplayPipeCapabilities", dpCaps);
-					dpCaps->release();
-				}
-				
-				SYSLOG("ngreen", "V44: personality has %u properties", dict->getCount());
-				
-				auto *array = OSArray::withCapacity(1);
-				if (array) {
-					array->setObject(dict);
-					if (gIOCatalogue) {
-						bool ok = gIOCatalogue->addDrivers(array, true);
-						SYSLOG("ngreen", "FBController: addDrivers to gIOCatalogue returned %d", ok);
-					} else {
-						SYSLOG("ngreen", "FBController: gIOCatalogue is null!");
-					}
-					array->release();
-				}
-				dict->release();
-			}
-			
 			SYSLOG("ngreen", "FBController: calling registerService() to trigger accelerator matching");
 			service->registerService();
 		}
 	}
-	
+
 	return ret;
+}
+
+void Gen11::injectAcceleratorPersonality(bool useTglNames)
+{
+	if (this->acceleratorPersonalityInjected) {
+		DBGLOG("ngreen", "injectAcceleratorPersonality: already injected, skipping");
+		return;
+	}
+
+	SYSLOG("ngreen", "injectAcceleratorPersonality: registering IntelAccelerator (%s) into IOCatalogue",
+	       useTglNames ? "TGL" : "ICL");
+
+	auto *dict = OSDictionary::withCapacity(24);
+	if (!dict) return;
+
+	const char *bundleId = useTglNames ? "com.xxxxx.driver.AppleIntelTGLGraphics" : "com.apple.driver.AppleIntelICLGraphics";
+	const char *mtlName  = useTglNames ? "AppleIntelTGLGraphicsMTLDriver"        : "AppleIntelICLGraphicsMTLDriver";
+	const char *glName   = useTglNames ? "AppleIntelTGLGraphicsGLDriver"         : "AppleIntelICLGraphicsGLDriver";
+	const char *vaName   = useTglNames ? "AppleIntelTGLGraphicsVADriver"         : "AppleIntelICLGraphicsVADriver";
+
+	// Basic matching properties
+	auto *bi  = OSString::withCString(bundleId);
+	auto *cls = OSString::withCString("IntelAccelerator");
+	auto *mc  = OSString::withCString("IOAccelerator");
+	auto *pv  = OSString::withCString("IOPCIDevice");
+	auto *pcm = OSString::withCString("0x03000000&0xff000000");
+	auto *ps  = OSNumber::withNumber(static_cast<unsigned long long>(1000), 32);
+
+	dict->setObject("CFBundleIdentifier", bi);
+	dict->setObject("IOClass", cls);
+	dict->setObject("IOMatchCategory", mc);
+	dict->setObject("IOProviderClass", pv);
+	dict->setObject("IOPCIClassMatch", pcm);
+	dict->setObject("IOProbeScore", ps);
+
+	OSSafeReleaseNULL(bi);
+	OSSafeReleaseNULL(cls);
+	OSSafeReleaseNULL(mc);
+	OSSafeReleaseNULL(pv);
+	OSSafeReleaseNULL(pcm);
+	OSSafeReleaseNULL(ps);
+
+	// V44: GPU driver bundle names — required by IOAcceleratorFamily2 and WindowServer
+	auto *mtl = OSString::withCString(mtlName);
+	auto *gl  = OSString::withCString(glName);
+	auto *dvd = OSString::withCString(vaName);
+	auto *src = OSString::withCString("0.0.0.0.0");
+	auto *vaCodec  = OSString::withCString("Gen10");
+	auto *vaScaler = OSString::withCString("Gen10");
+	auto *vaBGRA   = OSString::withCString("Gen10");
+	auto *vaRendID = OSNumber::withNumber(static_cast<unsigned long long>(17301568), 32); // 0x1084000
+
+	dict->setObject("MetalPluginName", mtl);
+	dict->setObject("IOGLBundleName", gl);
+	dict->setObject("IODVDBundleName", dvd);
+	dict->setObject("IOSourceVersion", src);
+	dict->setObject("IOGVACodec", vaCodec);
+	dict->setObject("IOGVAScaler", vaScaler);
+	dict->setObject("IOGVABGRAEnc", vaBGRA);
+	dict->setObject("IOVARendererID", vaRendID);
+
+	OSSafeReleaseNULL(mtl);
+	OSSafeReleaseNULL(gl);
+	OSSafeReleaseNULL(dvd);
+	OSSafeReleaseNULL(src);
+	OSSafeReleaseNULL(vaCodec);
+	OSSafeReleaseNULL(vaScaler);
+	OSSafeReleaseNULL(vaBGRA);
+	OSSafeReleaseNULL(vaRendID);
+
+	// IOAccelerator2D plugin type (required for 2D acceleration matching)
+	auto *pluginDict = OSDictionary::withCapacity(1);
+	if (pluginDict) {
+		auto *pluginName = OSString::withCString("IOAccelerator2D.plugin");
+		pluginDict->setObject("ACCF0000-0000-0000-0000-000a2789904e", pluginName);
+		OSSafeReleaseNULL(pluginName);
+		dict->setObject("IOCFPlugInTypes", pluginDict);
+		pluginDict->release();
+	}
+
+	// V77: Display pipe capabilities forced to 0 to prevent WS GPU compositing crash.
+	auto *dpCaps = OSDictionary::withCapacity(2);
+	if (dpCaps) {
+		auto *dpSupp = OSNumber::withNumber(static_cast<unsigned long long>(0), 32);
+		auto *trSupp = OSNumber::withNumber(static_cast<unsigned long long>(0), 32);
+		dpCaps->setObject("DisplayPipeSupported", dpSupp);
+		dpCaps->setObject("TransactionsSupported", trSupp);
+		OSSafeReleaseNULL(dpSupp);
+		OSSafeReleaseNULL(trSupp);
+		dict->setObject("IOAccelDisplayPipeCapabilities", dpCaps);
+		dpCaps->release();
+	}
+
+	SYSLOG("ngreen", "injectAcceleratorPersonality: personality has %u properties", dict->getCount());
+
+	auto *array = OSArray::withCapacity(1);
+	if (array) {
+		array->setObject(dict);
+		if (gIOCatalogue) {
+			bool ok = gIOCatalogue->addDrivers(array, true);
+			SYSLOG("ngreen", "injectAcceleratorPersonality: addDrivers returned %d", ok);
+			this->acceleratorPersonalityInjected = ok;
+		} else {
+			SYSLOG("ngreen", "injectAcceleratorPersonality: gIOCatalogue is null!");
+		}
+		array->release();
+	}
+	dict->release();
 }
 
 
@@ -5784,10 +5863,12 @@ uint64_t Gen11::getOSInformation(void *that)
 			FB_FLAG_FORCE_POWER_ALWAYS_CONNECTED |
 			FB_FLAG_AVOID_FAST_LINK_TRAINING;
 
-		// Path E: cameliav = 2 (CamelliaTcon2). Pairs with the binary patch that rewrites
-		// the runtime cmp eax,0x4184_0a11 so the kext matches this panel's actual ID
-		// 0x14 0x1e 0xc4 0xc1 as CamelliaTcon2.  Was 0 (no TCON) — keep at 0 if regressing.
-		pinfo[1].cameliav = 2;
+		// Path E: cameliav = 2 (CamelliaTcon2) COMMENTED OUT — depends on GFX/AGDC services.
+		// With FB-only boot, telling the FB driver this panel has CamelliaTcon2 makes init
+		// call into accelerator services that don't exist → hang.
+		// Re-enable to 2 only when -ngreentglwithgfx + -allow3d is used (full GFX path).
+		//pinfo[1].cameliav = 2;
+		pinfo[1].cameliav = 0;  // no TCON (Camellia/Banksia disabled — safe for FB-only)
 		pinfo[1].fMobile  = 1;
 		// Use Apple TGL native counts for 0x9a490000 (3/3/3 from original IGFB binary).
 		// NootedBlue used 4/4/2 for a different machine; our platform needs 3/3/3 to allow
