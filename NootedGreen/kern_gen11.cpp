@@ -60,11 +60,11 @@ Gen11 *Gen11::callback = nullptr;
 void Gen11::init() {
 	callback = this;
 
-	if (checkKernelArgument("-ngreentgl")) {
+	if (checkKernelArgument("-ngreentglfb") || checkKernelArgument("-ngreentglwithgfx")) {
 		SYSLOG("ngreen", "Gen11::init: FB tier → TGL (ICL FB skipped)");
 		lilu.onKextLoadForce(&kextG11FBT);
 		lilu.onKextLoadForce(&kextG11FBTA);
-		if (checkKernelArgument("-ngreentglgfx")) {
+		if (checkKernelArgument("-ngreentglwithgfx")) {
 			SYSLOG("ngreen", "Gen11::init: HW tier → TGL (ICL HW skipped)");
 			lilu.onKextLoadForce(&kextG11HWT);
 			lilu.onKextLoadForce(&kextG11HWTA);
