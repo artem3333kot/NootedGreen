@@ -718,6 +718,16 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		static const uint8_t f25[]= {0x77, 0x77, 0x00, 0x00};
 		static const uint8_t r25[]= {0x33, 0x00, 0x00, 0x00};
 
+		// Path E (TCON ID): replace Apple's expected CamelliaTcon2 / BanksiaTcon3 panel IDs
+		// with the user's actual panel ID 0x14 0x1e 0xc4 0xc1 so the kext recognises this
+		// panel and runs the matching TCON init path (PSR / power / timing).  Both compares
+		// are `cmp eax, IMM32` (5 bytes: 0x3D + 4 LE bytes).  Each pattern verified unique
+		// (1 occurrence) in the user's production le/AppleIntelTGLGraphicsFramebuffer.
+		static const uint8_t f_tcon_camellia[]= {0x3d, 0x11, 0x0a, 0x84, 0x41};
+		static const uint8_t r_tcon_camellia[]= {0x3d, 0x14, 0x1e, 0xc4, 0xc1};
+		static const uint8_t f_tcon_banksia[] = {0x3d, 0x12, 0x14, 0xc4, 0x41};
+		static const uint8_t r_tcon_banksia[] = {0x3d, 0x14, 0x1e, 0xc4, 0xc1};
+
 		if (isprod){
 			LookupPatchPlus const patchesp[] = {// tgl production kext
 
@@ -744,6 +754,9 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				{activeKext, f24cp, r24cp, arrsize(f24cp),	1},
 				{activeKext, f24dp, r24dp, arrsize(f24dp),	4},
 				{activeKext, f25,  r25,  arrsize(f25),	6},
+				// Path E: TCON ID rewrite so the kext recognises this panel
+				{activeKext, f_tcon_camellia, r_tcon_camellia, arrsize(f_tcon_camellia),	1},
+				{activeKext, f_tcon_banksia,  r_tcon_banksia,  arrsize(f_tcon_banksia),	1},
 			};
 
 			PANIC_COND(!LookupPatchPlus::applyAll(patcher, patchesp , address, size), "ngreen", "kextG11FBT Failed to apply production patches!");
@@ -783,6 +796,9 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				{activeKext, f24c, r24c, arrsize(f24c),	1},
 				{activeKext, f24d, r24d, arrsize(f24d),	6},
 				{activeKext, f25,  r25,  arrsize(f25),	6},
+				// Path E: TCON ID rewrite so the kext recognises this panel
+				{activeKext, f_tcon_camellia, r_tcon_camellia, arrsize(f_tcon_camellia),	1},
+				{activeKext, f_tcon_banksia,  r_tcon_banksia,  arrsize(f_tcon_banksia),	1},
 			};
 
 			PANIC_COND(!LookupPatchPlus::applyAll(patcher, patches , address, size), "ngreen", "kextG11FBT Failed to apply dbg patches!");
@@ -5755,7 +5771,10 @@ uint64_t Gen11::getOSInformation(void *that)
 			FB_FLAG_FORCE_POWER_ALWAYS_CONNECTED |
 			FB_FLAG_AVOID_FAST_LINK_TRAINING;
 
-		pinfo[1].cameliav = 0;  // no TCON (Camellia/Banksia disabled)
+		// Path E: cameliav = 2 (CamelliaTcon2). Pairs with the binary patch that rewrites
+		// the runtime cmp eax,0x4184_0a11 so the kext matches this panel's actual ID
+		// 0x14 0x1e 0xc4 0xc1 as CamelliaTcon2.  Was 0 (no TCON) — keep at 0 if regressing.
+		pinfo[1].cameliav = 2;
 		pinfo[1].fMobile  = 1;
 		// Use Apple TGL native counts for 0x9a490000 (3/3/3 from original IGFB binary).
 		// NootedBlue used 4/4/2 for a different machine; our platform needs 3/3/3 to allow

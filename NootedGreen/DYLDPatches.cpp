@@ -251,20 +251,55 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 		0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90
 	};
 
+	// V189: Smart AccessComplete patch (Sonoma 14.7.1).
+	// Instead of stubbing the entire function (V187 = xor eax,eax; ret), we let the
+	// prologue run, then jump from offset +0x2F directly to the *completion signal path*
+	// at loc_7FF8022E40E0. That path:
+	//   1. Performs region housekeeping (CFTypePtr move + CGRegionCreateEmpty)
+	//   2. Clears the surface dirty flag at [this+0x118]
+	//   3. lock dec dword ptr [surface->[+0x178]+0x170]   ← KERNEL WAKEUP SIGNAL
+	//   4. Clears [this+0x178]
+	//   5. Falls through to the canary-check epilogue at loc_7FF8022E416E
+	// None of these touch Metal — only CGRegion + atomic dec — so they are safe on
+	// spoofed RPL where MetalDevice can't be constructed. WS's 234 ms timeout fires
+	// because the lock dec never happens with V187; V189 fires it without the crash.
+	//
+	// Find pattern (16 bytes at function offset +0x2F):
+	//   mov rdi, [rdi+0x178]      48 8B BF 78 01 00 00
+	//   test rdi, rdi              48 85 FF
+	//   jz loc_7FF8022E40B8        0F 84 15 22 00 00     (rel offset 0x2215)
+	// Replace with:
+	//   jmp loc_7FF8022E40E0       E9 48 22 00 00        (rel offset 0x2248)
+	//   + 11 NOPs
+	static const uint8_t f_accesscomplete_v189_sonoma[] = {
+		0x48,0x8B,0xBF,0x78,0x01,0x00,0x00,
+		0x48,0x85,0xFF,
+		0x0F,0x84,0x15,0x22,0x00,0x00
+	};
+	static const uint8_t r_accesscomplete_v189_sonoma[] = {
+		0xE9,0x48,0x22,0x00,0x00,
+		0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90
+	};
+
 	if (getKernelVersion() >= KernelVersion::Ventura) {
 		const bool isRealTGL = NGreen::callback && NGreen::callback->isRealTGL;
 		const bool forceFullMTL = shouldForceFullMetalPath();
-		const bool applyCoreDisplaySafety = isRealTGL || forceFullMTL || !isRealTGL;
-		static bool loggedMetalMode = false;
-		if (!loggedMetalMode) {
+		//const bool applyCoreDisplaySafety = isRealTGL || forceFullMTL || !isRealTGL;
+		{
 			const bool fullMTLActive = isRealTGL || forceFullMTL;
-			SYSLOG("DYLD", "FULL_MTL_ACTIVE=%d CORE_SAFETY_ACTIVE=%d (isRealTGL=%d forceFullMTL=%d)",
-			       fullMTLActive, applyCoreDisplaySafety, isRealTGL, forceFullMTL);
-			loggedMetalMode = true;
+			static bool loggedFullMTL = false;
+			if (!loggedFullMTL) {
+				loggedFullMTL = true;
+				SYSLOG("DYLD", "FULL_MTL_ACTIVE=%d (isRealTGL=%d forceFullMTL=%d)",
+				       fullMTLActive, isRealTGL, forceFullMTL);
+			}
 		}
-
-		// Keep these safety guards enabled on spoofed hardware even without full-MTL args,
-		// otherwise WindowServer/cursor init can regress before fallback stubs engage.
+		// COMMENTED OUT (2026-05-09): the gate `applyCoreDisplaySafety = isRealTGL || forceFullMTL || !isRealTGL`
+		// is a tautology (A || B || !A == true), so these two patches were always being applied
+		// regardless of mode. Disabling the branch entirely as a diagnostic to see whether the
+		// CoreDisplay assertion bypass and RunFullDisplayPipe NULL guard are actually needed
+		// alongside the V189 signal-path patch. Re-enable if WS/cursor init regresses.
+		/*
 		if (applyCoreDisplaySafety) {
 			const DYLDPatch assertionPatch[] = {
 				{f3b_sonoma, r3b_sonoma, "CoreDisplay assertion bypass (Sonoma)"},
@@ -276,15 +311,25 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 			};
 			DYLDPatch::applyAll(fdpGuardPatch, const_cast<void *>(data), PAGE_SIZE);
 		}
+		*/
 
-		if (!isRealTGL) {
+		if (!isRealTGL && !forceFullMTL) {
 			// For spoofed (non-TGL) hardware the CoreDisplay MetalDevice is never
 			// validly constructed — its internal mtlDevice field holds an
 			// NSTaggedPointerString rather than a real MTLDevice object.
 			// Stubbing both accessors to NULL prevents objc_msgSend from
 			// dispatching Metal methods onto the garbage pointer.
-			// This applies regardless of forceFullMTL: the Metal device simply
-			// does not exist for RPL/ADL under the spoofed TGL driver.
+			//
+			// Gated on !forceFullMTL: the whole point of -ngreenfullmtl on
+			// spoofed hardware is to drive the real Metal path (see
+			// kern_gen11.cpp:7346 and the !wegCoexist || forceFullMTL branches
+			// around kern_gen11.cpp:1075). Stubbing GetMTLTexture /
+			// GetMTLCommandQueue and truncating AccessComplete here would
+			// neuter the very accessors that path needs, so when forceFullMTL
+			// is set we skip these patches and let the real Metal accessors
+			// run. Trade-off: loses the RunFullDisplayPipe isRemovable crash
+			// guard under forceFullMTL — re-add it (with its own gate) if RFDP
+			// hits a NULL vcall on spoofed hardware in that mode.
 			const DYLDPatch getMtlTextureSafetyPatch[] = {
 				{f_getmtltex_sonoma, r_getmtltex_sonoma, "GetMTLTexture return NULL (Sonoma)"},
 			};
@@ -300,14 +345,31 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 			};
 			DYLDPatch::applyAll(isRemovableGuardPatch, const_cast<void *>(data), PAGE_SIZE);
 
-			// V187: aggressive full-return on AccessComplete prologue — best known state:
-			// no KP, cursor visible, but display may show recycle/low-detail condition.
-			// Applied unconditionally for !isRealTGL. Use -ngreenV188htfind to test the
-			// narrower hash-find guard instead (caused black screen regression).
-			const DYLDPatch accessCompleteGuardPatch[] = {
-				{f_accesscomplete_guard_sonoma, r_accesscomplete_guard_sonoma, "DisplaySurface::AccessComplete crash guard V187 (Sonoma)"},
-			};
-			DYLDPatch::applyAll(accessCompleteGuardPatch, const_cast<void *>(data), PAGE_SIZE);
+			// V187 vs V189 selection.
+			// -ngreenv189 (opt-in): apply the smart signal-path patch instead of V187.
+			//   V189 lets the prologue run, then jumps from +0x2F to loc_7FF8022E40E0
+			//   (the completion-signal path: lock dec on surface->[+0x178]+0x170).
+			//   This unblocks the WS 234 ms timeout while still avoiding the Metal crash.
+			// Default: V187 (full-stub, safe but never signals — Apple flash freezes).
+			static bool loggedV189Decision = false;
+			const bool wantV189 = checkKernelArgument("-ngreenv189");
+			if (!loggedV189Decision) {
+				loggedV189Decision = true;
+				SYSLOG("DYLD", "V189: -ngreenv189 detected=%d", wantV189);
+			}
+			if (wantV189) {
+				if (UNLIKELY(KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE,
+						f_accesscomplete_v189_sonoma, sizeof(f_accesscomplete_v189_sonoma),
+						r_accesscomplete_v189_sonoma, sizeof(r_accesscomplete_v189_sonoma)))) {
+					SYSLOG("DYLD", "V189: AccessComplete signal-path jump applied");
+				}
+			} else {
+				if (UNLIKELY(KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE,
+						f_accesscomplete_guard_sonoma, sizeof(f_accesscomplete_guard_sonoma),
+						r_accesscomplete_guard_sonoma, sizeof(r_accesscomplete_guard_sonoma)))) {
+					SYSLOG("DYLD", "V187: AccessComplete crash guard applied");
+				}
+			}
 
 			// V188: narrower hash-find guard — caused black screen regression, debug only.
 			if (checkKernelArgument("-ngreenV188htfind")) {
