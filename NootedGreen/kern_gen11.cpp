@@ -8,7 +8,6 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOCatalogue.h>
 #include <kern/thread_call.h>
-#include <Headers/kern_file.hpp>
 
 // ==== 6 kextInfos: ICL fallback + dual TGL identities (com.xxxxx and com.apple) from /Library/Extensions ====
 //trivial
@@ -58,34 +57,19 @@ static KernelPatcher::KextInfo kextG11HWTA {"com.apple.driver.AppleIntelTGLGraph
 
 Gen11 *Gen11::callback = nullptr;
 
-static bool gen11FileExistsOnDisk(const char *path) {
-	size_t size = 0;
-	uint8_t *buf = FileIO::readFileToBuffer(path, size);
-	if (buf == nullptr) return false;
-	Buffer::deleter(buf);
-	return size > 0;
-}
-
 void Gen11::init() {
 	callback = this;
 
-	// FB and HW tiers are decided independently from disk presence in /L/E.
-	// onKextLoadForce *forces* the kext to load, so registering an ICL kext
-	// while its TGL sibling is also in use would drag ICL in and cause an
-	// attach mismatch. Per-tier gating keeps each pathway clean.
-	bool tglFBOnDisk = gen11FileExistsOnDisk("/Library/Extensions/AppleIntelTGLGraphicsFramebuffer.kext/Contents/MacOS/AppleIntelTGLGraphicsFramebuffer");
-	bool tglHWOnDisk = gen11FileExistsOnDisk("/Library/Extensions/AppleIntelTGLGraphics.kext/Contents/MacOS/AppleIntelTGLGraphics");
-
-	if (tglFBOnDisk) {
+	if (checkKernelArgument("-ngreentgl")) {
 		SYSLOG("ngreen", "Gen11::init: FB tier → TGL (ICL FB skipped)");
 		lilu.onKextLoadForce(&kextG11FBT);
 		lilu.onKextLoadForce(&kextG11FBTA);
-		if (tglHWOnDisk) {
+		if (checkKernelArgument("-ngreentglgfx")) {
 			SYSLOG("ngreen", "Gen11::init: HW tier → TGL (ICL HW skipped)");
 			lilu.onKextLoadForce(&kextG11HWT);
 			lilu.onKextLoadForce(&kextG11HWTA);
 		}
-	} else if (tglHWOnDisk) {
+	} else if (checkKernelArgument("-ngreentglgfx")) {
 		SYSLOG("ngreen", "Gen11::init: HW tier → TGL (ICL HW skipped)");
 		lilu.onKextLoadForce(&kextG11HWT);
 		lilu.onKextLoadForce(&kextG11HWTA);
