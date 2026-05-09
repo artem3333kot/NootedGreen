@@ -1528,6 +1528,20 @@ private:
 	// The TGL FB uses getOnlineInfo instead; hook it here to unconditionally report online.
 	static void getOnlineInfo(void *that, void *displayPath, unsigned char *online, unsigned char *changed);
 	mach_vm_address_t ogetOnlineInfo {};
+
+	// Path B: Force AppleIntelFramebuffer::isApertureMemoryRequired() to return true under
+	// dp0 mode so setupScanoutMemory never migrates from aperture to non-aperture memory
+	// when WindowServer transitions fWSAAState 0→3.  Returns the original value otherwise.
+	static bool wrapIsApertureMemoryRequired(void *that);
+	mach_vm_address_t oIsApertureMemoryRequired {};
+
+	// Path C: Hook AppleIntelFramebuffer::setAttribute(IOSelect, uintptr_t).
+	// On dp0 + !isRealTGL: when WindowServer writes kIOWindowServerActiveAttribute
+	// ('wsrv' = 0x77737276) with value 0x1 (degrade), coerce to 0x3 (stay-active) before
+	// calling original — preserves kernel-tracked fWSAAState so the driver keeps treating
+	// WS as fully active.  All other attribute writes pass through unchanged.
+	static IOReturn wrapSetAttribute(void *that, uint32_t attr, uintptr_t value);
+	mach_vm_address_t oSetAttribute {};
 	
 	static void blit3d_submit_rectlist(void *param_1,void *param_2,void *param_3);
 	mach_vm_address_t oblit3d_submit_rectlist {};

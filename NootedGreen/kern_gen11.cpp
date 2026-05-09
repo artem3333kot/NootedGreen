@@ -469,6 +469,13 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			// V96: Force display online — WEG's getDisplayStatus hook (FOD) fails with
 			// "err 2" on TGL kext because that symbol doesn't exist. TGL uses getOnlineInfo.
 			{"__ZN21AppleIntelFramebuffer13getOnlineInfoEP21AppleIntelDisplayPathPhS2_", getOnlineInfo, this->ogetOnlineInfo},
+			// Path B: Force aperture memory under dp0 mode to prevent WS=0x3 migration to
+			// non-aperture, which leaves the display scanning empty pages and triggers
+			// the 0x3→0x1 WS degradation.
+			{"__ZN21AppleIntelFramebuffer24isApertureMemoryRequiredEv", wrapIsApertureMemoryRequired, this->oIsApertureMemoryRequired},
+			// Path C: Coerce kIOWindowServerActiveAttribute=0x1 (WS degrade) to 0x3 (stay-active)
+			// under dp0 mode so kernel-tracked fWSAAState never drops below 3 once WS goes active.
+			{"__ZN21AppleIntelFramebuffer12setAttributeEjm", wrapSetAttribute, this->oSetAttribute},
 			// V183: write-only ADL-P power well handler; no callthrough (TGL poll loop hangs on RPL).
 			// Real TGL falls through to original via ohwSetPowerWellStatePGE.
 			{"__ZN19AppleIntelPowerWell21hwSetPowerWellStatePGEbj", hwSetPowerWellStatePGE, this->ohwSetPowerWellStatePGE},
@@ -6431,6 +6438,55 @@ void Gen11::computeLaneCount(void *that, const void *timing, unsigned int linkRa
 
 	if (hwLanes > *laneCount)
 		*laneCount = hwLanes;
+}
+
+// Path B: hook AppleIntelFramebuffer::isApertureMemoryRequired().
+// On real TGL: pass-through (preserve native behavior).
+// On RPL/ADL with -ngreendp0: force return true so setupScanoutMemory never migrates
+// from aperture → non-aperture. setupScanoutMemory's logic is:
+//   if (isApertureMemoryRequired() && nonAperSurf!=0) → migrate-TO-aperture
+//   else if (!isApertureMemoryRequired() && nonAperSurf==0) → migrate-FROM-aperture (the bad path)
+//   else → no migration; if nonAperSurf==0 → "Using aperture memory"
+// Forcing true with nonAperSurf==0 (the boot state) keeps us on the aperture path forever,
+// matching what V99S+V99G already do at the hardware level — but cleanly, at the driver level,
+// so WS sees a coherent fWSAAState→memory mapping and shouldn't degrade 0x3→0x1.
+bool Gen11::wrapIsApertureMemoryRequired(void *that) {
+	bool orig = FunctionCast(wrapIsApertureMemoryRequired, callback->oIsApertureMemoryRequired)(that);
+	const bool isRealTGL = NGreen::callback && NGreen::callback->isRealTGL;
+	if (isRealTGL || !isDisplayPipeForceDisabled()) {
+		return orig;
+	}
+	static int logCount = 0;
+	if (logCount < 8 && orig != true) {
+		logCount++;
+		SYSLOG("ngreen", "PathB: isApertureMemoryRequired forced true (orig=%d) fb=%p", orig, that);
+	}
+	return true;
+}
+
+// Path C: hook AppleIntelFramebuffer::setAttribute(IOSelect, uintptr_t).
+// We intercept exactly one path: kIOWindowServerActiveAttribute ('wsrv' = 0x77737276).
+// When WindowServer writes 0x1 (degrade-from-active), coerce the value to 0x3 before
+// calling the original — keeping the driver's fWSAAState pinned at the active value so
+// it never takes the hwDeferFeatures / degraded path.  Real TGL is unaffected.
+IOReturn Gen11::wrapSetAttribute(void *that, uint32_t attr, uintptr_t value) {
+	const bool isRealTGL = NGreen::callback && NGreen::callback->isRealTGL;
+	if (attr == 0x77737276u /* 'wsrv' */ && !isRealTGL && isDisplayPipeForceDisabled()) {
+		static int logCount = 0;
+		uintptr_t newValue = value;
+		bool coerced = false;
+		if ((value & 0xFFu) == 0x1u) {
+			newValue = (value & ~uintptr_t(0xFF)) | 0x3u;
+			coerced = true;
+		}
+		if (logCount < 16) {
+			logCount++;
+			SYSLOG("ngreen", "PathC: wsrv setAttribute fb=%p value=0x%llx%s",
+			       that, (unsigned long long)value, coerced ? " → coerced 0x3" : "");
+		}
+		return FunctionCast(wrapSetAttribute, callback->oSetAttribute)(that, attr, newValue);
+	}
+	return FunctionCast(wrapSetAttribute, callback->oSetAttribute)(that, attr, value);
 }
 
 void Gen11::getOnlineInfo(void *that, void *displayPath, unsigned char *online, unsigned char *changed) {
