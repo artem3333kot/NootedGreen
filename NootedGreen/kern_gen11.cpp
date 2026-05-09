@@ -73,7 +73,7 @@ void Gen11::init() {
 		SYSLOG("ngreen", "Gen11::init: HW tier → TGL (ICL HW skipped)");
 		lilu.onKextLoadForce(&kextG11HWT);
 		lilu.onKextLoadForce(&kextG11HWTA);
-	} else {
+	} else if (checkKernelArgument("-ngreenicl")) {
 		SYSLOG("ngreen", "Gen11::init: FB tier → ICL fallback");
 		lilu.onKextLoadForce(&kextG11FB);
 		SYSLOG("ngreen", "Gen11::init: HW tier → ICL fallback");
