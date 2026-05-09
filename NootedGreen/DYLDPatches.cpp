@@ -251,25 +251,29 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 		0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90
 	};
 
-	// V189: Smart AccessComplete patch (Sonoma 14.7.1).
-	// Instead of stubbing the entire function (V187 = xor eax,eax; ret), we let the
-	// prologue run, then jump from offset +0x2F directly to the *completion signal path*
-	// at loc_7FF8022E40E0. That path:
-	//   1. Performs region housekeeping (CFTypePtr move + CGRegionCreateEmpty)
-	//   2. Clears the surface dirty flag at [this+0x118]
-	//   3. lock dec dword ptr [surface->[+0x178]+0x170]   ← KERNEL WAKEUP SIGNAL
-	//   4. Clears [this+0x178]
-	//   5. Falls through to the canary-check epilogue at loc_7FF8022E416E
-	// None of these touch Metal — only CGRegion + atomic dec — so they are safe on
-	// spoofed RPL where MetalDevice can't be constructed. WS's 234 ms timeout fires
-	// because the lock dec never happens with V187; V189 fires it without the crash.
+	// V189: Smart AccessComplete patch — MINIMAL variant (Sonoma 14.7.1).
+	// Earlier full-signal-path variant (jumping to loc_7FF8022E40E0) caused full system
+	// deadlock: it called _CGRegionCreateEmptyRegion / CFTypePtr::operator= before the
+	// lock dec, and those CG calls deadlocked against WS-held locks. WS state stayed at
+	// 0x3 (no degrade) but system froze on Apple-logo flash.
+	//
+	// New strategy: jump from prologue +0x2F directly to loc_7FF8022E4150 — the absolute
+	// minimal completion-signal block:
+	//   mov rax, [r15+0x178]                         ; surface backing
+	//   test rax, rax
+	//   jz short loc_7FF8022E4163
+	//   lock dec dword ptr [rax+0x170]               ; ← KERNEL WAKEUP (the only signal)
+	//   mov qword ptr [r15+0x178], 0                 ; clear backing
+	//   <canary check + ret>
+	// No CG calls, no CFTypePtr, no region housekeeping. Just the atomic dec that wakes
+	// the kernel-side waiter, then return.
 	//
 	// Find pattern (16 bytes at function offset +0x2F):
 	//   mov rdi, [rdi+0x178]      48 8B BF 78 01 00 00
 	//   test rdi, rdi              48 85 FF
 	//   jz loc_7FF8022E40B8        0F 84 15 22 00 00     (rel offset 0x2215)
 	// Replace with:
-	//   jmp loc_7FF8022E40E0       E9 48 22 00 00        (rel offset 0x2248)
+	//   jmp loc_7FF8022E4150       E9 B8 22 00 00        (rel offset 0x22B8)
 	//   + 11 NOPs
 	static const uint8_t f_accesscomplete_v189_sonoma[] = {
 		0x48,0x8B,0xBF,0x78,0x01,0x00,0x00,
@@ -277,7 +281,7 @@ void DYLDPatches::wrapCsValidatePage(vnode *vp, memory_object_t pager, memory_ob
 		0x0F,0x84,0x15,0x22,0x00,0x00
 	};
 	static const uint8_t r_accesscomplete_v189_sonoma[] = {
-		0xE9,0x48,0x22,0x00,0x00,
+		0xE9,0xB8,0x22,0x00,0x00,
 		0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90
 	};
 
