@@ -1796,6 +1796,31 @@ private:
 	static int wrapHwSetupMemory(void *that, void *fb, void *displayPath, void *params, bool isAperture);
 	mach_vm_address_t ohwSetupMemory {};
 
+	// V208: AppleIntelFramebuffer::start() override that refuses fbId != 0. Hides
+	// phantom FB1/FB2 (path-not-assigned) from IOFramebufferShared so CoreDisplay's
+	// CreateDisplayForCGXDisplayDevice doesn't enumerate them and assert. Apple's
+	// internal pipe/port/FB counts stay 3/3/3 (kept in pinfo) — only the IOService
+	// registration is blocked. fbId is at +0x1DC (we already use this offset in V96).
+	static bool wrapAppleIntelFramebufferStart(void *that, void *provider);
+	mach_vm_address_t oAppleIntelFramebufferStart {};
+
+	// V209: AppleIntelFramebuffer::enableController() short-circuit for fbId != 0.
+	// Pairs with V208 — without this, fb1/fb2 still get tracked by IGAccelDisplayPipe
+	// (in HW kext) and a later displayModeDidChange iteration crashes in
+	// IOFramebuffer::getAttributeExt + 0x25 NULL deref. Returning kIOReturnUnsupported
+	// for non-FB0 marks them as "not enabled" so IGAccelDisplayPipe skips them.
+	static int wrapEnableController(void *that);
+	mach_vm_address_t oEnableController {};
+
+	// V210: AppleIntelDisplayPath::getFreeJoinablePathCount() unconditionally returns 0.
+	// Original calls getPathByPipe(1) and getPathByPipe(2) and dereferences [+0x3644]
+	// on the result — but with single-pipe (1/1/1) pinfo config those return NULL →
+	// crash during setupBootDisplay → allocateBootDisplayResources →
+	// commitResourceConfigurationSet → allocateDisplayResources. With 1/1/1 we want
+	// "no joinable paths available" = return 0. Enables 1/1/1 to actually boot.
+	static int wrapGetFreeJoinablePathCount(void *that);
+	mach_vm_address_t oGetFreeJoinablePathCount {};
+
 	// IntelAccelerator personality registration in IOCatalogue. Lives in the HW-kext
 	// path (ICL or TGL Graphics, not Framebuffer) — must run before the FBController's
 	// registerService() so IOKit can match IntelAccelerator. Idempotent.

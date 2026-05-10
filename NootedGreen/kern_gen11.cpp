@@ -487,6 +487,13 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			// V96: Force display online — WEG's getDisplayStatus hook (FOD) fails with
 			// "err 2" on TGL kext because that symbol doesn't exist. TGL uses getOnlineInfo.
 			{"__ZN21AppleIntelFramebuffer13getOnlineInfoEP21AppleIntelDisplayPathPhS2_", getOnlineInfo, this->ogetOnlineInfo},
+			// V208/V209/V210 routes DISABLED at 3/3/3 baseline. They actively cause
+			// the IOFramebuffer::getAttributeExt+0x25 NULL deref when fb1/fb2 start()
+			// is refused but IGAccelDisplayPipe still tracks them. Re-enable only
+			// alongside pinfo 1/1/1 if pursuing FB-count-reduction direction.
+			//{"__ZN21AppleIntelFramebuffer5startEP9IOService", wrapAppleIntelFramebufferStart, this->oAppleIntelFramebufferStart},
+			//{"__ZN21AppleIntelFramebuffer16enableControllerEv", wrapEnableController, this->oEnableController},
+			//{"__ZN21AppleIntelDisplayPath24getFreeJoinablePathCountEv", wrapGetFreeJoinablePathCount, this->oGetFreeJoinablePathCount},
 			// Path B: Force aperture memory under dp0 mode to prevent WS=0x3 migration to
 			// non-aperture, which leaves the display scanning empty pages and triggers
 			// the 0x3→0x1 WS degradation.
@@ -2110,37 +2117,35 @@ void Gen11::wrapWriteRegister32(void *controller, uint32_t address, uint32_t val
 		return;
 	}
 
-	// V195: HSW_PWR_WELL_CTL1 (0x45400) — preserve display power-domain bits [14,12].
-	// The ICL DMC save/restore table periodically writes CTL1 = 0x401, clearing bits 14,12.
-	// Those bits enable vsync interrupts; losing them stalls WindowServer.
-	// Only on spoofed (non-real-TGL) hardware — real TGL manages its own power wells.
+	// V195W removed (was: OR-in bits 14,12 from UEFI's HSW_PWR_WELL_CTL1 onto every
+	// 0x45400 write because the ICL DMC save/restore table allegedly clears them
+	// periodically, supposedly stalling WindowServer's vsync). Pair-mate to V195 in
+	// raWriteRegister32 + V195F in FastWriteRegister32 — all three sites stripped
+	// together. The DMC save/restore behavior on Display 13 (ADL-P) differs from
+	// Display 11 (ICL); enforcing UEFI's specific bits hides what Apple's stack
+	// actually wants and what the ADL-P DMC table actually contains. If vsync stalls
+	// re-emerge, fix should come from a correct DMC table or proper power-well init,
+	// not bit OR-in.
 	if (address == 0x45400 && NGreen::callback && !NGreen::callback->isRealTGL
 	    && NGreen::callback->uefiCtl1 != 0) {
-		uint32_t preserve = NGreen::callback->uefiCtl1 & 0x5000u; // bits 14,12
-		if (preserve && (value & preserve) != preserve) {
-			static int v195Count = 0;
-			if (v195Count < 20) {
-				v195Count++;
-				SYSLOG("ngreen", "V195W[%d]: CTL1 write 0x%x -> 0x%x (bits 14,12 preserved)",
-				       v195Count, value, value | preserve);
-			}
-			value |= preserve;
+		static int v195WpCount = 0;
+		if (v195WpCount < 6) {
+			++v195WpCount;
+			SYSLOG("ngreen", "V195Wp[%d]: CTL1 0x%x passthrough uefiCtl1=0x%x (V195W hack removed)",
+			       v195WpCount, value, NGreen::callback->uefiCtl1);
 		}
 	}
 
-	// ── V72: EMR write intercept — force all errors masked ──
-	// RCS EMR = 0x20b4, BCS EMR = 0x220b4
-	// Apple writes 0xfffffffa (unmasks bits 0,2) → triggers phantom ERROR_GEN6=0x7b
-	// Force value to 0xffffffff so no error bits can fire interrupts.
+	// V72W removed (was: force RCS/BCS RING_EMR writes to 0xFFFFFFFF — same blanket
+	// error-mask hack as V72R, on the wrapWriteRegister32 helper path). Pair-mate to
+	// the V72R passthrough already in place. Keeping the address-match shell so a
+	// future legitimate intercept can use this hook point.
 	if (address == 0x20b4 || address == 0x220b4) {
-		if (value != 0xFFFFFFFF) {
-			static int v72WrapCount = 0;
-			if (v72WrapCount < 20) {
-				v72WrapCount++;
-				SYSLOG("ngreen", "V72W[%d]: EMR write blocked @ 0x%x val=0x%x -> 0xffffffff",
-					   v72WrapCount, address, value);
-			}
-			value = 0xFFFFFFFF;
+		static int v72WPassCount = 0;
+		if (v72WPassCount < 6) {
+			++v72WPassCount;
+			SYSLOG("ngreen", "V72Wp[%d]: EMR @ 0x%x val=0x%x passthrough (V72W hack removed)",
+			       v72WPassCount, address, value);
 		}
 	}
 
@@ -2980,11 +2985,14 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 		SYSLOG("ngreen", "V75[%d]: PWR_WELL=0x%x DC_STATE=0x%x",
 			   v60Count, pwrWell, dcState);
 
-		// V103P: DC_STATE_EN enforcement — re-zero every V60 tick when ADL-P DMC is active.
-		// Belt-and-suspenders against any write path that bypasses raWriteRegister32/FastWrite.
+		// V103P removed (was: every V60 tick, force DC_STATE_EN back to 0 when ADL-P
+		// DMC is active — third belt of the V103 trio). Now read-only: log the value
+		// when non-zero so we can see when Apple's DMC actually wants to enter a DC
+		// state. With V103 raWriteRegister32-side and V103F FastWrite-side also off,
+		// this is the full "no DC_STATE_EN block" experiment.
 		if (NGreen::callback->dmcIsAdlp && dcState != 0) {
-			NGreen::callback->writeReg32(0x45504, 0);
-			SYSLOG("ngreen", "V103P[%d]: DC_STATE_EN was 0x%x, forced to 0", v60Count, dcState);
+			SYSLOG("ngreen", "V103Pp[%d]: DC_STATE_EN=0x%x observed (V103P hack removed)",
+			       v60Count, dcState);
 		}
 		// V105: Pipe-A gamma LUT enforcement — write linear pass-through when LUT is bad.
 		// The Apple driver enables precision gamma mode before WindowServer writes the actual
@@ -3022,14 +3030,10 @@ void Gen11::v60GpuHealthMonitor(thread_call_param_t param0, thread_call_param_t 
 			}
 		}
 
-		// V104P: diagnostic only — V195 now intercepts CTL1 writes immediately.
-		if (!NGreen::callback->isRealTGL && NGreen::callback->uefiCtl1 != 0) {
-			uint32_t targetCtl1 = NGreen::callback->uefiCtl1 | 0x00000401u;
-			if (pwrWell != targetCtl1) {
-				SYSLOG("ngreen", "V104P[%d]: CTL1 still wrong: 0x%x (expected 0x%x) — V195 miss?",
-				       v60Count, pwrWell, targetCtl1);
-			}
-		}
+		// V104P removed (was: V60-tick log "V195 miss?" if CTL1 != uefiCtl1 | 0x401).
+		// V195 is gone (passthrough), so the "miss" framing is meaningless. The V60 V75
+		// SYSLOG above already prints PWR_WELL=0x%x every tick, so CTL1 drift is observable
+		// without this duplicate log line.
 	}
 
 	// ── V76: Deep display diagnostic + framebuffer physical write test ──
@@ -3379,23 +3383,21 @@ void Gen11::v71EmrEnforcer(thread_call_param_t param0, thread_call_param_t param
 	static int v71Count = 0;
 	v71Count++;
 
-	// 1. Mask ALL errors on RCS and BCS — prevent interrupt generation
+	// V74 EMR-mask portion REMOVED (was: every 50ms force RING_EMR(RCS) and RING_EMR(BCS)
+	// to 0xFFFFFFFF, clear ERROR_GEN6). Pair-mate to V72R/V72W/V72F. With those three
+	// passthrough on the write paths but V74 still polling and rewriting EMR back to
+	// all-ones from a thread, the "no blanket EMR mask" experiment was incomplete.
+	// Now reads-only: log what Apple's actual EMR/ERROR values look like so we can
+	// see WHICH bits Apple unmasks and WHICH errors actually fire (instead of hiding
+	// them under a blanket 0xFFFFFFFF). The V116 GGTT[0] re-enforcer below is left
+	// intact — that prevents real MCE on stolen-mem GVA-0 access, not a hack.
 	uint32_t emrRcs = NGreen::callback->readReg32(RING_EMR(RENDER_RING_BASE));
 	uint32_t emrBcs = NGreen::callback->readReg32(RING_EMR(BLT_RING_BASE));
-	if (emrRcs != 0xFFFFFFFF)
-		NGreen::callback->writeReg32(RING_EMR(RENDER_RING_BASE), 0xFFFFFFFF);
-	if (emrBcs != 0xFFFFFFFF)
-		NGreen::callback->writeReg32(RING_EMR(BLT_RING_BASE), 0xFFFFFFFF);
-
-	// 2. Clear any pending ERROR_GEN6 before Apple's handler can read it
-	uint32_t err = NGreen::callback->readReg32(ERROR_GEN6);
-	if (err)
-		NGreen::callback->writeReg32(ERROR_GEN6, 0x0);
-
-	// 3. Log first 3 + unmask events (rate-limited)
-	if (v71Count <= 3 || (emrRcs != 0xFFFFFFFF && v71Count <= 10)) {
-		SYSLOG("ngreen", "V74E[%d]: EMR_RCS=0x%x EMR_BCS=0x%x ERR=0x%x",
-			   v71Count, emrRcs, emrBcs, err);
+	uint32_t err    = NGreen::callback->readReg32(ERROR_GEN6);
+	if (v71Count <= 3 || (err != 0 && v71Count <= 50) ||
+	    ((emrRcs != 0xFFFFFFFF || emrBcs != 0xFFFFFFFF) && v71Count <= 50)) {
+		SYSLOG("ngreen", "V74Ep[%d]: EMR_RCS=0x%x EMR_BCS=0x%x ERR=0x%x (V74 EMR mask removed)",
+		       v71Count, emrRcs, emrBcs, err);
 	}
 
 	// V80 legacy ownership mode: one-shot plane linearization at early boot.
@@ -5090,111 +5092,92 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 		}
 	}
 
-	// ── V72: EMR write intercept — force all errors masked ──
-	if (param_1 == 0x20b4 || param_1 == 0x220b4) {
-		if (param_2 != 0xFFFFFFFF) {
-			static int v72RaCount = 0;
-			if (v72RaCount < 20) {
-				v72RaCount++;
-				SYSLOG("ngreen", "V72R[%d]: EMR write blocked @ 0x%lx val=0x%x -> 0xffffffff",
-					   v72RaCount, param_1, param_2);
-			}
-			param_2 = 0xFFFFFFFF;
-		}
-	}
+	// V72R removed (was: force RING_EMR (0x20b4 / 0x220b4) writes to 0xFFFFFFFF —
+	// blanket-mask-all-GT-engine-errors). Hack that hides root cause; Linux i915
+	// doesn't do blanket EMR masking. Remove and observe what real engine errors
+	// emerge so the actual cause can be fixed.
+	// NOTE: V72W (in wrapWriteRegister32 helper) and V72F (in FastWriteRegister32)
+	// and V74 50ms permanent enforcer still mask RING_EMR. To fully test "no EMR
+	// blanket mask" they need to be disabled in subsequent steps.
 
-	// V99: PLANE_STRIDE — convert X-tiled stride (512-byte tile units) to Y-tiled/linear
-	// stride (64-byte cacheline units) by multiplying by 8.
-	// TGL kext writes 0x14 (X-tiled, 20×512=10240 bytes=2560px BGRA8); correct is 0xa0
-	// (160×64=10240 bytes). Matches EFI GOP Y-tiled state that produced working display.
-	// Horizontal-bars issue from prior FastWriteRegister32 attempt was because PLANE_CTL
-	// tiling was NOT changed to Y-tiled, leaving X-tiled CTL + wrong stride → 8× too wide.
-	// Both registers are now fixed consistently here (during hwSetMode), not in FastWrite.
+	// V99R[S] removed (was: PLANE_STRIDE *= 8 — convert X-tiled tile-units 0x14 to
+	// Y-tiled/linear cacheline-units 0xa0). Hack guessing the right scanout stride
+	// without knowing the actual buffer layout. Linux i915 picks stride based on
+	// the IOSurface/buffer's documented tiling, not by rewriting Apple's value.
+	// Removing this lets Apple's natural PLANE_STRIDE (0x14) reach hardware. If
+	// scanout shows X-tiled bytes correctly → buffer was X-tiled. If garbled →
+	// real layer is buffer/renderer side, not register-write.
+	// NOTE: V99S (SURF arm) and V99f (fast-write variant) and V99F (FastWrite) still
+	// have their own PLANE_STRIDE rewrites — to fully test, those need removal too.
+	// For now keep the address-match shell so future legitimate intercepts can use it.
 	if ((param_1 & 0xFFFFF) == 0x70188) { // PLANE_STRIDE Pipe A Plane 1
-		uint32_t strideFixed = param_2 * 8; // X-tiled(512B) → 64B cacheline units
-		static int v99SCount = 0;
-		if (v99SCount < 5)
-			SYSLOG("ngreen", "V99R[S%d]: PLANE_STRIDE 0x%x -> 0x%x (x-tile->64B units)",
-				   ++v99SCount, param_2, strideFixed);
-		else
-			DBGLOG("ngreen", "V99R: PLANE_STRIDE 0x%x -> 0x%x", param_2, strideFixed);
-		param_2 = strideFixed;
+		static int v99SPassCount = 0;
+		if (v99SPassCount < 3) {
+			++v99SPassCount;
+			SYSLOG("ngreen", "V99R[Sp%d]: PLANE_STRIDE 0x%x passthrough (V99R hack removed)", v99SPassCount, param_2);
+		}
 	}
-	// V99: PLANE_CTL — tiling fixup.
-	// dp0 (CPU compositing): force linear so WindowServer's BAR2 writes scan out correctly.
-	// Default path: X-tiled (001) → Y-tiled legacy (100) to match EFI GOP and IOSurface.
+	// V99R[C] / V99R[Cdp] removed (was: PLANE_CTL tiling rewrites — X-tiled (001) →
+	// Y-tiled legacy (100) on default path, force linear under -ngreendp0). Same
+	// "guess the tiling" antipattern as V99R[S]; pairs with the stride-rewrite hack
+	// just removed. Linux i915 picks PLANE_CTL tiling bits from the IOSurface/buffer's
+	// declared tiling, never rewrites Apple's value. With V99R[S] passthrough, leaving
+	// the corresponding CTL field rewritten is contradictory: STRIDE is now 0x14
+	// (X-tiled tile-units) but CTL would still be forced to Y-tiled or linear, which
+	// is guaranteed-wrong scanout. Removing both lets Apple's natural CTL reach HW so
+	// we can observe what tiling Apple's allocator actually chose.
 	if ((param_1 & 0xFFFFF) == 0x70180) { // PLANE_CTL Pipe A Plane 1
-		const bool dpForced = isDisplayPipeForceDisabled();
-		uint32_t tiling = (param_2 >> 10) & 0x7;
-		if (dpForced && tiling != 0) {
-			uint32_t ctlFixed = param_2 & ~(0x7u << 10); // clear tiling → linear
-			static int v99CdpCount = 0;
-			if (v99CdpCount < 5)
-				SYSLOG("ngreen", "V99R[Cdp%d]: PLANE_CTL 0x%x->0x%x (dp0: tiling %d->linear)",
-					   ++v99CdpCount, param_2, ctlFixed, tiling);
-			param_2 = ctlFixed;
-		} else if (tiling == 0x1) { // X-tiled (001) → Y-tiled legacy (100)
-			uint32_t ctlFixed = (param_2 & ~(0x7u << 10)) | (0x4u << 10);
-			static int v99CCount = 0;
-			if (v99CCount < 5)
-				SYSLOG("ngreen", "V99R[C%d]: PLANE_CTL 0x%x -> 0x%x (tiling X->Y)",
-					   ++v99CCount, param_2, ctlFixed);
-			else
-				DBGLOG("ngreen", "V99R: PLANE_CTL 0x%x -> 0x%x", param_2, ctlFixed);
-			param_2 = ctlFixed;
-		} else {
-			DBGLOG("ngreen", "PLANE_CTL passthrough: 0x%lx val=0x%x tiling=0x%x",
-				   param_1, param_2, tiling);
+		static int v99CPassCount = 0;
+		if (v99CPassCount < 3) {
+			++v99CPassCount;
+			uint32_t tiling = (param_2 >> 10) & 0x7;
+			SYSLOG("ngreen", "V99R[Cp%d]: PLANE_CTL 0x%x passthrough tiling=%d (V99R hack removed)",
+				   v99CPassCount, param_2, tiling);
 		}
 	}
 
-	// V97: TRANS_DDI_FUNC_CTL_A (0x60400): clear bit[16] on !isRealTGL.
-	// Apple's SetupParams always sets bit[16] (PORT_SYNC_MODE_MASTER_SELECT[0]) which
-	// UEFI GOP did not set. Writing it to an active transcoder disrupts the trained
-	// 4-lane eDP link, leading to "InterLane Alignment is lost" ~10s later.
+	// V97 removed (was: clear bit[16] PORT_SYNC_MODE_MASTER_SELECT[0] from
+	// TRANS_DDI_FUNC_CTL_A on !isRealTGL — Apple's SetupParams sets it but UEFI GOP
+	// doesn't, allegedly disrupting trained eDP link → "InterLane Alignment is lost"
+	// ~10s later). Symptom-hiding hack: real fix should match Linux i915's Display 13
+	// transcoder programming, not strip a bit Apple's stack expects to set. Removing
+	// reveals whether the InterLane loss still happens; if yes, look at Linux's
+	// TRANS_DDI_FUNC_CTL field layout for ADL-P (Display 13) since PORT_SYNC fields
+	// changed across display generations.
 	if ((param_1 & 0xFFFFF) == 0x60400 && NGreen::callback && !NGreen::callback->isRealTGL) {
-		static int v97RCount = 0;
-		if (v97RCount < 10) {
-			v97RCount++;
-			SYSLOG("ngreen", "V97R[%d]: TRANS_DDI_FUNC_CTL_A write 0x%x -> 0x%x (cleared bit16)",
-				   v97RCount, param_2, param_2 & ~(1u << 16));
+		static int v97RpCount = 0;
+		if (v97RpCount < 6) {
+			++v97RpCount;
+			SYSLOG("ngreen", "V97Rp[%d]: TRANS_DDI_FUNC_CTL_A 0x%x passthrough bit16=%d (V97 hack removed)",
+			       v97RpCount, param_2, !!(param_2 & (1u << 16)));
 		}
-		param_2 &= ~(1u << 16);
 	}
 
-	// V103: DC_STATE_EN (0x45504) — block all non-zero writes when ADL-P DMC is loaded.
-	// Apple's runtime power management (setAggressiveness type=3) re-enables DC3/DC5/DC6
-	// by writing DC_STATE_EN after hwInitializeCState. The ADL-P DMC then enters the
-	// requested DC state, cutting PHY clocks → all eDP lanes drop simultaneously at ~70s.
-	// Apple's ICL-targeted driver has no ADL-P DC exit recovery → display stays dead.
-	// Fix: keep DC_STATE_EN=0 at all times so the DMC never enters DC5/DC6.
+	// V103 removed (was: block all non-zero DC_STATE_EN writes when ADL-P DMC is
+	// loaded — keeps the DMC from entering DC3/DC5/DC6 because Apple's ICL-targeted
+	// driver has no ADL-P DC exit recovery, all eDP lanes drop ~70s after a write).
+	// Symptom-hiding hack: Linux i915 has proper DC enter/exit for Display 13 via
+	// the DMC. Permanently disabling DC states masks Apple's broken DC exit instead
+	// of providing one. Removing reveals when DC_STATE_EN gets written and what
+	// value Apple wants set; the fix is to ensure DC exit is properly handled (or
+	// to align with what Linux ADL-P DMC expects).
 	if ((param_1 & 0xFFFFF) == 0x45504 && NGreen::callback && NGreen::callback->dmcIsAdlp) {
-		if (param_2 != 0) {
-			static int v103Count = 0;
-			if (v103Count < 20) {
-				v103Count++;
-				SYSLOG("ngreen", "V103[%d]: DC_STATE_EN write 0x%x -> 0 (blocked to prevent ADL-P DMC DC exit)",
-					   v103Count, param_2);
-			}
-			param_2 = 0;
+		static int v103PassCount = 0;
+		if (v103PassCount < 10) {
+			++v103PassCount;
+			SYSLOG("ngreen", "V103p[%d]: DC_STATE_EN 0x%x passthrough (V103 hack removed)",
+			       v103PassCount, param_2);
 		}
 	}
 
-	// V195: HSW_PWR_WELL_CTL1 (0x45400) — preserve display power-domain bits [14,12].
-	// The ICL DMC save/restore table periodically writes CTL1 = 0x401, clearing bits 14,12.
-	// Those bits enable vsync interrupts; losing them stalls WindowServer.
-	// Only on spoofed (non-real-TGL) hardware — real TGL manages its own power wells.
+	// V195 removed (was: same OR-in bits 14,12 hack as V195W, on raWriteRegister32).
 	if ((param_1 & 0xFFFFF) == 0x45400 && NGreen::callback && !NGreen::callback->isRealTGL
 	    && NGreen::callback->uefiCtl1 != 0) {
-		uint32_t preserve = NGreen::callback->uefiCtl1 & 0x5000u; // bits 14,12
-		if (preserve && (param_2 & preserve) != preserve) {
-			static int v195Count = 0;
-			if (v195Count < 20) {
-				v195Count++;
-				SYSLOG("ngreen", "V195[%d]: CTL1 ra write 0x%x -> 0x%x (bits 14,12 preserved)",
-				       v195Count, param_2, param_2 | preserve);
-			}
-			param_2 |= preserve;
+		static int v195pCount = 0;
+		if (v195pCount < 6) {
+			++v195pCount;
+			SYSLOG("ngreen", "V195p[%d]: CTL1 ra 0x%x passthrough (V195 hack removed)",
+			       v195pCount, param_2);
 		}
 	}
 
@@ -5275,13 +5258,13 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 				#undef R
 			}
 		}
+		// dp0 branch RESTORED (V99R[P] + V99G + dp0-side V99S): user explicitly kept
+		// these as load-bearing for "fragmented but visible login" under -ngreendp0.
+		// The non-dp0 branch (HW+FB) V99S forces removed below — that path was frozen
+		// even with the hacks, so removing them loses nothing and unblocks observing
+		// what Apple's natural STRIDE/CTL produce on the real-display path.
 		const bool dpForced = isDisplayPipeForceDisabled();
 		if (dpForced) {
-			// Block non-aperture migration: redirect SURF to aperture start.
-			// ALSO: remap GGTT[0..3999] to the non-aperture physical pages on first
-			// interception.  setupScanoutMemory updates WS's write target to those pages,
-			// so SURF=0x0 must scan them too.  Without this remap the display reads the old
-			// (blank) aperture physical pages while WS composes to the new non-aperture ones.
 			if (param_2 >= 0x10000000u) {
 				static int v99PCount = 0;
 				if (v99PCount < 8)
@@ -5304,26 +5287,28 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 						NGreen::callback->writeReg32(GGTT_PTE_HI(i), hi);
 						remapped++;
 					}
-					// Flush GGTT TLB so the display engine sees the updated mappings.
-					NGreen::callback->writeReg32(0x101008, 0x1);
+					NGreen::callback->writeReg32(0x101008, 0x1); // flush GGTT TLB
 					SYSLOG("ngreen", "V99G: GGTT[0..%d] <- GGTT[0x%x..] remapped=%d skip=%d",
 						   remapped - 1, srcPage, remapped, remapSkipped);
 				}
 
 				param_2 = 0;
 			}
-			// Force CTL linear (tiling=0): CPU compositor writes linearly via BAR2.
+			// dp0: force CTL linear and STRIDE=0xa0 (CPU compositor writes linearly via BAR2).
 			uint32_t hwTiling = (hwCtl >> 10) & 0x7;
 			if (hwTiling != 0)
 				NGreen::callback->writeReg32(0x70180, hwCtl & ~(0x7u << 10));
-			// Force STRIDE to 0xa0 (linear 64B units: 160×64B=10240B=2560px×4bpp).
 			if (hwStride != 0xa0)
 				NGreen::callback->writeReg32(0x70188, 0xa0);
 		} else {
-			// Force STRIDE to 0xa0 (Y-tiled/linear units: 160 × 64B = 10240B = 2560px × 4bpp)
+			// Non-dp0 V99S RESTORED (per user): force STRIDE=0xa0 (Y-tiled/linear units:
+			// 160 × 64B = 10240B = 2560px × 4bpp) and CTL X-tiled (001) → Y-tiled-legacy
+			// (100). Note this is a CACHE-write entry (raWriteRegister32) but the writeReg32
+			// calls below are direct MMIO, so they DO reach hardware regardless of whether
+			// V99R[S]/V99R[C] above are passthrough or rewriting — i.e. the V99R passthrough
+			// upstream changes nothing about what scans out as long as V99S re-forces here.
 			if (hwStride != 0xa0)
 				NGreen::callback->writeReg32(0x70188, 0xa0);
-			// Force CTL to Y-tiled legacy if currently X-tiled (001→100)
 			uint32_t hwTiling = (hwCtl >> 10) & 0x7;
 			if (hwTiling == 0x1) {
 				uint32_t newCtl = (hwCtl & ~(0x7u << 10)) | (0x4u << 10);
@@ -5339,27 +5324,20 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 
 void Gen11::raWriteRegister32f(void *that,unsigned long param_1, UInt32 param_2)
 {
-	// V99f: also intercept the "f" (fast/direct) variant in case STRIDE/CTL/SURF use this path.
-	const bool dpForced = isDisplayPipeForceDisabled();
-	if ((param_1 & 0xFFFFF) == 0x70188) {
-		uint32_t strideFixed = param_2 * 8;
-		DBGLOG("ngreen", "V99f: PLANE_STRIDE(f) 0x%x -> 0x%x", param_2, strideFixed);
-		param_2 = strideFixed;
-	}
-	if ((param_1 & 0xFFFFF) == 0x70180) {
-		uint32_t tiling = (param_2 >> 10) & 0x7;
-		if (dpForced && tiling != 0) {
-			param_2 &= ~(0x7u << 10); // dp0: force linear
-			DBGLOG("ngreen", "V99f: dp0 CTL tiling %d->linear 0x%x", tiling, param_2);
-		} else if (tiling == 0x1) {
-			param_2 = (param_2 & ~(0x7u << 10)) | (0x4u << 10);
-			DBGLOG("ngreen", "V99f: PLANE_CTL(f) X->Y 0x%x", param_2);
+	// V99f removed (was: fast-write twin of V99R[S]/[C] — STRIDE *= 8, PLANE_CTL X->Y
+	// or dp0->linear, SURF >= 0x10000000 -> 0). Same family of "guess the tiling" /
+	// "redirect SURF" hacks we just removed in raWriteRegister32. Keeping V99f active
+	// while V99R is passthrough creates a contradiction between the cached-write path
+	// and the fast/direct path. Removed to keep both paths consistent — Apple's
+	// natural STRIDE/CTL/SURF reach HW from this entry point too.
+	if ((param_1 & 0xFFFFF) == 0x70188 || (param_1 & 0xFFFFF) == 0x70180 ||
+	    (param_1 & 0xFFFFF) == 0x7019C) {
+		static int v99fPassCount = 0;
+		if (v99fPassCount < 6) {
+			++v99fPassCount;
+			SYSLOG("ngreen", "V99fp[%d]: reg=0x%lx val=0x%x passthrough (V99f hack removed)",
+			       v99fPassCount, param_1 & 0xFFFFF, param_2);
 		}
-	}
-	// dp0: redirect non-aperture SURF writes to aperture start (same as V99S in cached path).
-	if ((param_1 & 0xFFFFF) == 0x7019C && dpForced && param_2 >= 0x10000000u) {
-		DBGLOG("ngreen", "V99f: dp0 SURF 0x%x->0 (non-aperture blocked)", param_2);
-		param_2 = 0;
 	}
 	FunctionCast(raWriteRegister32f, callback->oraWriteRegister32f)(that, param_1, param_2);
 };
@@ -5682,6 +5660,57 @@ bool Gen11::AppleIntelBaseControllerstart(void *that,void *param_1)
 	return ret;
 }
 
+int Gen11::wrapGetFreeJoinablePathCount(void *that)
+{
+	// Always return 0 — with 1/1/1 pinfo config, only pipe 0 has a path. Original
+	// would call getPathByPipe(1) and (2), get NULL back, dereference [+0x3644] →
+	// kernel panic at setupBootDisplay->allocateBootDisplayResources chain.
+	// Returning 0 means "no joinable paths" which is correct for single-pipe.
+	static int v210Count = 0;
+	if (v210Count < 4) {
+		v210Count++;
+		SYSLOG("ngreen", "V210[%d]: getFreeJoinablePathCount → 0 (1/1/1 single-pipe safe)", v210Count);
+	}
+	return 0;
+}
+
+int Gen11::wrapEnableController(void *that)
+{
+	uint32_t fbId = getMember<uint32_t>(that, 0x1DC);
+	if (fbId != 0) {
+		// Short-circuit for phantom FB1/FB2: don't call original, return success
+		// without doing the per-fb setup (gController ref-count bumps,
+		// AppleIntelBaseController::enableController, AAPL0n,IgnoreConnection
+		// property lookup, etc). Without this, the per-fb setup chain leaves
+		// fb1/fb2 partially-initialized → IGAccelDisplayPipe iterates them in
+		// displayModeDidChange → IOFramebuffer::getAttributeExt+0x25 NULL deref.
+		// Returning 0 (kIOReturnSuccess) so callers don't error-handle.
+		SYSLOG("ngreen", "V209: enableController short-circuited for fb=%u", fbId);
+		return 0;
+	}
+	int ret = FunctionCast(wrapEnableController, callback->oEnableController)(that);
+	SYSLOG("ngreen", "V209: enableController fb=0 ret=0x%x", ret);
+	return ret;
+}
+
+bool Gen11::wrapAppleIntelFramebufferStart(void *that, void *provider)
+{
+	uint32_t fbId = getMember<uint32_t>(that, 0x1DC);
+	if (fbId != 0) {
+		// Refuse to start phantom FB1/FB2 — they have no display path assigned and
+		// trip CoreDisplay_CreateDisplayForCGXDisplayDevice's __assert_rtn during WS init.
+		// Returning false from start() means IOService::registerService is never called,
+		// so CoreDisplay never sees this FB. Apple's controller still has 3 FBs internally
+		// (per pinfo counts) — we just block IOFramebufferShared registration for !FB0.
+		SYSLOG("ngreen", "V208: AppleIntelFramebuffer::start refused for fb=%u (only FB0 starts)",
+		       fbId);
+		return false;
+	}
+	bool ret = FunctionCast(wrapAppleIntelFramebufferStart, callback->oAppleIntelFramebufferStart)(that, provider);
+	SYSLOG("ngreen", "V208: AppleIntelFramebuffer::start fb=0 ret=%d", ret);
+	return ret;
+}
+
 int Gen11::wrapHwSetupMemory(void *that, void *fb, void *displayPath, void *params, bool isAperture)
 {
 	int ret = FunctionCast(wrapHwSetupMemory, callback->ohwSetupMemory)(that, fb, displayPath, params, isAperture);
@@ -5947,6 +5976,38 @@ void Gen11::initPlatformWorkarounds(void *that)
 	getMember<volatile uint32_t>(that, 0xC58) = FB_FLAG_BOOST_PIXEL_FREQUENCY_LIMIT;
 
 	FunctionCast(initPlatformWorkarounds, callback->oinitPlatformWorkarounds)(that);
+
+	// V212: ADL-P (Display 13) specific display workarounds, ported from Linux i915.
+	// Apple's TGL kext targets Display 12 and doesn't apply these chicken bits / clock-
+	// gating / error masks on the spoofed setup. Linux marks them as REQUIRED for
+	// Display 13+; their absence can manifest as display engine misbehavior
+	// (timing/underrun/error-recovery loops). Gated by !isRealTGL so genuine TGL HW
+	// (Display 12) is unaffected.
+	if (NGreen::callback && !NGreen::callback->isRealTGL) {
+		// Wa_22011091694:adlp — DPCE_GATING_DIS = REG_BIT(17) in GEN9_CLKGATE_DIS_5 (0x46540)
+		NGreen::callback->intel_de_rmw(0x46540, 0, 1u << 17);
+
+		// Bspec/49189 ADL-P init — CLEAR DDI_CLOCK_REG_ACCESS = REG_BIT(7) in GEN8_CHICKEN_DCPR_1 (0x46430)
+		NGreen::callback->intel_de_rmw(0x46430, 1u << 7, 0);
+
+		// PIPE_CHICKEN Pipe A (0x70038):
+		//   bit 30 = UNDERRUN_RECOVERY_DISABLE_ADLP — required on Display 13+
+		//   bit 7  = PER_PIXEL_ALPHA_BYPASS_EN     — Display WA #1153
+		//   bit 15 = PIXEL_ROUNDING_TRUNC_FB_PASSTHRU — Display WA #1605353570
+		NGreen::callback->intel_de_rmw(0x70038, 0, (1u << 30) | (1u << 15) | (1u << 7));
+
+		// XELPD_DISPLAY_ERR_FATAL_MASK (0x4421C) ← mask all fatal display errors on
+		// Display 13 (per icl_display_core_init in Linux i915). Without this, fatal
+		// error events can trigger pipeline restart loops.
+		NGreen::callback->writeReg32(0x4421C, 0xFFFFFFFFu);
+
+		uint32_t pipeChicken    = NGreen::callback->readReg32(0x70038);
+		uint32_t clkGateDis5    = NGreen::callback->readReg32(0x46540);
+		uint32_t chickenDcpr1   = NGreen::callback->readReg32(0x46430);
+		uint32_t errFatalMask   = NGreen::callback->readReg32(0x4421C);
+		SYSLOG("ngreen", "V212: ADL-P Display 13+ workarounds applied — PIPE_CHICKEN(A)=0x%x CLKGATE_DIS_5=0x%x CHICKEN_DCPR_1=0x%x ERR_FATAL_MASK=0x%x",
+		       pipeChicken, clkGateDis5, chickenDcpr1, errFatalMask);
+	}
 }
 
 uint64_t Gen11::getOSInformation(void *that)
@@ -5968,9 +6029,10 @@ uint64_t Gen11::getOSInformation(void *that)
 		//pinfo[1].cameliav = 2;
 		pinfo[1].cameliav = 0;  // no TCON (Camellia/Banksia disabled — safe for FB-only)
 		pinfo[1].fMobile  = 1;
-		// Use Apple TGL native counts for 0x9a490000 (3/3/3 from original IGFB binary).
-		// NootedBlue used 4/4/2 for a different machine; our platform needs 3/3/3 to allow
-		// IOAccelDisplayPipeUserClient2 to reach state=0x1e (fully matched, driver started).
+		// 3/3/3 baseline restored. Multi-pipe reduction is whack-a-mole — every count
+		// reduction reveals new cross-pipe NULL-deref sites in TGL FB internals
+		// (enableController +0x1356, getFreeJoinablePathCount +0xa7, etc).
+		// Best known config: 3/3/3 + -ngreendp0 → reaches login with banded display.
 		pinfo[1].fPipeCount            = 3;
 		pinfo[1].fInfoPortCount        = 3;
 		pinfo[1].fInfoFramebufferCount = 3;
@@ -5984,18 +6046,17 @@ uint64_t Gen11::getOSInformation(void *that)
 		pinfo[1].connectors[0].pipe  = 0;
 		pinfo[1].connectors[0].pad   = 0;
 		pinfo[1].connectors[0].type  = ConnectorLVDS;
-		pinfo[1].connectors[0].flags = 0x8 | 0x10;  // AlwaysConnected + Support32BPP
+		pinfo[1].connectors[0].flags = 0x8 | 0x10;
 
 		// Connector 1: external USB-C/Thunderbolt DP (TC1/DDI-D), pipe 2
-		// Linux syslog confirms: no HDMI on DDI-B; external ports are TC1/TC2 (USB-C/TBT)
 		pinfo[1].connectors[1].index = 1;
 		pinfo[1].connectors[1].busId = 1;
 		pinfo[1].connectors[1].pipe  = 2;
 		pinfo[1].connectors[1].pad   = 0;
 		pinfo[1].connectors[1].type  = ConnectorDP;
-		pinfo[1].connectors[1].flags = 0x1 | 0x400;  // CNAlterAppertureRequirements + CNFlagDP
+		pinfo[1].connectors[1].flags = 0x1 | 0x400;
 
-		// Connectors 2-3: unused (Dummy)
+		// Connectors 2-3: Dummy
 		pinfo[1].connectors[2] = { 2, 2, 2, 0, ConnectorDummy, 0 };
 		pinfo[1].connectors[3] = { 3, 3, 3, 0, ConnectorDummy, 0 };
 
@@ -6443,86 +6504,78 @@ void Gen11::FastWriteRegister32(void *that,unsigned long param_1,uint32_t param_
 		}
 	}
 
-	// ── V72: EMR write intercept — force all errors masked ──
+	// V72F removed (was: force RCS/BCS RING_EMR FastWrite path to 0xFFFFFFFF — same
+	// blanket-mask hack as V72R/V72W, on the FastWriteRegister32 entry). Last of the
+	// "raWriteRegister32-side" EMR mask trio. The V74 50ms enforcer still re-forces
+	// EMR via direct writeReg32 from a polling thread, so this passthrough alone is
+	// not yet a full "no blanket EMR mask" test — V74's EMR portion is stripped
+	// separately in v71EmrEnforcer.
 	if (param_1 == 0x20b4 || param_1 == 0x220b4) {
-		if (param_2 != 0xFFFFFFFF) {
-			static int v72FastCount = 0;
-			if (v72FastCount < 20) {
-				v72FastCount++;
-				SYSLOG("ngreen", "V72F[%d]: EMR write blocked @ 0x%lx val=0x%x -> 0xffffffff",
-					   v72FastCount, param_1, param_2);
-			}
-			param_2 = 0xFFFFFFFF;
+		static int v72FPassCount = 0;
+		if (v72FPassCount < 6) {
+			++v72FPassCount;
+			SYSLOG("ngreen", "V72Fp[%d]: EMR @ 0x%lx val=0x%x passthrough (V72F hack removed)",
+			       v72FPassCount, param_1, param_2);
 		}
 	}
 
-	// V99F: PLANE_STRIDE — use & 0xFFFFF mask in case param_1 is a full MMIO address.
-	if ((param_1 & 0xFFFFF) == 0x70188) { // PLANE_STRIDE Pipe A Plane 1
-		uint32_t strideFixed = param_2 * 8; // X-tiled(512B) → 64B cacheline units
-		static int v99FSCount = 0;
-		if (v99FSCount < 5)
-			SYSLOG("ngreen", "V99F[S%d]: PLANE_STRIDE addr=0x%lx 0x%x -> 0x%x",
-				   ++v99FSCount, param_1, param_2, strideFixed);
-		else
-			DBGLOG("ngreen", "V99F: PLANE_STRIDE 0x%x -> 0x%x", param_2, strideFixed);
-		param_2 = strideFixed;
-	}
-	// V99F: PLANE_CTL
-	if ((param_1 & 0xFFFFF) == 0x70180) { // PLANE_CTL Pipe A Plane 1
-		uint32_t tiling = (param_2 >> 10) & 0x7;
-		if (tiling == 0x1) { // X-tiled (001) → Y-tiled legacy (100)
-			uint32_t ctlFixed = (param_2 & ~(0x7u << 10)) | (0x4u << 10);
-			static int v99FCCount = 0;
-			if (v99FCCount < 5)
-				SYSLOG("ngreen", "V99F[C%d]: PLANE_CTL addr=0x%lx 0x%x -> 0x%x (tiling X->Y)",
-					   ++v99FCCount, param_1, param_2, ctlFixed);
-			else
-				DBGLOG("ngreen", "V99F: PLANE_CTL 0x%x -> 0x%x", param_2, ctlFixed);
-			param_2 = ctlFixed;
-		} else {
-			DBGLOG("ngreen", "FastWrite PLANE_CTL passthrough: 0x%x tiling=0x%x",
-				   param_2, tiling);
+	// V99F[S] removed (was: PLANE_STRIDE *= 8 — same X-tile-units → 64B-cacheline-units
+	// rewrite as V99R[S], on the FastWriteRegister32 entry). Pair-mate to V99R[Sp].
+	// V99S downstream still re-forces STRIDE=0xa0 at SURF arm via direct MMIO, so
+	// this passthrough does not affect what scans out.
+	if ((param_1 & 0xFFFFF) == 0x70188) {
+		static int v99FSpCount = 0;
+		if (v99FSpCount < 3) {
+			++v99FSpCount;
+			SYSLOG("ngreen", "V99F[Sp%d]: PLANE_STRIDE 0x%x passthrough (V99F[S] hack removed)",
+			       v99FSpCount, param_2);
 		}
 	}
-	// V103: DC_STATE_EN (0x45504) — same block as raWriteRegister32.
-	// FastWriteRegister32 is used for high-frequency register paths; intercept here too.
+	// V99F[C] removed (was: PLANE_CTL X-tiled (001) → Y-tiled-legacy (100) rewrite,
+	// FastWriteRegister32 twin of V99R[C]). V99S at SURF arm still re-forces CTL
+	// downstream, so this is a no-op for actually-displayed values.
+	if ((param_1 & 0xFFFFF) == 0x70180) {
+		static int v99FCpCount = 0;
+		if (v99FCpCount < 3) {
+			++v99FCpCount;
+			uint32_t tiling = (param_2 >> 10) & 0x7;
+			SYSLOG("ngreen", "V99F[Cp%d]: PLANE_CTL 0x%x passthrough tiling=%d (V99F[C] hack removed)",
+			       v99FCpCount, param_2, tiling);
+		}
+	}
+	// V103F removed (was: FastWriteRegister32 twin of V103 — block DC_STATE_EN
+	// non-zero writes). Pair-mate to V103/V103P; all three sites now passthrough.
 	if ((param_1 & 0xFFFFF) == 0x45504 && NGreen::callback && NGreen::callback->dmcIsAdlp) {
-		if (param_2 != 0) {
-			static int v103FCount = 0;
-			if (v103FCount < 20) {
-				v103FCount++;
-				SYSLOG("ngreen", "V103F[%d]: DC_STATE_EN FastWrite 0x%x -> 0 (blocked)",
-					   v103FCount, param_2);
-			}
-			param_2 = 0;
+		static int v103FpCount = 0;
+		if (v103FpCount < 6) {
+			++v103FpCount;
+			SYSLOG("ngreen", "V103Fp[%d]: DC_STATE_EN FastWrite 0x%x passthrough (V103F hack removed)",
+			       v103FpCount, param_2);
 		}
 	}
 
-	// V195: HSW_PWR_WELL_CTL1 (0x45400) — same preservation as raWriteRegister32.
+	// V195F removed (FastWriteRegister32 site of V195 — same hack pile).
 	if ((param_1 & 0xFFFFF) == 0x45400 && NGreen::callback && !NGreen::callback->isRealTGL
 	    && NGreen::callback->uefiCtl1 != 0) {
-		uint32_t preserve = NGreen::callback->uefiCtl1 & 0x5000u;
-		if (preserve && (param_2 & preserve) != preserve) {
-			static int v195FCount = 0;
-			if (v195FCount < 20) {
-				v195FCount++;
-				SYSLOG("ngreen", "V195F[%d]: CTL1 FastWrite 0x%x -> 0x%x (bits 14,12 preserved)",
-				       v195FCount, param_2, param_2 | preserve);
-			}
-			param_2 |= preserve;
+		static int v195FpCount = 0;
+		if (v195FpCount < 6) {
+			++v195FpCount;
+			SYSLOG("ngreen", "V195Fp[%d]: CTL1 FastWrite 0x%x passthrough (V195F hack removed)",
+			       v195FpCount, param_2);
 		}
 	}
 
-	// V99F: PLANE_SURF arm — same belt-and-suspenders fix as raWriteRegister32 V99S
+	// V99F[SURF] removed (was: at SURF arm via FastWriteRegister32, force PLANE_STRIDE=0xa0
+	// — FastWrite-path twin of V99S non-dp0 STRIDE=0xa0 force in raWriteRegister32). The
+	// raWriteRegister32 V99S still re-forces STRIDE at SURF arm via direct MMIO, so this
+	// passthrough doesn't change what scans out.
 	if ((param_1 & 0xFFFFF) == 0x7019C && NGreen::callback) {
 		uint32_t hwStride = NGreen::callback->readReg32(0x70188);
-		static int v99FSurfCount = 0;
-		if (v99FSurfCount < 3) {
-			SYSLOG("ngreen", "V99F[SURF%d]: arm 0x%x pre-arm STRIDE=0x%x",
-				   ++v99FSurfCount, param_2, hwStride);
-		}
-		if (hwStride != 0xa0) {
-			NGreen::callback->writeReg32(0x70188, 0xa0);
+		static int v99FSurfPassCount = 0;
+		if (v99FSurfPassCount < 3) {
+			++v99FSurfPassCount;
+			SYSLOG("ngreen", "V99F[SURFp%d]: SURF arm 0x%x STRIDE=0x%x passthrough (V99F[SURF] hack removed)",
+			       v99FSurfPassCount, param_2, hwStride);
 		}
 	}
 
@@ -6683,6 +6736,14 @@ bool Gen11::wrapIsApertureMemoryRequired(void *that) {
 		static uint32_t v205Calls = 0;
 		v205Calls++;
 
+		// V99Z dirty-rect test removed: wipe ran but visually no change because WS
+		// rewrites the whole buffer every frame. The "frozen images" symptom is
+		// actually the X-tile-as-linear scanout artifact appearing more pronounced
+		// on low-frequency content (text, solid blocks) than high-frequency content
+		// (wallpaper texture). Single root cause = scanout-vs-buffer tile mismatch.
+		// (Wipe proved BAR2 writes reach scanout in earlier magenta test, but WS's
+		// per-frame rewriting makes the wipe invisible.)
+
 		// Continuous PSR1+PSR2 disable — every call. PSR enabled = panel refreshes from
 		// its own cache and ignores new SURF arms → frozen frame even while pipe vsyncs.
 		uint32_t psr1Now = NGreen::callback->readReg32(0x60800);
@@ -6706,20 +6767,37 @@ bool Gen11::wrapIsApertureMemoryRequired(void *that) {
 			}
 		}
 
-		// Periodic state snapshot for freeze diagnosis.
-		const bool sample = (v205Calls == 1   || v205Calls == 50  || v205Calls == 100  ||
-		                     v205Calls == 250 || v205Calls == 500 || v205Calls == 1000 ||
-		                     v205Calls == 2000 || v205Calls == 5000);
+		// Periodic state snapshot for freeze diagnosis. Reduced thresholds since
+		// wrapIsApertureMemoryRequired only fires ~44 times per boot in FB-only mode.
+		const bool sample = (v205Calls == 1  || v205Calls == 2  || v205Calls == 5  ||
+		                     v205Calls == 10 || v205Calls == 20 || v205Calls == 30 ||
+		                     v205Calls == 40 || v205Calls == 44);
 		if (sample) {
 			uint32_t frm   = NGreen::callback->readReg32(0x70040);
 			uint32_t pstat = NGreen::callback->readReg32(0x70024);
 			uint32_t pcfg  = NGreen::callback->readReg32(0x70008);
 			uint32_t dcst  = NGreen::callback->readReg32(0x45504);
-			uint32_t pctl  = NGreen::callback->readReg32(0x70180);
-			uint32_t psurf = NGreen::callback->readReg32(0x7019C);
-			uint32_t pliv  = NGreen::callback->readReg32(0x701AC);
-			SYSLOG("ngreen", "V205[c=%u]: FRM=%u STAT=%08x CONF=%08x DC=%08x PCTL=%08x SURF=%08x LIVE=%08x PSR1=%08x PSR2=%08x",
-			       v205Calls, frm, pstat, pcfg, dcst, pctl, psurf, pliv,
+			// V211: also probe Plane 2 (overlay) and Plane 3 (sprite) on Pipe A.
+			// The visible "frozen overlay over animating background" symptom suggests
+			// these planes hold stale content because WS's dp0 path only writes Plane 1.
+			uint32_t p1ctl = NGreen::callback->readReg32(0x70180);
+			uint32_t p1surf = NGreen::callback->readReg32(0x7019C);
+			uint32_t p1liv = NGreen::callback->readReg32(0x701AC);
+			uint32_t p2ctl = NGreen::callback->readReg32(0x71180);
+			uint32_t p2surf = NGreen::callback->readReg32(0x7119C);
+			uint32_t p2liv = NGreen::callback->readReg32(0x711AC);
+			uint32_t p3ctl = NGreen::callback->readReg32(0x72180);
+			uint32_t p3surf = NGreen::callback->readReg32(0x7219C);
+			uint32_t p3liv = NGreen::callback->readReg32(0x721AC);
+			uint32_t curctl = NGreen::callback->readReg32(0x70080);
+			uint32_t curbase = NGreen::callback->readReg32(0x70084);
+			uint32_t curpos = NGreen::callback->readReg32(0x70088);
+			SYSLOG("ngreen", "V205[c=%u]: FRM=%u STAT=%08x CONF=%08x DC=%08x | P1 CTL=%08x SURF=%08x LIVE=%08x | P2 CTL=%08x SURF=%08x LIVE=%08x | P3 CTL=%08x SURF=%08x LIVE=%08x | CUR CTL=%08x BASE=%08x POS=%08x | PSR1=%08x PSR2=%08x",
+			       v205Calls, frm, pstat, pcfg, dcst,
+			       p1ctl, p1surf, p1liv,
+			       p2ctl, p2surf, p2liv,
+			       p3ctl, p3surf, p3liv,
+			       curctl, curbase, curpos,
 			       NGreen::callback->readReg32(0x60800), NGreen::callback->readReg32(0x60A10));
 		}
 	}
@@ -6761,18 +6839,19 @@ IOReturn Gen11::wrapSetAttribute(void *that, uint32_t attr, uintptr_t value) {
 }
 
 void Gen11::getOnlineInfo(void *that, void *displayPath, unsigned char *online, unsigned char *changed) {
-	// V96: Force display online. WEG's force-online (FOD) targets getDisplayStatus which
-	// does not exist in the TGL framebuffer kext — Lilu reports "failed to solve" err 2
-	// at boot. The TGL kext uses getOnlineInfo instead. Without this override the eDP
-	// connector is treated as disconnected on RPL hardware → black screen + TV static cursor
-	// (WindowServer doesn't render desktop; hardware cursor reads from uninitialized VRAM).
+	// V96 removed (was: force *online=1 for fbId==0). Confirmed no-op on this hardware:
+	// baseline log shows Apple's getOnlineInfo natively reports orig=1 for FB0, so the
+	// V96 forcing was already redundant. Keeping the wrapper as a logging shell so we
+	// can observe original online behavior across boots — if any orig!=1 case shows up
+	// we'll know V96 was masking a real status bug, not just being redundant.
 	FunctionCast(getOnlineInfo, callback->ogetOnlineInfo)(that, displayPath, online, changed);
-	static int v96Logs = 0;
+	uint32_t fbId = getMember<uint32_t>(that, 0x1DC);
 	unsigned char origOnline = online ? *online : 0xFF;
-	if (online) *online = 1;
-	if (v96Logs < 8) {
-		v96Logs++;
-		SYSLOG("ngreen", "V96: getOnlineInfo: orig=%d forced=1 (fb=%p dp=%p)", origOnline, that, displayPath);
+	static int v96PassLogs = 0;
+	if (v96PassLogs < 12) {
+		v96PassLogs++;
+		SYSLOG("ngreen", "V96p: fb%u getOnlineInfo: orig=%d passthrough (V96 hack removed)",
+		       fbId, origOnline);
 	}
 }
 
