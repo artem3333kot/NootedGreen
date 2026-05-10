@@ -5274,63 +5274,49 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 				#undef R
 			}
 		}
-		// dp0 branch RESTORED (V99R[P] + V99G + dp0-side V99S): user explicitly kept
-		// these as load-bearing for "fragmented but visible login" under -ngreendp0.
-		// The non-dp0 branch (HW+FB) V99S forces removed below — that path was frozen
-		// even with the hacks, so removing them loses nothing and unblocks observing
-		// what Apple's natural STRIDE/CTL produce on the real-display path.
-		const bool dpForced = isDisplayPipeForceDisabled();
-		if (dpForced) {
-			if (param_2 >= 0x10000000u) {
-				static int v99PCount = 0;
-				if (v99PCount < 8)
-					SYSLOG("ngreen", "V99R[P%d]: SURF 0x%x->0 (dp0: non-aperture blocked, aperture kept)",
-						   ++v99PCount, (uint32_t)param_2);
-
-				// V99G: one-shot GGTT remap — copy PTEs from the non-aperture surface pages
-				// (GGTT[surfPage..surfPage+3999]) to GGTT[0..3999] so that SURF=0x0 scans
-				// the SAME physical memory that WS's CPU compositor is writing into.
-				static bool ggttRemapped = false;
-				if (!ggttRemapped) {
-					ggttRemapped = true;
-					uint32_t srcPage = (uint32_t)param_2 >> 12;
-					int remapped = 0, remapSkipped = 0;
-					for (int i = 0; i < 4000; i++) {
-						uint32_t lo = NGreen::callback->readReg32(GGTT_PTE_LO(srcPage + i));
-						uint32_t hi = NGreen::callback->readReg32(GGTT_PTE_HI(srcPage + i));
-						if (!(lo & 1)) { remapSkipped++; continue; }
-						NGreen::callback->writeReg32(GGTT_PTE_LO(i), lo);
-						NGreen::callback->writeReg32(GGTT_PTE_HI(i), hi);
-						remapped++;
-					}
-					NGreen::callback->writeReg32(0x101008, 0x1); // flush GGTT TLB
-					SYSLOG("ngreen", "V99G: GGTT[0..%d] <- GGTT[0x%x..] remapped=%d skip=%d",
-						   remapped - 1, srcPage, remapped, remapSkipped);
+		// V99R[P] + V99G + linear STRIDE/CTL forces — CORE scanout coherence.
+		// Confirmed empirically (user): this triad unlocks visible scanout in dp0, dp1,
+		// AND without any -ngreendp* boot arg. It is the load-bearing path on this hardware
+		// regardless of dp state. Applied unconditionally — no more if/else on dpForced.
+		//
+		//   1. SURF redirect: non-aperture writes (>=0x10000000) → 0, so the display engine
+		//      always scans from the same GGTT page range (GGTT[0..3999]) no matter where
+		//      Apple's setupScanoutMemory chose to migrate the surface.
+		//   2. V99G: one-shot GGTT remap — copies the PTEs at the migrated surface pages
+		//      down to GGTT[0..3999] so SURF=0 fetches the same physical memory WS's CPU
+		//      compositor is writing into.
+		//   3. Linear forces (CTL tiling→0, STRIDE=0xa0): self-consistent for 2560×4bpp
+		//      linear scanout (160 cachelines × 64B = 10240 B/row). Any other tiling/stride
+		//      combo on this path produces reads-past-buffer → black.
+		if (param_2 >= 0x10000000u) {
+			static int v99PCount = 0;
+			if (v99PCount < 8)
+				SYSLOG("ngreen", "V99R[P%d]: SURF 0x%x->0 (non-aperture blocked, aperture kept)",
+					   ++v99PCount, (uint32_t)param_2);
+			static bool ggttRemapped = false;
+			if (!ggttRemapped) {
+				ggttRemapped = true;
+				uint32_t srcPage = (uint32_t)param_2 >> 12;
+				int remapped = 0, remapSkipped = 0;
+				for (int i = 0; i < 4000; i++) {
+					uint32_t lo = NGreen::callback->readReg32(GGTT_PTE_LO(srcPage + i));
+					uint32_t hi = NGreen::callback->readReg32(GGTT_PTE_HI(srcPage + i));
+					if (!(lo & 1)) { remapSkipped++; continue; }
+					NGreen::callback->writeReg32(GGTT_PTE_LO(i), lo);
+					NGreen::callback->writeReg32(GGTT_PTE_HI(i), hi);
+					remapped++;
 				}
-
-				param_2 = 0;
+				NGreen::callback->writeReg32(0x101008, 0x1); // flush GGTT TLB
+				SYSLOG("ngreen", "V99G: GGTT[0..%d] <- GGTT[0x%x..] remapped=%d skip=%d",
+					   remapped - 1, srcPage, remapped, remapSkipped);
 			}
-			// dp0: force CTL linear and STRIDE=0xa0 (CPU compositor writes linearly via BAR2).
-			uint32_t hwTiling = (hwCtl >> 10) & 0x7;
-			if (hwTiling != 0)
-				NGreen::callback->writeReg32(0x70180, hwCtl & ~(0x7u << 10));
-			if (hwStride != 0xa0)
-				NGreen::callback->writeReg32(0x70188, 0xa0);
-		} else {
-			// Non-dp0 V99S RESTORED (per user): force STRIDE=0xa0 (Y-tiled/linear units:
-			// 160 × 64B = 10240B = 2560px × 4bpp) and CTL X-tiled (001) → Y-tiled-legacy
-			// (100). Note this is a CACHE-write entry (raWriteRegister32) but the writeReg32
-			// calls below are direct MMIO, so they DO reach hardware regardless of whether
-			// V99R[S]/V99R[C] above are passthrough or rewriting — i.e. the V99R passthrough
-			// upstream changes nothing about what scans out as long as V99S re-forces here.
-			if (hwStride != 0xa0)
-				NGreen::callback->writeReg32(0x70188, 0xa0);
-			uint32_t hwTiling = (hwCtl >> 10) & 0x7;
-			if (hwTiling == 0x1) {
-				uint32_t newCtl = (hwCtl & ~(0x7u << 10)) | (0x4u << 10);
-				NGreen::callback->writeReg32(0x70180, newCtl);
-			}
+			param_2 = 0;
 		}
+		uint32_t hwTiling = (hwCtl >> 10) & 0x7;
+		if (hwTiling != 0)
+			NGreen::callback->writeReg32(0x70180, hwCtl & ~(0x7u << 10));
+		if (hwStride != 0xa0)
+			NGreen::callback->writeReg32(0x70188, 0xa0);
 	}
 
 	if (reinterpret_cast<volatile uint64_t*>(that)==nullptr) return NGreen::callback->writeReg32(param_1,param_2);
