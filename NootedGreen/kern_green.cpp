@@ -1,4 +1,4 @@
-//  Copyright © 2023 ChefKiss Inc. Licensed under the Thou Shalt Not Profit License version 1.0. See LICENSE for
+//  Copyright © 2026 Stezza @ inc. Licensed under the Thou Shalt Not Profit License version 1.0. See LICENSE for
 //  details.
 
 #include "kern_green.hpp"
@@ -333,6 +333,19 @@ void NGreen::setRMMIOIfNecessary() {
 	}
 }
 
+void NGreen::setApertureIfNecessary() {
+	if (UNLIKELY(!this->aperture || !this->aperture->getLength())) {
+		this->aperture = this->iGPU->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress2);
+		if (this->aperture) {
+			this->aperturePtr = reinterpret_cast<volatile uint32_t *>(this->aperture->getVirtualAddress());
+			this->apertureLen = this->aperture->getLength();
+			SYSLOG("ngreen", "V201: BAR2 aperture mapped, len=0x%llx", this->apertureLen);
+		} else {
+			SYSLOG("ngreen", "V201: BAR2 aperture map FAILED");
+		}
+	}
+}
+
 bool NGreen::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
 	if (kextIOAcceleratorFamily2.loadIndex == index) {
 		SYSLOG("NGreen", "IOAccelF2: TEXT 0x%llx size 0x%lx", address, size);
@@ -414,14 +427,16 @@ bool NGreen::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 			SYSLOG_COND(!patch.apply(patcher, address, size), "NGreen", "Failed to apply AGDP fb count check patch");
 		}*/
 	}  else if (kextBacklight.loadIndex == index) {
-		/*KernelPatcher::RouteRequest request {"__ZN15AppleIntelPanel10setDisplayEP9IODisplay", wrapApplePanelSetDisplay,
-	  orgApplePanelSetDisplay};
-			if (patcher.routeMultiple(kextBacklight.loadIndex, &request, 1, address, size)) {
-				const UInt8 find[] = {"F%uT%04x"};
-				const UInt8 replace[] = {"F%uTxxxx"};
-				const LookupPatchPlus patch {&kextBacklight, find, replace, 1};
-				SYSLOG_COND(!patch.apply(patcher, address, size), "NGreen", "Failed to apply backlight patch");
-			}*/
+		// V204b: re-enable AppleIntelPanel::setDisplay route + backlight string patch.
+		// Friend's working version has these enabled. Sets up panel data for backlight ramp.
+		KernelPatcher::RouteRequest request {"__ZN15AppleIntelPanel10setDisplayEP9IODisplay", wrapApplePanelSetDisplay,
+			orgApplePanelSetDisplay};
+		if (patcher.routeMultiple(kextBacklight.loadIndex, &request, 1, address, size)) {
+			const UInt8 find[] = {"F%uT%04x"};
+			const UInt8 replace[] = {"F%uTxxxx"};
+			const LookupPatchPlus patch {&kextBacklight, find, replace, 1};
+			SYSLOG_COND(!patch.apply(patcher, address, size), "NGreen", "Failed to apply backlight patch");
+		}
 } else if (kextMCCSControl.loadIndex == index) {
 		/*KernelPatcher::RouteRequest requests[] = {
 				{"__ZN25AppleMCCSControlGibraltar5probeEP9IOServicePi", wrapFunctionReturnZero},

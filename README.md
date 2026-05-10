@@ -28,6 +28,9 @@ Patches Apple's Tiger Lake (Gen12) graphics drivers to work with newer Intel iGP
 
 ### Recent Progress
 
+- **DBUF root cause identified (`-ngreentglwithgfx` required on Gen11+):** Per-plane `DBUF_BUF_CFG_<PIPE>_<PLANE>` allocation lives in the watermark/atomic-commit pipeline that ships with `AppleIntelTGLGraphics.kext` (the HW accelerator kext), not in `AppleIntelTGLGraphicsFramebuffer.kext`. With FB-only mode (`-ngreentglfb`), `DBUF_BUF_CFG_A_PA` stays at `0x00000000` even though `PLANE_CTL` enable bit is set — the display engine fetches from a zero-block DBUF range and produces duplicated/fragmented output (most visible on the boot Apple-logo + loading-bar phase and the login screen). Loading both kexts via `-ngreentglwithgfx` lets Apple's native code program DBUF correctly. V203 register dump (Pipe/Trans/DSC/M-N/DBUF) confirmed `DBUF_BUF_CFG_A_PA = 0` as the smoking gun in the FB-only case.
+- **V204 ccont init hooks re-enabled:** `AppleIntelScaler::init` and `AppleIntelPlane::init` are now routed in the FBT branch so `ccont` is set into `that[+0x28]` / `that[+0x90]` at construction time (matches Visual Ehrmanntraut's working configuration). The per-method ccont patches (`disableScaler` / `enablePlane` / `programPipeScaler` / `updateRegisterCache` / `disableDisplayEngine` / `enableDisplayEngine` / `hwSetPowerWellStateAux/DDI` / `raWriteRegister32b`) remain enabled as belt-and-suspenders for any path that bypasses the constructor.
+- **V204b backlight panel hook re-enabled:** `AppleIntelPanel::setDisplay` route + `F%uT%04x` → `F%uTxxxx` panel-data string patch in `kextBacklight` branch.
 - **dp0 path (CPU compositor / `-ngreendp0`) active investigation:**
   - **V99S**: Hook in `raWriteRegister32` intercepts all `PLANE_SURF` writes ≥`0x10000000` (non-aperture) and redirects them to `0x0`; simultaneously forces `PLANE_CTL` linear and `PLANE_STRIDE=0xa0`. Keeps the display scanning BAR2 aperture while the Intel driver tries to migrate to non-aperture GGTT.
   - **V99G**: One-shot GGTT remap — when V99S first intercepts a non-aperture `PLANE_SURF` write, copies PTEs from the non-aperture surface pages (`GGTT[surfPage..surfPage+3999]`) to `GGTT[0..3999]` so that `SURF=0x0` scans the same physical pages that WindowServer's CPU compositor writes to. Confirmed visible: Apple boot flash appears briefly on dp0.
@@ -105,14 +108,18 @@ These properties are essential for correct platform identification and WEG coexi
 ## Boot args
 
 ```
--v keepsyms=1 debug=0x100 IGLogLevel=8 -NGreenDebug -liludbg liludump=220 ngreen-dmc=adlp -allow3d -disablegfxfirmware -ngreenfullmtldyld -ngreenfullmtlcore -ngreendp0 -ngreenexp -ngreenv60 -ngreenv88
+-v keepsyms=1 debug=0x100 IGLogLevel=8 -ngreentglwithgfx -NGreenDebug -liludbg liludump=220 ngreen-dmc=adlp -allow3d -disablegfxfirmware -ngreenfullmtldyld -ngreenfullmtlcore -ngreendp0 -ngreenexp -ngreenv60 -ngreenv88
 ```
 
-> **Note:** `-ngreendp0 -ngreenv88` are diagnostic flags for the dp0/CPU-compositor investigation path. Remove them for normal operation.
+> **Note:** `-ngreentglwithgfx` is required on Gen11/TGL hardware to load BOTH the TGL framebuffer AND the TGL HW (accelerator) kext. FB-only mode (`-ngreentglfb`) does not allocate per-plane DBUF on Gen11+ — the watermark/DBUF programming pipeline lives in the HW kext (`AppleIntelTGLGraphics.kext`), so without it the display engine fetches from a zero-block DBUF range and produces duplicated/fragmented output. `-ngreendp0 -ngreenv88` are diagnostic flags for the dp0/CPU-compositor investigation path. Remove them for normal operation.
 
 | Arg | Purpose |
 |---|---|
 | `-NGreenDebug` | Enable NootedGreen debug logging |
+| `-ngreentglfb` | Load only the TGL framebuffer kext (FB-only mode). On Gen11+, this is generally NOT enough for a coherent display because per-plane DBUF allocation is HW-kext side. Diagnostic / FB-driver-isolation use only. |
+| `-ngreentglwithgfx` | Load both the TGL framebuffer AND the TGL HW accelerator kext. **Recommended for normal operation on TGL/RPL hardware.** Pairs the FB driver with `AppleIntelTGLGraphics.kext` so the watermark/DBUF programming pipeline runs at mode-set time. |
+| `-ngreentglgfx` | Load only the TGL HW kext, no FB. Diagnostic — hardware will not display anything without an FB driver. |
+| `-ngreenicl` | Load the legacy ICL framebuffer + HW kexts instead of TGL. For older Gen11 hardware where TGL spoof isn't suitable. |
 | `-disablegfxfirmware` | Disable GuC/HuC firmware loading — required on RPL/ADL because scheduler selection (`ngreenSched`) happens after the HW-branch `processKext`, so the driver attempts firmware init before NootedGreen can override the scheduler type. Not needed on real TGL (GuC loads natively). |
 | `-nbwegcoex` / `nbwegcoex=1` | Enable WEG coexistence mode. |
 | `ngreenSched=N` | Select GPU scheduler type: `3` = GuC firmware, `4` = IGScheduler4, `5` = host preemptive (default: `3` on real TGL, `5` on RPL/ADL) |
@@ -334,8 +341,12 @@ Open `NootedGreen.xcodeproj` and select the **NootedGreen** scheme to build the 
 ## Authors
 
 - **Stefano Giammori** ([@sgiammori](https://github.com/sgiammori)) — reverse engineering, driver development, hardware testing
-- Thanks to [@shl628](https://github.com/lshbluesky) and [@jalavoui](https://github.com/macintelk), developers of NootedBlue
-- **Claude Code** (Claude Opus 4.7) — AI pair-programming, code generation, debug analysis
+
+## Thanks to..
+
+- **Visual Ehrmanntraut** — original ChefKiss / NootedBlue / NootedGreen author whose code this project builds on; ongoing IDA / ccont-init / DBUF / boot-arg guidance
+- [@shl628](https://github.com/lshbluesky) and [@jalavoui](https://github.com/macintelk) — developers of NootedBlue
+- **Claude Code** (Claude Opus 4.7 + Claude Sonnet 4.6) — AI pair-programming, code generation, debug analysis
 
 ## License
 

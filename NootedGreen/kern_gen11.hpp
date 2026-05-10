@@ -1,5 +1,5 @@
 	
-//  Copyright © 2023 ChefKiss Inc. Licensed under the Thou Shalt Not Profit License version 1.0. See LICENSE for
+//  Copyright © 2026 Stezza @ inc. Licensed under the Thou Shalt Not Profit License version 1.0. See LICENSE for
 //  details.
 
 #ifndef kern_gen11_hpp
@@ -1789,6 +1789,12 @@ private:
 	// FB controller start — wraps original, adds registerService() for accelerator matching
 	static bool AppleIntelBaseControllerstart(void *that,void *param_1);
 	mach_vm_address_t oAppleIntelBaseControllerstart {};
+
+	// V201 diagnostic: read first bytes of the scanout buffer right after hwSetupMemory
+	// returns. Tells us whether something filled the buffer (wallpaper) or it's still
+	// zeros from the IOBufferMemoryDescriptor allocation.
+	static int wrapHwSetupMemory(void *that, void *fb, void *displayPath, void *params, bool isAperture);
+	mach_vm_address_t ohwSetupMemory {};
 
 	// IntelAccelerator personality registration in IOCatalogue. Lives in the HW-kext
 	// path (ICL or TGL Graphics, not Framebuffer) — must run before the FBController's

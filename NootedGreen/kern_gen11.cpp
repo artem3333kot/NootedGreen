@@ -1,4 +1,4 @@
-//  Copyright © 2023 ChefKiss Inc. Licensed under the Thou Shalt Not Profit License version 1.0. See LICENSE for
+//  Copyright © 2026 Stezza @ inc. Licensed under the Thou Shalt Not Profit License version 1.0. See LICENSE for
 //  details.
 #include "kern_gen11.hpp"
 #include <Headers/kern_api.hpp>
@@ -462,6 +462,11 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			{"__ZN19AppleIntelPowerWell21hwSetPowerWellStatePGEbj.cold.11",releaseDoorbell},
 			{"__ZN19AppleIntelPowerWell21hwSetPowerWellStatePGEbj.cold.12",releaseDoorbell},
 			{"__ZN19AppleIntelPowerWell22hwSetPowerWellStateAuxEbj.cold.1",releaseDoorbell},*/
+			// V204: re-enable AppleIntelScaler/Plane init constructors so ccont is set
+			// once at object construction. Friend's working version routes only these and
+			// keeps the per-method patches commented; we keep both as belt-and-suspenders.
+			{"__ZN16AppleIntelScaler4initE10IGScalerID", AppleIntelScalerinit, this->oAppleIntelScalerinit},
+			{"__ZN15AppleIntelPlane4initE9IGPlaneID",     AppleIntelPlaneinit,  this->oAppleIntelPlaneinit},
 			// AppleIntelPlaneinit/Scalerinit hooks are disabled in kern_genx.cpp, so fields
 			// 0x90 (plane RAM) and 0x28/0x10 (scaler RAM) are never set at object-init time.
 			// Every entry point into Plane/Scaler that calls ReadRegister32 will crash with
@@ -557,7 +562,9 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				{"__ZN24AppleIntelBaseController28setCDClockFrequencyOnHotplugEv",setCDClockFrequencyOnHotplug, this->osetCDClockFrequencyOnHotplug},
 				{"__ZN24AppleIntelBaseController14disableCDClockEv",disableCDClock,this->odisableCDClock},
 				{"__ZN24AppleIntelBaseController16hwRegsNeedUpdateEP21AppleIntelFramebufferP21AppleIntelDisplayPathP10CRTCParamsPK29IODetailedTimingInformationV2PN16AppleIntelScaler12SCALERPARAMSE",hwRegsNeedUpdate, this->ohwRegsNeedUpdate},
-				
+				// V201 diagnostic: read scanout buffer right after hwSetupMemory returns to
+				// detect what fills it (zeros vs wallpaper pixels). FB-only scope.
+				{"__ZN24AppleIntelBaseController13hwSetupMemoryEP21AppleIntelFramebufferP21AppleIntelDisplayPathP10CRTCParamsb", wrapHwSetupMemory, this->ohwSetupMemory},
 			};
 			PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, requests, address, size), "ngreen","Failed to route d symbols");
 			
@@ -5207,9 +5214,66 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 		uint32_t hwStride = NGreen::callback->readReg32(0x70188);
 		uint32_t hwCtl    = NGreen::callback->readReg32(0x70180);
 		static int v99SCount = 0;
-		if (v99SCount < 5) {
-			SYSLOG("ngreen", "V99S[%d]: SURF arm 0x%x: pre-arm STRIDE=0x%x CTL=0x%x",
-				   ++v99SCount, (uint32_t)param_2, hwStride, hwCtl);
+		if (v99SCount < 8) {
+			++v99SCount;
+			// V201B: read TOP-LEFT (gray border) AND CENTER (Apple logo / loading bar
+			// area) of the buffer. Linear byte offset of pixel (x,y) = y*10240 + x*4.
+			// Sample points (BGRA, 2560×1600):
+			//  - (0,0)         offset 0          → top-left, gray bg
+			//  - (1280,800)    offset 0x7D2800   → screen center, Apple logo
+			//  - (1280,1000)   offset 0x9C7800   → loading-bar row
+			//  - (640,800)     offset 0x7D1A00   → mid-left of logo area
+			NGreen::callback->setApertureIfNecessary();
+			uint32_t tlCtr = 0xDEADBEEF, ctr = 0xDEADBEEF, bar = 0xDEADBEEF, mid = 0xDEADBEEF;
+			if (NGreen::callback->aperturePtr && NGreen::callback->apertureLen >= 0xA00000) {
+				volatile uint32_t *fb32 = NGreen::callback->aperturePtr;
+				tlCtr = fb32[0];             // top-left
+				ctr   = fb32[0x7D2800 / 4];  // center (Apple logo)
+				bar   = fb32[0x9C7800 / 4];  // loading bar row
+				mid   = fb32[0x7D1A00 / 4];  // mid-left of logo area
+			}
+			SYSLOG("ngreen", "V99S[%d]: SURF arm 0x%x STRIDE=0x%x CTL=0x%x | tl=%08x ctr(1280,800)=%08x bar(1280,1000)=%08x mid(640,800)=%08x",
+			       v99SCount, (uint32_t)param_2, hwStride, hwCtl, tlCtr, ctr, bar, mid);
+
+			// V203: on the LAST sampled SURF arm, dump every pipe/transcoder/DSC/scaler
+			// register relevant to the duplicated-content symptom. We're hunting an
+			// off-by-2 in stride / src-vs-active / DSC bpp / pipe-bpc / M-N.
+			if (v99SCount == 8) {
+				#define R(addr) NGreen::callback->readReg32(addr)
+				SYSLOG("ngreen", "V203: --- SCANOUT REGISTER DUMP ---");
+				// Plane A
+				SYSLOG("ngreen", "V203 PLANE_A: CTL=%08x STRIDE=%08x POS=%08x SIZE=%08x OFFSET=%08x SURF=%08x SURFLIVE=%08x AUX_DIST=%08x AUX_OFFSET=%08x KEYVAL=%08x KEYMSK=%08x KEYMAX=%08x COLOR_CTL=%08x",
+				       R(0x70180), R(0x70188), R(0x7018C), R(0x70190), R(0x701A4),
+				       R(0x7019C), R(0x701AC), R(0x701C0), R(0x701C4),
+				       R(0x70194), R(0x70198), R(0x701A0), R(0x701CC));
+				// Pipe A general
+				SYSLOG("ngreen", "V203 PIPE_A: SRCSZ=%08x CONF=%08x MISC=%08x MISC2=%08x STAT=%08x",
+				       R(0x6001C), R(0x70008), R(0x70030), R(0x7002C), R(0x70024));
+				// Transcoder A timings
+				SYSLOG("ngreen", "V203 TRANS_A: HTOTAL=%08x HBLANK=%08x HSYNC=%08x VTOTAL=%08x VBLANK=%08x VSYNC=%08x VSYNCSHIFT=%08x",
+				       R(0x60000), R(0x60004), R(0x60008), R(0x6000C),
+				       R(0x60010), R(0x60014), R(0x60028));
+				// DDI function control + MSA
+				SYSLOG("ngreen", "V203 TRANS_A_DDI: DDI_FUNC_CTL=%08x DDI_FUNC_CTL2=%08x MSA_MISC=%08x CONF=%08x CLK_SEL=%08x",
+				       R(0x60400), R(0x60404), R(0x60410), R(0x70008), R(0x46140));
+				// DP M/N values for Pipe A
+				SYSLOG("ngreen", "V203 TRANS_A_DPMN: DATAM1=%08x DATAN1=%08x DATAM2=%08x DATAN2=%08x LINKM1=%08x LINKN1=%08x LINKM2=%08x LINKN2=%08x",
+				       R(0x60030), R(0x60034), R(0x60038), R(0x6003C),
+				       R(0x60040), R(0x60044), R(0x60048), R(0x6004C));
+				// Pipe A scaler 1
+				SYSLOG("ngreen", "V203 PIPE_A_PS1: CTRL=%08x WIN_POS=%08x WIN_SZ=%08x VPHASE=%08x HPHASE=%08x",
+				       R(0x68180), R(0x68170), R(0x68174), R(0x68188), R(0x68194));
+				// DSC slice control / PPS for Pipe A (DSC_BASE_A around 0x6B200; varies by gen)
+				SYSLOG("ngreen", "V203 DSC_A: PIC_RC=%08x PPS0=%08x PPS1=%08x PPS2=%08x PPS3=%08x PPS4=%08x",
+				       R(0x6B200), R(0x6B210), R(0x6B214), R(0x6B218), R(0x6B21C), R(0x6B220));
+				// DDI buf / port
+				SYSLOG("ngreen", "V203 DDI_BUF: A_CTL=%08x B_CTL=%08x | DP_TP_CTL_A=%08x DP_TP_STATUS_A=%08x",
+				       R(0x64000), R(0x64100), R(0x64040), R(0x64044));
+				// Display Buffer programming
+				SYSLOG("ngreen", "V203 DBUF: CTL_S0=%08x CTL_S1=%08x DBUF_BUF_CFG_A_PA=%08x A_PB=%08x",
+				       R(0x44300), R(0x44304), R(0x70B80), R(0x70B84));
+				#undef R
+			}
 		}
 		const bool dpForced = isDisplayPipeForceDisabled();
 		if (dpForced) {
@@ -5613,6 +5677,40 @@ bool Gen11::AppleIntelBaseControllerstart(void *that,void *param_1)
 			SYSLOG("ngreen", "FBController: calling registerService() to trigger accelerator matching");
 			service->registerService();
 		}
+	}
+
+	return ret;
+}
+
+int Gen11::wrapHwSetupMemory(void *that, void *fb, void *displayPath, void *params, bool isAperture)
+{
+	int ret = FunctionCast(wrapHwSetupMemory, callback->ohwSetupMemory)(that, fb, displayPath, params, isAperture);
+
+	// V201: post-hwSetupMemory probe — read 32 bytes at the SURF GTT offset through BAR2.
+	// SURF address is at fb+0x4330 (per hwSetupMemory decomp at offset 0x6E046).
+	// If buffer is all zeros → freshly-allocated IOBufferMemoryDescriptor pages, nothing
+	// has rendered into them yet. If non-zero → some path filled them (EFI GOP carry-over,
+	// CoreDisplay handoff blit, or other).
+	static int v201Count = 0;
+	if (v201Count < 4 && NGreen::callback) {
+		uint32_t surfAddr = getMember<uint32_t>(fb, 0x4330);
+		uint32_t fbSize   = getMember<uint32_t>(fb, 0x4334);
+		uint8_t  fbIdx    = getMember<uint8_t>(fb,  0x4288);
+		uint8_t  yTileFlg = getMember<uint8_t>(fb,  0x4A18);
+
+		NGreen::callback->setApertureIfNecessary();
+		// Sample top-left and screen-center for 2560×1600 BGRA layout.
+		uint32_t tlCtr = 0xDEADBEEF, ctr = 0xDEADBEEF, bar = 0xDEADBEEF, mid = 0xDEADBEEF;
+		if (NGreen::callback->aperturePtr && surfAddr + 0xA00000 <= NGreen::callback->apertureLen) {
+			volatile uint32_t *fb32 = NGreen::callback->aperturePtr + (surfAddr / sizeof(uint32_t));
+			tlCtr = fb32[0];
+			ctr   = fb32[0x7D2800 / 4];  // (1280,800) Apple logo center
+			bar   = fb32[0x9C7800 / 4];  // (1280,1000) loading-bar row
+			mid   = fb32[0x7D1A00 / 4];  // (640,800) mid-left of logo area
+		}
+		v201Count++;
+		SYSLOG("ngreen", "V201[%d]: hwSetupMemory ret=0x%x fb=%p surf=0x%x size=0x%x idx=%u tile=%u | tl=%08x ctr=%08x bar=%08x mid=%08x",
+		       v201Count, ret, fb, surfAddr, fbSize, fbIdx, yTileFlg, tlCtr, ctr, bar, mid);
 	}
 
 	return ret;

@@ -1,4 +1,4 @@
-//  Copyright © 2023 ChefKiss Inc. Licensed under the Thou Shalt Not Profit License version 1.0. See LICENSE for
+//  Copyright © 2026 Stezza @ inc. Licensed under the Thou Shalt Not Profit License version 1.0. See LICENSE for
 //  details.
 
 #pragma once
@@ -51,6 +51,9 @@ class NGreen {
     void processPatcher(KernelPatcher &patcher);
     bool processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
 	void setRMMIOIfNecessary();
+	// V201 diagnostic: BAR2 graphics aperture mapping. Lets us read scanout buffer
+	// bytes through the GTT-translated CPU mapping (safe — no MCE risk like raw PA).
+	void setApertureIfNecessary();
 	
 	static uint16_t configRead16(IORegistryEntry *service, uint32_t space, uint8_t offset);
 	static uint32_t configRead32(IORegistryEntry *service, uint32_t space, uint8_t offset);
@@ -288,6 +291,10 @@ class NGreen {
 	
 	IOMemoryMap *rmmio {nullptr};
 	volatile UInt32 *rmmioPtr {nullptr};
+
+	IOMemoryMap *aperture {nullptr};
+	volatile UInt32 *aperturePtr {nullptr};
+	uint64_t apertureLen {0};
 
 };
 
