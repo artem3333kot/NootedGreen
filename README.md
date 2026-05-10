@@ -344,7 +344,7 @@ Open `NootedGreen.xcodeproj` and select the **NootedGreen** scheme to build the 
 
 ## Thanks to..
 
-- **Visual Ehrmanntraut** — original ChefKiss / NootedBlue / NootedGreen author whose code this project builds on; ongoing IDA / ccont-init / DBUF / boot-arg guidance
+- **Visual Ehrmanntraut** — author of the upstream ChefKiss code this project builds on; ongoing IDA / ccont-init / DBUF / boot-arg guidance
 - [@shl628](https://github.com/lshbluesky) and [@jalavoui](https://github.com/macintelk) — developers of NootedBlue
 - **Claude Code** (Claude Opus 4.7 + Claude Sonnet 4.6) — AI pair-programming, code generation, debug analysis
 
