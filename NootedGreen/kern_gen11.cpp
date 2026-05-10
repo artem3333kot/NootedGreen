@@ -5274,10 +5274,9 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 				#undef R
 			}
 		}
-		// V99R[P] + V99G + linear STRIDE/CTL forces — CORE scanout coherence.
-		// Confirmed empirically (user): this triad unlocks visible scanout in dp0, dp1,
-		// AND without any -ngreendp* boot arg. It is the load-bearing path on this hardware
-		// regardless of dp state. Applied unconditionally — no more if/else on dpForced.
+		// V99R[P] + V99G — CORE scanout coherence (SURF redirect + GGTT remap).
+		// Applied unconditionally — confirmed load-bearing for visible scanout regardless
+		// of -ngreendp* state.
 		//
 		//   1. SURF redirect: non-aperture writes (>=0x10000000) → 0, so the display engine
 		//      always scans from the same GGTT page range (GGTT[0..3999]) no matter where
@@ -5285,9 +5284,17 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 		//   2. V99G: one-shot GGTT remap — copies the PTEs at the migrated surface pages
 		//      down to GGTT[0..3999] so SURF=0 fetches the same physical memory WS's CPU
 		//      compositor is writing into.
-		//   3. Linear forces (CTL tiling→0, STRIDE=0xa0): self-consistent for 2560×4bpp
-		//      linear scanout (160 cachelines × 64B = 10240 B/row). Any other tiling/stride
-		//      combo on this path produces reads-past-buffer → black.
+		//
+		// The previous linear CTL/STRIDE forces (tiling→0, STRIDE=0xa0) were the CAUSE
+		// of the fragmented/repeated screen: Apple allocates an X-tiled buffer (X-tile =
+		// 512B wide × 8 rows tall = 4096B/tile). When we forced linear scanout of those
+		// physical bytes at STRIDE=10240 B/row, each linear "row" actually contained
+		// interleaved 64-byte slivers from 8 different visual rows packed together → the
+		// fragmented/repeated pattern, with the 8-row cycle visibly repeating.
+		//
+		// Fix: let Apple's natural CTL (X-tiled bit 0x1) + STRIDE=0x14 (20 X-tile units =
+		// 10240B X-tile row) reach HW. Display reads X-tiled bytes as X-tiled → coherent
+		// image. We only redirect SURF and remap GGTT; tiling stays Apple-native.
 		if (param_2 >= 0x10000000u) {
 			static int v99PCount = 0;
 			if (v99PCount < 8)
@@ -5312,11 +5319,9 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 			}
 			param_2 = 0;
 		}
-		uint32_t hwTiling = (hwCtl >> 10) & 0x7;
-		if (hwTiling != 0)
-			NGreen::callback->writeReg32(0x70180, hwCtl & ~(0x7u << 10));
-		if (hwStride != 0xa0)
-			NGreen::callback->writeReg32(0x70188, 0xa0);
+		// Tiling/STRIDE forces REMOVED — they were the fragmentation cause. Apple's
+		// natural X-tiled CTL + X-tile-unit STRIDE reaches HW unmodified.
+		(void)hwStride; (void)hwCtl;
 	}
 
 	if (reinterpret_cast<volatile uint64_t*>(that)==nullptr) return NGreen::callback->writeReg32(param_1,param_2);

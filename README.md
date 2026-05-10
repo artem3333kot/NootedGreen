@@ -107,8 +107,14 @@ These properties are essential for correct platform identification and WEG coexi
 
 ## Boot args
 
+Boot args advised for testing (Hookcase in `/Library/Extensions/` too):
+
 ```
--v keepsyms=1 debug=0x100 IGLogLevel=8 -ngreentglwithgfx -NGreenDebug -liludbg liludump=220 ngreen-dmc=adlp -allow3d -disablegfxfirmware -ngreenfullmtldyld -ngreenfullmtlcore -ngreendp0 -ngreenexp -ngreenv60 -ngreenv88
+-v keepsyms=1 debug=0x100 IGLogLevel=8 -ngreentglfb -NGreenDebug -liludbg liludump=220 ngreen-dmc=adlp -ngreenv189
+```
+
+```
+-v keepsyms=1 debug=0x100 IGLogLevel=8 -ngreentglwithgfx -NGreenDebug -liludbg liludump=220 ngreen-dmc=adlp -ngreenv189 -ngreendp0 -allow3d -disablegfxfirmware -ngreenfullmtlcore -ngreenexp -ngreenv60 -ngreenv88
 ```
 
 > **Note:** `-ngreentglwithgfx` is required on Gen11/TGL hardware to load BOTH the TGL framebuffer AND the TGL HW (accelerator) kext. FB-only mode (`-ngreentglfb`) does not allocate per-plane DBUF on Gen11+ — the watermark/DBUF programming pipeline lives in the HW kext (`AppleIntelTGLGraphics.kext`), so without it the display engine fetches from a zero-block DBUF range and produces duplicated/fragmented output. `-ngreendp0 -ngreenv88` are diagnostic flags for the dp0/CPU-compositor investigation path. Remove them for normal operation.
