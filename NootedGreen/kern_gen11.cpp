@@ -5274,9 +5274,9 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 				#undef R
 			}
 		}
-		// V99R[P] + V99G — CORE scanout coherence (SURF redirect + GGTT remap).
-		// Applied unconditionally — confirmed load-bearing for visible scanout regardless
-		// of -ngreendp* state.
+		// V99R[P] + V99G + linear CTL/STRIDE forces — CORE scanout coherence.
+		// Applied unconditionally; confirmed empirically as the load-bearing path for
+		// visible scanout in dp0, dp1, AND without any -ngreendp* boot arg.
 		//
 		//   1. SURF redirect: non-aperture writes (>=0x10000000) → 0, so the display engine
 		//      always scans from the same GGTT page range (GGTT[0..3999]) no matter where
@@ -5284,26 +5284,28 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 		//   2. V99G: one-shot GGTT remap — copies the PTEs at the migrated surface pages
 		//      down to GGTT[0..3999] so SURF=0 fetches the same physical memory WS's CPU
 		//      compositor is writing into.
-		//
-		// The previous linear CTL/STRIDE forces (tiling→0, STRIDE=0xa0) were the CAUSE
-		// of the fragmented/repeated screen: Apple allocates an X-tiled buffer (X-tile =
-		// 512B wide × 8 rows tall = 4096B/tile). When we forced linear scanout of those
-		// physical bytes at STRIDE=10240 B/row, each linear "row" actually contained
-		// interleaved 64-byte slivers from 8 different visual rows packed together → the
-		// fragmented/repeated pattern, with the 8-row cycle visibly repeating.
-		//
-		// Fix: let Apple's natural CTL (X-tiled bit 0x1) + STRIDE=0x14 (20 X-tile units =
-		// 10240B X-tile row) reach HW. Display reads X-tiled bytes as X-tiled → coherent
-		// image. We only redirect SURF and remap GGTT; tiling stays Apple-native.
+		//   3. Linear CTL/STRIDE forces (tiling→0, STRIDE=0xa0): required for visible
+		//      output. Removing them produces a black screen with no scanout activity,
+		//      confirmed empirically. Side effect: produces the fragmented/repeated
+		//      pattern when Apple's allocator stores buffer in non-linear physical layout
+		//      — that is a known cost of this path, not a removable hack.
 		if (param_2 >= 0x10000000u) {
 			static int v99PCount = 0;
 			if (v99PCount < 8)
 				SYSLOG("ngreen", "V99R[P%d]: SURF 0x%x->0 (non-aperture blocked, aperture kept)",
 					   ++v99PCount, (uint32_t)param_2);
-			static bool ggttRemapped = false;
-			if (!ggttRemapped) {
-				ggttRemapped = true;
-				uint32_t srcPage = (uint32_t)param_2 >> 12;
+			// V99G: remap GGTT[0..3999] → physical pages of the CURRENT scanout buffer.
+			// Re-run whenever Apple's SURF address (srcPage) changes — WS uses double or
+			// triple buffering and flips between non-aperture VAs every frame; with the
+			// previous one-shot guard, GGTT[0..] stayed pinned to the FIRST buffer forever
+			// while WS rotated through 2-3 others → display read stale fragments from old
+			// flips with occasional fresh writes overlapping = fragmented/repeated symptom.
+			// Now: track last srcPage, remap when it changes. Cost ≈ 8000 reg ops per flip.
+			uint32_t srcPage = (uint32_t)param_2 >> 12;
+			static uint32_t lastSrcPage = 0;
+			static int v99GCount = 0;
+			if (srcPage != lastSrcPage) {
+				lastSrcPage = srcPage;
 				int remapped = 0, remapSkipped = 0;
 				for (int i = 0; i < 4000; i++) {
 					uint32_t lo = NGreen::callback->readReg32(GGTT_PTE_LO(srcPage + i));
@@ -5314,14 +5316,17 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 					remapped++;
 				}
 				NGreen::callback->writeReg32(0x101008, 0x1); // flush GGTT TLB
-				SYSLOG("ngreen", "V99G: GGTT[0..%d] <- GGTT[0x%x..] remapped=%d skip=%d",
-					   remapped - 1, srcPage, remapped, remapSkipped);
+				if (++v99GCount <= 8 || (v99GCount & 0x3F) == 0)
+					SYSLOG("ngreen", "V99G[%d]: GGTT[0..%d] <- GGTT[0x%x..] remapped=%d skip=%d",
+						   v99GCount, remapped - 1, srcPage, remapped, remapSkipped);
 			}
 			param_2 = 0;
 		}
-		// Tiling/STRIDE forces REMOVED — they were the fragmentation cause. Apple's
-		// natural X-tiled CTL + X-tile-unit STRIDE reaches HW unmodified.
-		(void)hwStride; (void)hwCtl;
+		uint32_t hwTiling = (hwCtl >> 10) & 0x7;
+		if (hwTiling != 0)
+			NGreen::callback->writeReg32(0x70180, hwCtl & ~(0x7u << 10));
+		if (hwStride != 0xa0)
+			NGreen::callback->writeReg32(0x70188, 0xa0);
 	}
 
 	if (reinterpret_cast<volatile uint64_t*>(that)==nullptr) return NGreen::callback->writeReg32(param_1,param_2);
