@@ -767,12 +767,17 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				{activeKext, f2dp, r2dp, arrsize(f2dp),	1},
 				// f3 (connector data table rewrite) commented out — not in NootedBlue.
 				//{activeKext, f3, r3, arrsize(f3),	1},
-				{activeKext, f4, r4, arrsize(f4),	11},
-				{activeKext, f4a, r4a, arrsize(f4a),	11},
-				{activeKext, f4b, r4b, arrsize(f4b),	2},
-				{activeKext, f4c, r4c, arrsize(f4c),	2},
+				// f4 family ("lcd power reg" 0x72→0x12, 4 variants ~27 binary mods) commented out
+				// — NOT present in NootedBlue's working TGL FBT prod patch list. These rewrite
+				// what appears to be LCD power register access patterns; on Display 13 hardware
+				// the original Apple code paths may be correct without the rewrite.
+				//{activeKext, f4, r4, arrsize(f4),	11},
+				//{activeKext, f4a, r4a, arrsize(f4a),	11},
+				//{activeKext, f4b, r4b, arrsize(f4b),	2},
+				//{activeKext, f4c, r4c, arrsize(f4c),	2},
 				{activeKext, f7p, r7p, arrsize(f7p),	1},
-				{activeKext, f10p, r10p, arrsize(f10p),	1},
+				// f10p ("hwreg" CALL+JZ→JMP bypass) commented out — NOT in NootedBlue.
+				//{activeKext, f10p, r10p, arrsize(f10p),	1},
 				// Keep native probe-port mode flow for compatibility.
 				//{activeKext, f13p, r13p, arrsize(f13p),	1},
 				//{activeKext, f13pb, r13pb, arrsize(f13pb),	1},
@@ -801,13 +806,18 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				// f2/f2d: osinfo pipe/port/fb counts now set via getOSInformation hook — no binary patch needed.
 				// f3 (connector data table rewrite) commented out — not in NootedBlue.
 				//{activeKext, f3, r3, arrsize(f3),	1},
-				{activeKext, f4, r4, arrsize(f4),	12},
-				{activeKext, f4a, r4a, arrsize(f4a),	11},
-				{activeKext, f4b, r4b, arrsize(f4b),	2},
-				{activeKext, f4c, r4c, arrsize(f4c),	2},
+				// f4 family ("lcd power reg" 0x72→0x12, 4 variants ~27 binary mods) commented out
+				// — NOT in NootedBlue's working TGL FBT debug patch list. Suspected contributor
+				// to the fragmentation/repetition symptom: rewriting LCD power register access
+				// patterns may corrupt panel-side state on Display 13 (ADL-P) hardware.
+				//{activeKext, f4, r4, arrsize(f4),	12},
+				//{activeKext, f4a, r4a, arrsize(f4a),	11},
+				//{activeKext, f4b, r4b, arrsize(f4b),	2},
+				//{activeKext, f4c, r4c, arrsize(f4c),	2},
 				//{activeKext, f6a, r6a, arrsize(f6a),	1},
 				{activeKext, f7, r7, arrsize(f7),	1},
-				{activeKext, f10, r10, arrsize(f10),	1},
+				// f10 ("hwreg" CALL+JZ→JMP bypass) commented out — NOT in NootedBlue.
+				//{activeKext, f10, r10, arrsize(f10),	1},
 				// f13: mandatory. Without this port-probe bypass the spoofed TGL path freezes during boot.
 				{activeKext, f13, r13, arrsize(f13),	1},
 				// f13b: mandatory. Without this bypass AppleIntelPort::probePortStateEv hits
