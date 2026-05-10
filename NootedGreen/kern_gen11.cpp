@@ -760,10 +760,13 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		if (isprod){
 			LookupPatchPlus const patchesp[] = {// tgl production kext
 
-				{activeKext, f1p, r1p, arrsize(f1p),	1},
+				// f1p (powerwell JZ→JMP) commented out — not present in NootedBlue's
+				// working TGL FBT prod patch list. Was an extra NootedGreen accumulated.
+				//{activeKext, f1p, r1p, arrsize(f1p),	1},
 				{activeKext, f2p, r2p, arrsize(f2p),	1},
 				{activeKext, f2dp, r2dp, arrsize(f2dp),	1},
-				{activeKext, f3, r3, arrsize(f3),	1},
+				// f3 (connector data table rewrite) commented out — not in NootedBlue.
+				//{activeKext, f3, r3, arrsize(f3),	1},
 				{activeKext, f4, r4, arrsize(f4),	11},
 				{activeKext, f4a, r4a, arrsize(f4a),	11},
 				{activeKext, f4b, r4b, arrsize(f4b),	2},
@@ -792,9 +795,12 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		}
 		else {
 			LookupPatchPlus const patches[] = {// tgl debug kext
-				{activeKext, f1, r1, arrsize(f1),	1},
+				// f1 (powerwell JZ→JMP) commented out — not present in NootedBlue's
+				// working TGL FBT debug patch list. Was an extra NootedGreen accumulated.
+				//{activeKext, f1, r1, arrsize(f1),	1},
 				// f2/f2d: osinfo pipe/port/fb counts now set via getOSInformation hook — no binary patch needed.
-				{activeKext, f3, r3, arrsize(f3),	1},
+				// f3 (connector data table rewrite) commented out — not in NootedBlue.
+				//{activeKext, f3, r3, arrsize(f3),	1},
 				{activeKext, f4, r4, arrsize(f4),	12},
 				{activeKext, f4a, r4a, arrsize(f4a),	11},
 				{activeKext, f4b, r4b, arrsize(f4b),	2},
