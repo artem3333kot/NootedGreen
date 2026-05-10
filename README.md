@@ -119,6 +119,15 @@ FB+GFX:
 -v keepsyms=1 debug=0x100 IGLogLevel=8 -ngreentglwithgfx -NGreenDebug -liludbg liludump=220 ngreen-dmc=adlp -ngreenv189 -allow3d -disablegfxfirmware -ngreenfullmtlcore -ngreenexp -ngreenv60 -ngreenv88
 ```
 
+Where:
+// Boot-arg "ngreen-dmc":
+//   not set or "skip" → safe fallback: passthrough original + AUX only (proven working)
+//   "tgl"             → load TGL DMC v2.12 blob + TGL display engine registers
+//                       + ICL/TGL combo PHY signal levels (PHY_A eDP, PHY_B DP)
+//   "adlp"            → load ADL-P DMC v2.16 blob + ADL-P display engine registers
+//                       + combo PHY signal levels (PHY_A eDP)
+//   "icl"             → passthrough original ICL DMC load + ICL combo PHY signal levels
+
 > **Note:** `-ngreentglwithgfx` is required on Gen11/TGL hardware to load BOTH the TGL framebuffer AND the TGL HW (accelerator) kext. FB-only mode (`-ngreentglfb`) does not allocate per-plane DBUF on Gen11+ — the watermark/DBUF programming pipeline lives in the HW kext (`AppleIntelTGLGraphics.kext`), so without it the display engine fetches from a zero-block DBUF range and produces duplicated/fragmented output. `-ngreendp0 -ngreenv88` are diagnostic flags for the dp0/CPU-compositor investigation path. Remove them for normal operation.
 
 | Arg | Purpose |
