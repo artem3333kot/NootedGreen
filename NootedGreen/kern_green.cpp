@@ -197,6 +197,7 @@ void NGreen::processPatcher(KernelPatcher &patcher) {
         this->iGPU = OSDynamicCast(IOPCIDevice, devInfo->videoBuiltin);
         PANIC_COND(!this->iGPU, "ngreen", "videoBuiltin is not IOPCIDevice");
 		
+		// necessary without : igpu stall hang on boot
 		this->iGPU->enablePCIPowerManagement(kPCIPMCSPowerStateD0);
 		this->iGPU->setBusMasterEnable(true);
 		this->iGPU->setMemoryEnable(true);
@@ -360,6 +361,8 @@ bool NGreen::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 		static const uint8_t f2_r[]  = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xEB, 0x00};
 		static const uint8_t f2_rm[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00};
 		const LookupPatchPlus p2 {&kextIOAcceleratorFamily2, f2_f, f2_m, f2_r, f2_rm, 2};
+		
+		// necessary : without it hang on boot
 		bool f2ok = p2.apply(patcher, address, size);
 		patcher.clearError();
 		SYSLOG("NGreen", "IOAccelF2 f2 (fixed): %s", f2ok ? "OK" : "FAILED");
@@ -376,7 +379,9 @@ bool NGreen::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 		static const uint8_t f1_r[]  = {0x90, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 		static const uint8_t f1_rm[] = {0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 		const LookupPatchPlus p1 {&kextIOAcceleratorFamily2, f1_f, f1_m, f1_r, f1_rm, 1};
-		bool f1ok = p1.apply(patcher, address, size);
+		// V206: disabled IOAccelF2 f1 patch + IGAccelDevice::deviceStart hook + V181 lock
+		// resolves to match Visual Ehrmanntraut's working config. Restore if regression.
+		/*bool f1ok = p1.apply(patcher, address, size);
 		patcher.clearError();
 		SYSLOG("NGreen", "IOAccelF2 f1 (fixed): %s", f1ok ? "OK" : "FAILED");
 
@@ -404,7 +409,7 @@ bool NGreen::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 				patcher.clearError();
 				SYSLOG("ngreen", "V181: IOAF2 lock/unlock resolve failed");
 			}
-		}
+		}*/
 
 	}  else if (kextIOGraphics.loadIndex == index) {
 		/*

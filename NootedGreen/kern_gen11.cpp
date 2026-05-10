@@ -6282,11 +6282,22 @@ void Gen11::hwInitializeCState(void *that)
 		// restores normal scanout. Confirmed root cause via V76: PSR2_CTL=0x4811, V88
 		// direct physical writes to SURF invisible despite valid GGTT PTEs.
 		{
-			uint32_t psr2ctl = NGreen::callback->readReg32(0x60900);
-			uint32_t psr1ctl = NGreen::callback->readReg32(0x64800);
-			NGreen::callback->writeReg32(0x60900, 0);   // EDP_PSR2_CTL — disable PSR2
-			NGreen::callback->writeReg32(0x64800, 0);   // EDP_PSR_CTL  — disable PSR1
-			SYSLOG("ngreen", "V105: PSR1+PSR2 disabled (was PSR2=0x%x PSR1=0x%x)", psr2ctl, psr1ctl);
+			// V105 ADDRESS FIX: PSR1 control on TGL is at 0x60800 (transcoder EDP space),
+			// NOT 0x64800 (older Gen ICL/SKL layout). Pre-fix V105 was writing to a wrong
+			// register; PSR1 stayed enabled at 0x60800 = 0x00100001, panel kept refreshing
+			// from its own cache, screen frozen on first frame even while PIPE_FRMCOUNT
+			// kept advancing. Probe V205 caught this. Now writes to both addresses for
+			// safety (0x60800 = TGL, 0x64800 = legacy/ICL — covers both spoof paths).
+			uint32_t psr2ctl     = NGreen::callback->readReg32(0x60A10);  // EDP_PSR2_CTL TGL
+			uint32_t psr1ctlTgl  = NGreen::callback->readReg32(0x60800);  // EDP_PSR_CTL  TGL
+			uint32_t psr1ctlIcl  = NGreen::callback->readReg32(0x64800);  // EDP_PSR_CTL  ICL
+			uint32_t psr2ctlIcl  = NGreen::callback->readReg32(0x60900);  // EDP_PSR2_CTL ICL
+			NGreen::callback->writeReg32(0x60A10, 0);  // PSR2 TGL
+			NGreen::callback->writeReg32(0x60800, 0);  // PSR1 TGL  ← THE ACTUAL FIX
+			NGreen::callback->writeReg32(0x60900, 0);  // PSR2 legacy
+			NGreen::callback->writeReg32(0x64800, 0);  // PSR1 legacy
+			SYSLOG("ngreen", "V105: PSR disabled — TGL(PSR1=0x%x PSR2=0x%x) legacy(PSR1=0x%x PSR2=0x%x)",
+			       psr1ctlTgl, psr2ctl, psr1ctlIcl, psr2ctlIcl);
 		}
 
 	} else if (dmcArg[0] == 'i' || dmcArg[0] == 'I') {
@@ -6664,6 +6675,55 @@ void Gen11::computeLaneCount(void *that, const void *timing, unsigned int linkRa
 bool Gen11::wrapIsApertureMemoryRequired(void *that) {
 	bool orig = FunctionCast(wrapIsApertureMemoryRequired, callback->oIsApertureMemoryRequired)(that);
 	const bool isRealTGL = NGreen::callback && NGreen::callback->isRealTGL;
+
+	// V205 freeze probe + continuous PSR1 disable. PSR1 at 0x60800 was found re-enabled
+	// post-V105 (V105 was writing wrong register 0x64800). Even with the V105 fix, Apple
+	// or DMC may re-arm PSR1 later — keep stomping it on every call.
+	if (NGreen::callback) {
+		static uint32_t v205Calls = 0;
+		v205Calls++;
+
+		// Continuous PSR1+PSR2 disable — every call. PSR enabled = panel refreshes from
+		// its own cache and ignores new SURF arms → frozen frame even while pipe vsyncs.
+		uint32_t psr1Now = NGreen::callback->readReg32(0x60800);
+		if (psr1Now & 1) {
+			NGreen::callback->writeReg32(0x60800, 0);
+			static uint32_t v205PSR1Resets = 0;
+			if (v205PSR1Resets < 8) {
+				v205PSR1Resets++;
+				SYSLOG("ngreen", "V205PSR1[%u]: re-disabled PSR1 (was 0x%x) at call=%u",
+				       v205PSR1Resets, psr1Now, v205Calls);
+			}
+		}
+		uint32_t psr2Now = NGreen::callback->readReg32(0x60A10);
+		if (psr2Now & 1) {
+			NGreen::callback->writeReg32(0x60A10, 0);
+			static uint32_t v205PSR2Resets = 0;
+			if (v205PSR2Resets < 8) {
+				v205PSR2Resets++;
+				SYSLOG("ngreen", "V205PSR2[%u]: re-disabled PSR2 (was 0x%x) at call=%u",
+				       v205PSR2Resets, psr2Now, v205Calls);
+			}
+		}
+
+		// Periodic state snapshot for freeze diagnosis.
+		const bool sample = (v205Calls == 1   || v205Calls == 50  || v205Calls == 100  ||
+		                     v205Calls == 250 || v205Calls == 500 || v205Calls == 1000 ||
+		                     v205Calls == 2000 || v205Calls == 5000);
+		if (sample) {
+			uint32_t frm   = NGreen::callback->readReg32(0x70040);
+			uint32_t pstat = NGreen::callback->readReg32(0x70024);
+			uint32_t pcfg  = NGreen::callback->readReg32(0x70008);
+			uint32_t dcst  = NGreen::callback->readReg32(0x45504);
+			uint32_t pctl  = NGreen::callback->readReg32(0x70180);
+			uint32_t psurf = NGreen::callback->readReg32(0x7019C);
+			uint32_t pliv  = NGreen::callback->readReg32(0x701AC);
+			SYSLOG("ngreen", "V205[c=%u]: FRM=%u STAT=%08x CONF=%08x DC=%08x PCTL=%08x SURF=%08x LIVE=%08x PSR1=%08x PSR2=%08x",
+			       v205Calls, frm, pstat, pcfg, dcst, pctl, psurf, pliv,
+			       NGreen::callback->readReg32(0x60800), NGreen::callback->readReg32(0x60A10));
+		}
+	}
+
 	if (isRealTGL || !isDisplayPipeForceDisabled()) {
 		return orig;
 	}
