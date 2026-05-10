@@ -5274,22 +5274,30 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 				#undef R
 			}
 		}
-		// V99R[P] + V99G + linear CTL/STRIDE forces — CORE scanout coherence.
-		// Applied unconditionally; confirmed empirically as the load-bearing path for
-		// visible scanout in dp0, dp1, AND without any -ngreendp* boot arg.
+		// V99R[P] + V99G + linear CTL/STRIDE forces — CORE scanout coherence (!isRealTGL).
+		// Confirmed load-bearing for visible scanout on spoofed RPL/ADL-P in dp0, dp1, AND
+		// without any -ngreendp* boot arg. Real TGL hardware programs these correctly via
+		// Apple's native code path — gating the entire triad on !isRealTGL.
+		//
+		// Friend's architectural feedback (Visual Ehrmanntraut, NootedBlue lineage):
+		// the right long-term fix is intercepting CRTCParams / PLANEPARAMS / SCALERPARAMS
+		// at hwSetupMemory / paramsSurfCompare / hwRegsNeedUpdate (already partial via
+		// V97P / V97C) instead of hooking MMIO writes after-the-fact. "Hacking regs only
+		// won't work — leave WS alone, problem is in apple code."
 		//
 		//   1. SURF redirect: non-aperture writes (>=0x10000000) → 0, so the display engine
 		//      always scans from the same GGTT page range (GGTT[0..3999]) no matter where
 		//      Apple's setupScanoutMemory chose to migrate the surface.
-		//   2. V99G: one-shot GGTT remap — copies the PTEs at the migrated surface pages
+		//   2. V99G: per-flip GGTT remap — copies the PTEs at the migrated surface pages
 		//      down to GGTT[0..3999] so SURF=0 fetches the same physical memory WS's CPU
-		//      compositor is writing into.
+		//      compositor is writing into. Re-runs whenever Apple's SURF address changes
+		//      (handles double/triple buffering — WS rotates between 2-3 IOSurfaces per flip).
 		//   3. Linear CTL/STRIDE forces (tiling→0, STRIDE=0xa0): required for visible
 		//      output. Removing them produces a black screen with no scanout activity,
 		//      confirmed empirically. Side effect: produces the fragmented/repeated
 		//      pattern when Apple's allocator stores buffer in non-linear physical layout
-		//      — that is a known cost of this path, not a removable hack.
-		if (param_2 >= 0x10000000u) {
+		//      — known cost of this path, removable only by struct-level fix.
+		if (NGreen::callback && !NGreen::callback->isRealTGL && param_2 >= 0x10000000u) {
 			static int v99PCount = 0;
 			if (v99PCount < 8)
 				SYSLOG("ngreen", "V99R[P%d]: SURF 0x%x->0 (non-aperture blocked, aperture kept)",
@@ -5322,11 +5330,15 @@ void Gen11::raWriteRegister32(void *that,unsigned long param_1, UInt32 param_2)
 			}
 			param_2 = 0;
 		}
-		uint32_t hwTiling = (hwCtl >> 10) & 0x7;
-		if (hwTiling != 0)
-			NGreen::callback->writeReg32(0x70180, hwCtl & ~(0x7u << 10));
-		if (hwStride != 0xa0)
-			NGreen::callback->writeReg32(0x70188, 0xa0);
+		// Linear CTL/STRIDE forces — gated on !isRealTGL. Real TGL programs these
+		// correctly via Apple's native code path; only spoofed RPL/ADL-P needs the override.
+		if (NGreen::callback && !NGreen::callback->isRealTGL) {
+			uint32_t hwTiling = (hwCtl >> 10) & 0x7;
+			if (hwTiling != 0)
+				NGreen::callback->writeReg32(0x70180, hwCtl & ~(0x7u << 10));
+			if (hwStride != 0xa0)
+				NGreen::callback->writeReg32(0x70188, 0xa0);
+		}
 	}
 
 	if (reinterpret_cast<volatile uint64_t*>(that)==nullptr) return NGreen::callback->writeReg32(param_1,param_2);
