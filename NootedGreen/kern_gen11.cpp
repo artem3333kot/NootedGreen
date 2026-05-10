@@ -1,6 +1,7 @@
 //  Copyright © 2026 Stezza @ inc. Licensed under the Thou Shalt Not Profit License version 1.0. See LICENSE for
 //  details.
 #include "kern_gen11.hpp"
+#include "AppleIntelParams.hpp"
 #include <Headers/kern_api.hpp>
 #include "kern_genx.hpp"
 #include "kern_green.hpp"
@@ -6686,24 +6687,27 @@ uint8_t Gen11::hwRegsNeedUpdate
 	// clear bit[16] before compare/apply so the full modeset path does not request
 	// 0x8a010106 against an already-trained 0x8a000106 link.
 	if (!NGreen::callback->isRealTGL && param_3) {
-		auto *pending = reinterpret_cast<uint32_t *>(param_3);
+		// Typed access via AppleIntel::CRTCParams (see AppleIntelParams.hpp). Offsets
+		// reconstructed from Ghidra Structure Editor + IDA disasm cross-check; static
+		// asserts in the header guard against drift.
+		auto *params = reinterpret_cast<AppleIntel::CRTCParams *>(param_3);
 
-		// V97P: clear bit[16] in TRANS_DDI_FUNC_CTL (offset +0x04).
+		// V97P: clear bit[16] in TRANS_DDI_FUNC_CTL.
 		// Apple's SetupParams sets bit16 as a port-type flag; UEFI/HW never sets it.
 		// Without this the DDI FUNC_CTL compare fires and triggers a full modeset
 		// that disrupts the already-trained 4-lane eDP link → black screen.
-		uint32_t &transDdi = pending[1]; // offset +0x04
-		if (transDdi & (1u << 16)) {
+		if (params->TRANS_DDI_FUNC_CTL & (1u << 16)) {
 			static int v97PCount = 0;
 			if (v97PCount < 12) {
 				v97PCount++;
 				SYSLOG("ngreen", "V97P[%d]: CRTCParams TRANS_DDI_FUNC_CTL 0x%x -> 0x%x",
-				       v97PCount, transDdi, transDdi & ~(1u << 16));
+				       v97PCount, params->TRANS_DDI_FUNC_CTL,
+				       params->TRANS_DDI_FUNC_CTL & ~(1u << 16));
 			}
-			transDdi &= ~(1u << 16);
+			params->TRANS_DDI_FUNC_CTL &= ~(1u << 16);
 		}
 
-		// V97C: align pending TRANS_CONF (offset +0x2C) with the live HW value.
+		// V97C: align pending TRANS_CONF with the live HW value.
 		// paramsFbCompare logs "TRANS_CONF 0xc0000000->0xc0000024": HW has bits[5,2]
 		// clear (UEFI default), Apple wants to set them (interlace/depth config).
 		// Writing those bits to an active pipe causes a transient signal disruption
@@ -6713,17 +6717,27 @@ uint8_t Gen11::hwRegsNeedUpdate
 		// paramsFbCompare sees no change and the partial pipe update is suppressed.
 		// PIPE_CONF_A (= TRANS_CONF in ICL+) = 0x70008.
 		// NOTE: 0x60008 is TRANS_HSYNC_A (horizontal sync timing) — do NOT use that.
-		uint32_t &transConf = pending[11]; // offset +0x2C
 		const uint32_t hwTransConf = NGreen::callback->readReg32(0x70008);
-		if (transConf != hwTransConf) {
+		if (params->TRANS_CONF != hwTransConf) {
 			static int v97CCount = 0;
 			if (v97CCount < 12) {
 				v97CCount++;
 				SYSLOG("ngreen", "V97C[%d]: CRTCParams TRANS_CONF 0x%x -> HW 0x%x (suppressed pipe update)",
-				       v97CCount, transConf, hwTransConf);
+				       v97CCount, params->TRANS_CONF, hwTransConf);
 			}
-			transConf = hwTransConf;
+			params->TRANS_CONF = hwTransConf;
 		}
+
+		// V300 REVERTED — was a memory-write hack zeroing CRTCParams[+0xE8]/[+0xEC] to
+		// kill DSC engine select bits. Per jalavoui's feedback ("stop hacking memory
+		// writes, fix the origin not the destination"), DSC should be controlled at
+		// getDPCDInfo / Info.plist FeatureControl level, not patched after-the-fact in
+		// the CRTCParams struct. Our Info.plist already sets DSCSupport=0/DSCCapReporting=0
+		// (confirmed by fb.log "DSC supported: 0" / "DSC Caps Reporting enabled: 0"),
+		// so if Apple still calls setupDSCEngineParams the path is somewhere downstream
+		// that ignores FeatureControl — needs investigation at the origin function, not
+		// here. Linux on this hardware: VBT Port A DSC:0, link runs "DSC off" → DSC was
+		// likely a wrong hypothesis for the fragmentation symptom in the first place.
 	}
 
 	// Return the original result so that register reprogramming proceeds normally.
