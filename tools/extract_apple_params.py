@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # Extract AppleIntel framebuffer parameter structs to a C++ header
 # @author NootedGreen
 # @category AppleIntel
@@ -8,47 +9,64 @@
 #
 # What it does:
 #   Scans the currently-open Ghidra program (an AppleIntelTGLGraphicsFramebuffer
-#   kext disassembly) for the parameter structs we care about (CRTCParams,
-#   PLANEPARAMS, SCALERPARAMS, plus anything else added to STRUCT_WHITELIST), and
-#   emits AppleIntelParams.hpp with named fields, static_assert offset guards,
-#   and `_pad_NNNN` arrays where Ghidra has not yet identified a field.
+#   kext disassembly) for ALL structs, unions, and enums in the DataTypeManager,
+#   function signatures, local variables, and defined data in memory.  For each
+#   type with real content it emits a C++ definition with static_assert offset
+#   guards.  For whitelist structs that are still empty it emits a stub driven
+#   by EXPECTED_OFFSETS so the build at least compiles with placeholders.
 #
 # How to use:
 #   1. Open the kext in Ghidra and let auto-analysis finish.
-#   2. (Optional) In the Data Type Manager, name each interesting struct
-#      (CRTCParams, PLANEPARAMS, SCALERPARAMS) and label fields you've identified.
-#      Unnamed slots become _pad_NNNN arrays in the output.
-#   3. Drop this file into ~/ghidra_scripts/ (or open Script Manager and add it).
-#   4. Run it from Tools → Apple Intel → Extract Params Header. A file picker
-#      will ask where to write AppleIntelParams.hpp — point it at your
-#      NootedGreen source tree (the existing file will be overwritten).
+#   2. (Optional) In the Data Type Manager, define fields in the interesting
+#      structs.  Unnamed slots become _pad_NNNN arrays in the output.
+#   3. Drop this file into ~/ghidra_scripts/.
+#   4. Run it from Tools -> Apple Intel -> Extract Params Header.
 #
 # Also runnable from pyghidra (Python 3 outside Ghidra):
 #   pyghidra-run --project-name <name> --project-path <path> extract_apple_params.py
-#   In that mode `currentProgram` is provided by pyghidra via the bridge.
 
-from ghidra.program.model.data import Structure, Pointer
-import os
+from ghidra.program.model.data import (
+    Structure, Union, Enum, Pointer, Array,
+    TypeDef, AbstractIntegerDataType,
+)
+import os, datetime
 
 # ----------------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------------
 
-# Structs to extract. Add new names here as you identify them in Ghidra.
 STRUCT_WHITELIST = [
     "CRTCParams",
     "PLANEPARAMS",
-    "PlaneParams",        # tolerate casing variants Ghidra may produce
+    "PlaneParams",
     "SCALERPARAMS",
     "ScalerParams",
-    "ppsConfig_t",        # consumed by computePps in setupDSCEngineParams
+    "ppsConfig_t",
     "ppsOpt_t",
-    "LinkConfig",         # port-side DP link config
+    "LinkConfig",
 ]
 
-# Hardcoded references to confirm against Ghidra's discovered offsets. If Ghidra
-# disagrees with these on a struct we emit, the script logs a WARNING (this is
-# how we catch the case where Ghidra has been edited away from the truth).
+# When True, emit ONLY whitelisted structs (skip Mach-O loader / CodeSign cruft).
+# When False, emit every kext-defined struct in the DTM. Default is True so the
+# generated AppleIntelParams.hpp stays focused on our targets; flip to False if
+# you want a full dump for exploration.
+WHITELIST_ONLY = True
+
+# Struct names to ALWAYS skip (Mach-O loader, code-sign blobs, libkern types
+# that come in via Ghidra's built-in headers and are noise for our purposes).
+SKIP_STRUCT_NAMES = frozenset([
+    "mach_header", "segment_command", "section",
+    "symtab_command", "dysymtab_command", "linkedit_data_command",
+    "source_version_command", "uuid_command", "nlist",
+    "CS_BlobIndex", "CS_CodeDirectory", "CS_GenericBlob", "CS_SuperBlob",
+])
+
+# Skip enums that are really preprocessor-define noise (Ghidra's Parse C Source
+# turns every -D from the parse profile into an enum like "define__POSIX_C_SOURCE").
+# These are not real driver enums.
+SKIP_ENUM_PREFIXES = ("define_", "_FORTIFY_", "_POSIX_", "_LARGEFILE", "_INTEGRAL_", "__x86_", "__APPLE_", "__GNUC_")
+
+# Known offsets used to cross-check Ghidra and to synthesize stubs.
 EXPECTED_OFFSETS = {
     "CRTCParams": {
         "TRANS_CLK_SEL":       0x00,
@@ -73,153 +91,362 @@ EXPECTED_OFFSETS = {
         "PS_WIN_POS": 0x04,
         "PS_WIN_SZ":  0x08,
     },
+    "PLANEPARAMS": {
+        "PLANE_CTL":       0x00,
+        "PLANE_STRIDE":    0x04,
+        "PLANE_POS":       0x08,
+        "PLANE_SIZE":      0x0C,
+        "PLANE_KEYVAL":    0x10,
+        "PLANE_KEYMSK":    0x14,
+        "PLANE_OFFSET":    0x18,
+        "PLANE_COLOR_CTL": 0x1C,
+    },
 }
 
-HEADER_PREAMBLE = """//  Copyright \xc2\xa9 2026 Stezza @ inc. Licensed under the Thou Shalt Not Profit License version 1.0.
+HEADER_PREAMBLE = u"""\
+//  Copyright © 2026 Stezza @ inc. Licensed under the Thou Shalt Not Profit License version 1.0.
 //  See LICENSE for details.
 //
-//  AppleIntelParams.hpp \xe2\x80\x94 typed mirror of Apple's framebuffer-driver parameter
+//  AppleIntelParams.hpp — typed mirror of Apple's framebuffer-driver parameter
 //  structures. AUTO-GENERATED by tools/extract_apple_params.py from a Ghidra-
-//  analyzed AppleIntelTGLGraphicsFramebuffer.kext. Do not edit by hand \xe2\x80\x94 re-run
+//  analyzed AppleIntelTGLGraphicsFramebuffer.kext. Do not edit by hand — re-run
 //  the script after updating struct definitions in Ghidra.
 //
 //  Source program: {prog_name}
 //  Generated: {timestamp}
 //
-//  These structs replace raw `pending[N]` uint32_t array indexing in our hooks.
-//  Each named field is guarded by a `static_assert` against the offset Ghidra
-//  reported when the script ran \xe2\x80\x94 if Ghidra is later edited and a field shifts,
-//  the build will fail loudly instead of silently producing wrong code.
+//  Populated structs: {n_populated}  |  Stubs: {n_stubs}  |  Enums: {n_enums}
 
 #ifndef AppleIntelParams_hpp
 #define AppleIntelParams_hpp
 
 #include <stdint.h>
 
-namespace AppleIntel {
+namespace AppleIntel {{
 
 """
 
-HEADER_EPILOGUE = """} // namespace AppleIntel
+HEADER_EPILOGUE = u"""\
+} // namespace AppleIntel
 
 #endif // AppleIntelParams_hpp
 """
 
+# Skip Ghidra built-in categories that never contain kext types
+_BUILTIN_PATHS = frozenset([
+    "/", "/BuiltInTypes", "/DWARF",
+    "/ghidra_builtins", "/ghidra",
+])
+
 # ----------------------------------------------------------------------------
-# Implementation
+# Type helpers
 # ----------------------------------------------------------------------------
 
+def _base_type(dt):
+    """Unwrap TypeDef chains to the underlying DataType."""
+    while isinstance(dt, TypeDef):
+        dt = dt.getDataType()
+    return dt
 
-def to_field_type(data_type, length):
-    """Return a C++ type for a Ghidra DataType + byte length."""
-    name = data_type.getName()
-    # Common width-based normalizations
-    if name in ("undefined4", "dword", "DWORD"):
-        return "uint32_t"
-    if name in ("undefined2", "word", "WORD", "ushort"):
-        return "uint16_t"
-    if name in ("undefined1", "byte", "BYTE", "uchar"):
-        return "uint8_t"
-    if name in ("undefined8", "qword", "QWORD", "ulonglong"):
+
+def to_ctype(dt, length):
+    """Map a Ghidra DataType to a C++ type string.
+
+    Returns scalar/struct/pointer types only. Arrays are handled by the emitter,
+    which calls this on the element type and adds the [N] count itself — that
+    avoids producing invalid C++ like `uint8_t[16] uuid` (correct: `uint8_t uuid[16]`).
+    """
+    dt = _base_type(dt)
+    name = dt.getName()
+
+    if isinstance(dt, Pointer):
+        inner = _base_type(dt.getDataType())
+        inner_name = inner.getName() if inner else "void"
+        return "{}*".format(inner_name)
+
+    # Ghidra's "string" / TerminatedCString / fixed-length string types — emit char.
+    # The scalar-array path in the emitter wraps to `char name[length]` automatically.
+    if name in ("string", "TerminatedCString", "TerminatedUnicode", "char"):
+        return "char"
+
+    if isinstance(dt, (Structure, Union, Enum)):
+        return name
+
+    # Integer/undefined normalization by size
+    sz = length if length > 0 else dt.getLength()
+    if sz == 8:
         return "uint64_t"
-    if isinstance(data_type, Pointer):
-        inner = data_type.getDataType()
-        return "{}*".format(inner.getName() if inner else "void")
-    # Fallback: use Ghidra's reported name verbatim
-    return name
+    if sz == 4:
+        return "uint32_t"
+    if sz == 2:
+        return "uint16_t"
+    if sz == 1:
+        return "uint8_t"
+
+    return name or "uint8_t"
 
 
-def sanitize_field_name(raw_name, offset):
-    """Return a valid C++ identifier for a field; fall back to field_NNNN."""
-    if not raw_name:
-        return "field_{:X}".format(offset)
-    cleaned = "".join(c if (c.isalnum() or c == "_") else "_" for c in raw_name)
-    if cleaned[:1].isdigit():
-        cleaned = "_" + cleaned
-    return cleaned
+def sanitize(raw, offset):
+    if not raw:
+        return "field_{:04X}".format(offset)
+    cleaned = "".join(c if (c.isalnum() or c == "_") else "_" for c in raw)
+    return ("_" + cleaned) if cleaned[:1].isdigit() else cleaned
 
+# ----------------------------------------------------------------------------
+# Emitters
+# ----------------------------------------------------------------------------
 
-def emit_struct(struct):
-    """Emit one C++ struct definition + static_asserts."""
-    name = struct.getName()
-    total = struct.getLength()
-    lines = []
-    lines.append("// {} \xe2\x80\x94 {} bytes, {} defined components".format(
-        name, total, struct.getNumDefinedComponents()))
-    lines.append("struct {} {{".format(name))
-
-    written = 0
-    asserts = []
-    components = list(struct.getDefinedComponents())
-    components.sort(key=lambda c: c.getOffset())
-
-    for comp in components:
-        offset = comp.getOffset()
-        length = comp.getLength()
-        dtype = comp.getDataType()
-        fname = sanitize_field_name(comp.getFieldName(), offset)
-
-        # Emit padding for any gap before this component
-        if offset > written:
-            gap = offset - written
-            lines.append(
-                "    uint8_t _pad_{:X}[0x{:X}]; // +0x{:X}..+0x{:X}".format(
-                    written, gap, written, offset - 1))
-            written = offset
-
-        ctype = to_field_type(dtype, length)
-        # Treat array-typed components as arrays
-        if length > 0 and ctype in ("uint32_t", "uint16_t", "uint8_t", "uint64_t"):
-            type_size = {"uint64_t": 8, "uint32_t": 4, "uint16_t": 2, "uint8_t": 1}[ctype]
-            if length == type_size:
-                lines.append("    {:<12} {}; // +0x{:X}".format(ctype, fname, offset))
-            else:
-                count = length // type_size
-                lines.append("    {:<12} {}[{}]; // +0x{:X}".format(
-                    ctype, fname, count, offset))
-        else:
-            lines.append("    {:<12} {}; // +0x{:X}, len 0x{:X}".format(
-                ctype, fname, offset, length))
-
-        # Skip pad-style autogenerated names
-        if not fname.startswith("field_") and not fname.startswith("_pad_"):
-            asserts.append(
-                "static_assert(__builtin_offsetof({}, {}) == 0x{:X}, \"{}.{} offset\");".format(
-                    name, fname, offset, name, fname))
-        written = offset + length
-
-    # Trailing pad to struct size
-    if written < total:
-        gap = total - written
-        lines.append(
-            "    uint8_t _pad_{:X}[0x{:X}]; // +0x{:X}..+0x{:X} (trailing)".format(
-                written, gap, written, total - 1))
-
+def emit_enum(en):
+    name = en.getName()
+    sz = en.getLength()
+    width_map = {1: "uint8_t", 2: "uint16_t", 4: "uint32_t", 8: "uint64_t"}
+    base = width_map.get(sz, "uint32_t")
+    lines = ["enum class {} : {} {{".format(name, base)]
+    for val_name in en.getNames():
+        lines.append("    {} = 0x{:X},".format(val_name, en.getValue(val_name)))
     lines.append("};")
-    lines.append("static_assert(sizeof({}) == 0x{:X}, \"{} total size\");".format(
-        name, total, name))
-    lines.extend(asserts)
-
-    # Cross-check expected offsets, warn on mismatch
-    if name in EXPECTED_OFFSETS:
-        actual = {sanitize_field_name(c.getFieldName(), c.getOffset()): c.getOffset()
-                  for c in components if c.getFieldName()}
-        for fname, exp_off in EXPECTED_OFFSETS[name].items():
-            if fname in actual and actual[fname] != exp_off:
-                print("WARNING: {}.{} is at 0x{:X}, expected 0x{:X}".format(
-                    name, fname, actual[fname], exp_off))
-
     lines.append("")
     return "\n".join(lines)
 
 
-def find_struct(dtm, name):
-    """Locate a Structure by name in Ghidra's DataTypeManager."""
-    for st in dtm.getAllStructures():
-        if st.getName() == name:
-            return st
-    return None
+def emit_struct_or_union(dt, emitted):
+    """Emit a Structure or Union recursively, emitting dependencies first."""
+    name = dt.getName()
+    if name in emitted:
+        return ""
+    emitted.add(name)
 
+    total = dt.getLength()
+    n_comp = dt.getNumDefinedComponents()
+    is_union = isinstance(dt, Union)
+    keyword = "union" if is_union else "struct"
+
+    out = ""
+
+    # Emit nested types first
+    for comp in dt.getDefinedComponents():
+        base = _base_type(comp.getDataType())
+        if isinstance(base, (Structure, Union)) and base.getName() not in emitted:
+            out += emit_struct_or_union(base, emitted) + "\n"
+        elif isinstance(base, Enum) and base.getName() not in emitted:
+            emitted.add(base.getName())
+            out += emit_enum(base) + "\n"
+
+    lines = []
+    lines.append("// {} {} -- 0x{:X} bytes, {} components".format(
+        keyword, name, total, n_comp))
+    lines.append("{} {} {{".format(keyword, name))
+
+    written = 0
+    asserts = []
+    components = list(dt.getDefinedComponents())
+    if not is_union:
+        components.sort(key=lambda c: c.getOffset())
+
+    for comp in components:
+        offset = comp.getOffset()
+        length = comp.getLength()
+        cdt = _base_type(comp.getDataType())
+        fname = sanitize(comp.getFieldName(), offset)
+
+        if not is_union and offset > written:
+            gap = offset - written
+            lines.append("    uint8_t _pad_{:04X}[0x{:X}]; // +0x{:X}..+0x{:X}".format(
+                written, gap, written, offset - 1))
+            written = offset
+
+        if isinstance(cdt, Array):
+            # Emit as ELEM NAME[N] (correct C++), not `ELEM[N] NAME`.
+            elem = _base_type(cdt.getDataType())
+            elem_len = elem.getLength()
+            elem_ctype = to_ctype(elem, elem_len)
+            count = cdt.getNumElements()
+            lines.append("    {:<14} {}[{}]; // +0x{:X}".format(
+                elem_ctype, fname, count, offset))
+        else:
+            ctype = to_ctype(cdt, length)
+            # Collapse plain scalar arrays — also handles fixed-length `char`
+            # strings (length > 1) into `char name[length]`.
+            if length > 0 and ctype in ("uint64_t", "uint32_t", "uint16_t", "uint8_t", "char"):
+                tsz = {"uint64_t": 8, "uint32_t": 4, "uint16_t": 2,
+                       "uint8_t": 1, "char": 1}[ctype]
+                if length > tsz and length % tsz == 0:
+                    lines.append("    {:<14} {}[{}]; // +0x{:X}".format(
+                        ctype, fname, length // tsz, offset))
+                else:
+                    lines.append("    {:<14} {}; // +0x{:X}".format(ctype, fname, offset))
+            else:
+                lines.append("    {:<14} {}; // +0x{:X}, 0x{:X} bytes".format(
+                    ctype, fname, offset, length))
+
+        if not fname.startswith("field_") and not fname.startswith("_pad_"):
+            asserts.append(
+                "static_assert(__builtin_offsetof({}, {}) == 0x{:X}, \"{}.{}\");".format(
+                    name, fname, offset, name, fname))
+
+        if not is_union:
+            written = offset + length
+
+    if not is_union and written < total:
+        gap = total - written
+        lines.append("    uint8_t _pad_{:04X}[0x{:X}]; // +0x{:X}..+0x{:X} (trailing)".format(
+            written, gap, written, total - 1))
+
+    lines.append("};")
+    lines.append("static_assert(sizeof({}) == 0x{:X}, \"{} size\");".format(name, total, name))
+    lines.extend(asserts)
+
+    # Cross-check expected offsets
+    if name in EXPECTED_OFFSETS:
+        actual = {}
+        for comp in dt.getDefinedComponents():
+            fn = comp.getFieldName()
+            if fn:
+                actual[sanitize(fn, comp.getOffset())] = comp.getOffset()
+        for fn, exp in EXPECTED_OFFSETS[name].items():
+            if fn in actual and actual[fn] != exp:
+                print("WARNING: {}.{} offset 0x{:X} != expected 0x{:X}".format(
+                    name, fn, actual[fn], exp))
+
+    lines.append("")
+    out += "\n".join(lines)
+    return out
+
+
+def emit_stub(name):
+    """Emit a placeholder struct driven by EXPECTED_OFFSETS."""
+    fields = EXPECTED_OFFSETS.get(name, {})
+    if not fields:
+        # No offset data — emit a minimal opaque placeholder
+        lines = [
+            "// {} -- STUB: not yet defined in Ghidra".format(name),
+            "struct {} {{".format(name),
+            "    // TODO: define fields in Ghidra's Data Type Manager",
+            "    uint8_t _opaque[1];",
+            "};",
+            "",
+        ]
+        return "\n".join(lines)
+
+    sorted_fields = sorted(fields.items(), key=lambda x: x[1])
+    # Infer a minimum size: last known offset + 4 bytes, rounded up to 16
+    last_off = sorted_fields[-1][1]
+    min_size = ((last_off + 4 + 15) // 16) * 16
+
+    lines = ["// {} -- STUB: not yet defined in Ghidra (expected offsets only)".format(name)]
+    lines.append("struct {} {{".format(name))
+    written = 0
+    asserts = []
+    for fname, off in sorted_fields:
+        if off > written:
+            lines.append("    uint8_t _pad_{:04X}[0x{:X}];".format(written, off - written))
+        lines.append("    uint32_t {}; // +0x{:X} (expected)".format(fname, off))
+        asserts.append(
+            "static_assert(__builtin_offsetof({}, {}) == 0x{:X}, \"{}.{} expected\");".format(
+                name, fname, off, name, fname))
+        written = off + 4
+    if written < min_size:
+        lines.append("    uint8_t _pad_{:04X}[0x{:X}]; // trailing".format(written, min_size - written))
+    lines.append("};")
+    lines.extend(asserts)
+    lines.append("")
+    return "\n".join(lines)
+
+# ----------------------------------------------------------------------------
+# Discovery
+# ----------------------------------------------------------------------------
+
+def _is_builtin(dt):
+    """Return True for Ghidra built-in / synthetic types we don't want."""
+    try:
+        path = dt.getCategoryPath().toString()
+        if any(path == b or path.startswith(b + "/") for b in _BUILTIN_PATHS):
+            return True
+    except Exception:
+        pass
+    name = dt.getName()
+    # Ghidra auto-names like "undefined", "undefined4", etc.
+    if name.startswith("undefined") or name in ("void", "bool", "char",
+            "uchar", "short", "ushort", "int", "uint", "long", "ulong",
+            "longlong", "ulonglong", "float", "double", "string"):
+        return True
+    return False
+
+
+def _unwrap_pointer(dt):
+    dt = _base_type(dt)
+    if isinstance(dt, Pointer):
+        return _base_type(dt.getDataType())
+    return dt
+
+
+def collect_all_types(program):
+    """Return dicts: structs{name->dt}, unions{name->dt}, enums{name->dt}."""
+    dtm = program.getDataTypeManager()
+    structs, unions, enums = {}, {}, {}
+
+    # 1. Everything in the DTM
+    from java.util import ArrayList
+    all_dt_list = ArrayList()
+    dtm.getAllDataTypes(all_dt_list)
+    for dt in all_dt_list:
+        if _is_builtin(dt):
+            continue
+        if isinstance(dt, Structure) and dt.getName() not in structs:
+            structs[dt.getName()] = dt
+        elif isinstance(dt, Union) and dt.getName() not in unions:
+            unions[dt.getName()] = dt
+        elif isinstance(dt, Enum) and dt.getName() not in enums:
+            enums[dt.getName()] = dt
+
+    # 2. Function signatures and locals
+    fm = program.getFunctionManager()
+    for fn in fm.getFunctions(True):
+        for candidate in ([fn.getReturnType()]
+                          + [p.getDataType() for p in fn.getParameters()]):
+            base = _unwrap_pointer(candidate)
+            if isinstance(base, Structure) and not _is_builtin(base):
+                structs.setdefault(base.getName(), base)
+            elif isinstance(base, Union) and not _is_builtin(base):
+                unions.setdefault(base.getName(), base)
+            elif isinstance(base, Enum) and not _is_builtin(base):
+                enums.setdefault(base.getName(), base)
+        try:
+            for var in fn.getAllVariables():
+                base = _unwrap_pointer(var.getDataType())
+                if isinstance(base, Structure) and not _is_builtin(base):
+                    structs.setdefault(base.getName(), base)
+        except Exception:
+            pass
+
+    # 3. Defined data in all memory blocks
+    listing = program.getListing()
+    mem = program.getMemory()
+    for block in mem.getBlocks():
+        addr = block.getStart()
+        end = block.getEnd()
+        while addr is not None and addr <= end:
+            data = listing.getDataAt(addr)
+            if data is not None:
+                base = _unwrap_pointer(data.getDataType())
+                if isinstance(base, Structure) and not _is_builtin(base):
+                    structs.setdefault(base.getName(), base)
+                elif isinstance(base, Union) and not _is_builtin(base):
+                    unions.setdefault(base.getName(), base)
+                elif isinstance(base, Enum) and not _is_builtin(base):
+                    enums.setdefault(base.getName(), base)
+                addr = data.getMaxAddress().add(1)
+            else:
+                try:
+                    addr = addr.add(1)
+                except Exception:
+                    break
+
+    return structs, unions, enums
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
 
 def main():
     program = currentProgram
@@ -227,36 +454,122 @@ def main():
         print("No program open in Ghidra")
         return
 
-    dtm = program.getDataTypeManager()
-    found = []
-    for wanted in STRUCT_WHITELIST:
-        st = find_struct(dtm, wanted)
-        if st is None:
-            print("INFO: struct '{}' not found in {}; skipping".format(
-                wanted, program.getName()))
-            continue
-        found.append(st)
+    print("Scanning {}...".format(program.getName()))
+    structs, unions, enums = collect_all_types(program)
+    print("  Structures : {}".format(len(structs)))
+    print("  Unions     : {}".format(len(unions)))
+    print("  Enums      : {}".format(len(enums)))
 
-    if not found:
-        print("No whitelisted structs found. Define them in Ghidra first or extend STRUCT_WHITELIST.")
+    # Three tiers:
+    #   with_fields  : size >= 4 AND has defined components  -> full emit
+    #   sized_opaque : size >= 4 AND 0 components            -> opaque sized stub
+    #   tiny         : size < 4 AND 0 components             -> skip (true 1-byte placeholder)
+    with_fields  = {}
+    sized_opaque = {}
+    tiny         = {}
+    for n, s in structs.items():
+        if n in SKIP_STRUCT_NAMES:
+            continue
+        if WHITELIST_ONLY and n not in STRUCT_WHITELIST:
+            continue
+        sz = s.getLength()
+        nc = s.getNumDefinedComponents()
+        if nc > 0 and sz >= 4:
+            with_fields[n] = s
+        elif nc == 0 and sz >= 4:
+            sized_opaque[n] = s
+        else:
+            tiny[n] = s
+
+    print("  With fields   : {}".format(len(with_fields)))
+    print("  Sized opaque  : {}".format(len(sized_opaque)))
+    print("  Tiny/skip     : {}".format(len(tiny)))
+
+    # Whitelist coverage
+    for wanted in STRUCT_WHITELIST:
+        if wanted not in structs:
+            print("WARNING: '{}' not found - create it in the Data Type Manager".format(wanted))
+        elif wanted in tiny:
+            print("WARNING: '{}' is a 1-byte placeholder - define fields in Ghidra".format(wanted))
+
+    # EXPECTED_OFFSETS stubs only for whitelist names absent from with_fields
+    stub_names = [n for n in STRUCT_WHITELIST if n not in with_fields]
+
+    n_fields  = len(with_fields)
+    n_opaque  = len(sized_opaque)
+    n_stubs   = len(stub_names)
+    n_enums   = len(enums)
+
+    if n_fields == 0 and n_opaque == 0 and n_stubs == 0 and n_enums == 0:
+        print("Nothing to emit.")
         return
 
     out_path = askFile("Save AppleIntelParams.hpp to", "Save")
     out_file = out_path.getAbsolutePath()
 
-    import datetime
     body = HEADER_PREAMBLE.format(
         prog_name=program.getName(),
         timestamp=datetime.datetime.now().isoformat(),
+        n_populated=n_fields,
+        n_stubs=n_stubs,
+        n_enums=n_enums,
     )
-    for st in found:
-        body += emit_struct(st) + "\n"
+
+    emitted = set()
+
+    # Enums first (no dependencies)
+    if enums:
+        body += "// ---- Enums ----\n\n"
+        for name in sorted(enums):
+            emitted.add(name)
+            body += emit_enum(enums[name]) + "\n"
+
+    # Unions
+    if unions:
+        body += "// ---- Unions ----\n\n"
+        for name in sorted(unions):
+            body += emit_struct_or_union(unions[name], emitted) + "\n"
+
+    # Structs with named fields
+    if with_fields:
+        body += "// ---- Structs (fields identified) ----\n\n"
+        for name in sorted(with_fields):
+            body += emit_struct_or_union(with_fields[name], emitted) + "\n"
+
+    # Sized structs with no fields yet - emit opaque with correct size
+    if sized_opaque:
+        body += "// ---- Structs (sized, fields not yet identified in Ghidra) ----\n\n"
+        for name in sorted(sized_opaque):
+            if name in emitted:
+                continue
+            emitted.add(name)
+            sz = sized_opaque[name].getLength()
+            body += (
+                "// {} -- 0x{:X} bytes, no fields identified yet\n"
+                "struct {} {{\n"
+                "    uint8_t _opaque[0x{:X}]; // TODO: name fields in Ghidra\n"
+                "}};\n"
+                "static_assert(sizeof({}) == 0x{:X}, \"{} size\");\n\n"
+            ).format(name, sz, name, sz, name, sz, name)
+
+    # EXPECTED_OFFSETS stubs for whitelist structs not yet fully defined
+    if stub_names:
+        body += "// ---- Stubs (whitelist structs not yet defined in Ghidra) ----\n\n"
+        for name in stub_names:
+            if name not in emitted:
+                body += emit_stub(name) + "\n"
+
     body += HEADER_EPILOGUE
 
     with open(out_file, "w") as f:
-        f.write(body)
+        f.write(body.encode("utf-8") if isinstance(body, unicode) else body)
 
-    print("Wrote {} structs to {}".format(len(found), out_file))
+    print("Wrote to {}".format(out_file))
+    print("  With fields   : {}".format(n_fields))
+    print("  Sized opaque  : {}".format(n_opaque))
+    print("  Stubs         : {}".format(n_stubs))
+    print("  Enums         : {}".format(n_enums))
+    print("  Unions        : {}".format(len(unions)))
 
 
 main()
