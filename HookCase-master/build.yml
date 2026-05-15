@@ -1,0 +1,20 @@
+name: Build HookCase
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build Kext
+        run: xcodebuild -project HookCase.xcodeproj -scheme HookCase -configuration Release -derivedDataPath build
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HookCase-Release
+          path: build/Build/Products/Release/*.kext
